@@ -1,0 +1,3 @@
+[submodule "worker/third_party/parakeet.cpp"]
+	path = worker/third_party/parakeet.cpp
+	url = https://github.com/mudler/parakeet.cpp

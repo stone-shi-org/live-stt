@@ -1,0 +1,198 @@
+syntax = "proto3";
+package livestt.v1;
+
+// The RPC *is* the session. One phone call = one Transcribe stream = one logical
+// ASR session. There is deliberately no session_id and no server-side registry:
+// nothing can be resumed after a stream ends, because the encoder cache lives in
+// a worker process that dies with the stream. A session_id field would only
+// invite a resume RPC that cannot be implemented.
+service StreamingASR {
+  rpc Transcribe(stream TranscriptionRequest) returns (stream TranscriptionEvent);
+  rpc GetServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+}
+
+enum AudioEncoding {
+  AUDIO_ENCODING_UNSPECIFIED = 0;
+  AUDIO_ENCODING_LINEAR16 = 1;  // int16 LE mono 16 kHz -- the ONLY accepted encoding in v1
+  AUDIO_ENCODING_MULAW = 2;     // reserved; rejected with INVALID_ARGUMENT
+  AUDIO_ENCODING_ALAW = 3;      // reserved; rejected with INVALID_ARGUMENT
+  AUDIO_ENCODING_FLOAT32 = 4;   // reserved; rejected with INVALID_ARGUMENT
+}
+
+message StreamConfig {
+  // Opaque; hashed on ingest for logs/traces. Never used as a key, metric label,
+  // or filename. Nothing about a call is persisted server-side.
+  string call_id = 1;
+
+  AudioEncoding encoding = 2;
+
+  // Must be 16000. Conversion (G.711 decode, 8k->16k resample) happens
+  // client-side in live_stt.client.telephony, shipped and tested from this repo.
+  uint32 sample_rate_hz = 3;
+
+  // Passed straight to parakeet_capi_stream_begin_lang, e.g. "en-US". Empty
+  // means the model default. Ignored by English-only models.
+  string language = 4;
+
+  // Empty means the server default (LSTT_DEFAULT_MODEL, "realtime_eou_120m-v1").
+  string model = 5;
+
+  // Per-word timestamps and confidence on every delta. Costs nothing extra --
+  // the engine's feed_json always produces them -- but roughly doubles event size.
+  bool enable_word_timestamps = 6;
+}
+
+message TranscriptionRequest {
+  oneof payload {
+    // MUST be the first message on the stream. A second config, or audio
+    // before any config, is INVALID_ARGUMENT.
+    StreamConfig config = 1;
+
+    // Raw int16 little-endian mono samples. No header, no framing, any length
+    // including zero. Send RTP-sized frames as they arrive; the server
+    // coalesces them to the model's chunk size itself.
+    bytes audio = 2;
+  }
+}
+
+message Word {
+  string text = 1;
+  // Seconds from the first sample of the CALL, not of the current worker
+  // generation. The server rebases these across worker rotations.
+  double start_sec = 2;
+  double end_sec = 3;
+  float confidence = 4;
+}
+
+// Confirmed, committed text. Append-only: this engine emits no revisable
+// hypothesis, so a delta is never retracted, rewritten, or superseded.
+//
+// There is deliberately NO partial/final flag. It would be constant-true, and
+// a client that saw the field would reasonably assume the false case exists and
+// write dead code to handle retraction. A client that wants a "live" feel
+// should render its own unstable tail (e.g. italicise the last word) -- that is
+// a presentation choice and does not belong in the protocol.
+message TranscriptDelta {
+  string text = 1;
+  repeated Word words = 2;
+  // Total audio accepted so far, for client-side drift accounting.
+  double audio_offset_sec = 3;
+}
+
+// PARAKEET_EVENT_EOU. Only ever emitted by models that actually carry an <EOU>
+// token; see Ready.supports_turn_detection.
+message EndOfUtterance {
+  double at_sec = 1;
+}
+
+// PARAKEET_EVENT_EOB (backchannel).
+message EndOfBoundary {
+  double at_sec = 1;
+}
+
+enum WarningCode {
+  WARNING_CODE_UNSPECIFIED = 0;
+  // Decode is slower than real time; behind_sec is set.
+  WARNING_CODE_FALLING_BEHIND = 1;
+  // The input ring overflowed and samples were discarded.
+  WARNING_CODE_AUDIO_DROPPED = 2;
+  // A malformed audio frame was dropped (rate-limited to 1/10s).
+  WARNING_CODE_MALFORMED_FRAME = 3;
+  // The selected model has no <EOU> token. No EndOfUtterance will ever be
+  // emitted on this stream. Bring your own VAD.
+  WARNING_CODE_NO_TURN_DETECTION = 4;
+  // Server is draining for shutdown; the call has a deadline_sec to finish.
+  WARNING_CODE_SERVER_DRAINING = 5;
+  // The worker process was lost (crash) and is being recovered.
+  WARNING_CODE_WORKER_LOST = 6;
+  // max_call_sec is approaching; the call will be finalized at deadline_sec.
+  WARNING_CODE_CALL_LIMIT_APPROACHING = 7;
+}
+
+message Warning {
+  WarningCode code = 1;
+  string message = 2;
+  double at_sec = 3;
+  double behind_sec = 4;
+  double dropped_sec = 5;
+  double deadline_sec = 6;
+}
+
+enum RecycleReason {
+  RECYCLE_REASON_UNSPECIFIED = 0;
+  RECYCLE_REASON_RSS_THRESHOLD = 1;
+  RECYCLE_REASON_AUDIO_CAP = 2;
+  RECYCLE_REASON_EOU_OPPORTUNISTIC = 3;
+  RECYCLE_REASON_CRASH = 4;
+}
+
+// The engine process was rotated (see upstream issue parakeet.cpp#63: a
+// streaming session leaks ~20-40 MB per second of audio fed and stream_free
+// does not reclaim it). No text was lost or duplicated -- the rotation is a
+// dual-feed overlap cut at an <EOU> boundary where possible. gap_sec is 0.0
+// for a warm overlapped rotation, > 0 for a cold one (no spare was available,
+// e.g. after a crash).
+message Recycled {
+  RecycleReason reason = 1;
+  double gap_sec = 2;
+  double at_audio_sec = 3;
+  bool warm = 4;
+}
+
+// Sent once, before any audio is consumed. Lets the client discover what it
+// actually got rather than assuming.
+message Ready {
+  string model = 1;
+  bool supports_turn_detection = 2;   // false for nemotron: eou_id_ is -1 (no <EOU> token)
+  bool has_punctuation = 3;           // false for realtime_eou_120m-v1
+  uint32 model_chunk_ms = 4;          // 160 (120m) or 320 (nemotron) -- baked into the GGUF
+  uint32 accepted_sample_rate_hz = 5; // always 16000 in v1
+}
+
+// Sent exactly once, last, on a clean half-close. Carries the tail that
+// stream_finalize() releases: the final word of the final utterance only ever
+// materializes here, because a word is not finalized until the NEXT word-start
+// token arrives.
+message Final {
+  string text = 1;
+  repeated Word words = 2;
+  double total_audio_sec = 3;
+  // How many engine generations this call consumed. 1 means no rotation.
+  uint32 worker_generations = 4;
+}
+
+message TranscriptionEvent {
+  oneof event {
+    Ready ready = 1;
+    TranscriptDelta delta = 2;
+    EndOfUtterance eou = 3;
+    EndOfBoundary eob = 4;
+    Warning warning = 5;
+    Recycled recycled = 6;
+    Final final = 7;
+  }
+}
+
+// Terminal failures are gRPC status codes, NOT in-band events:
+//   INVALID_ARGUMENT   bad or missing config, unsupported rate/encoding
+//   RESOURCE_EXHAUSTED at capacity, or the client is too far ahead of decode
+//   UNAVAILABLE        server is draining, or the engine died and could not be replaced
+//   DEADLINE_EXCEEDED  max_call_sec reached
+//   INTERNAL           anything else
+// Warning and Recycled are strictly non-fatal. Keeping these disjoint means a
+// client has exactly one error path instead of two.
+
+message ServerInfoRequest {}
+
+message ServerInfoResponse {
+  string version = 1;               // version.txt hash
+  string built_at = 2;
+  string parakeet_ref = 3;          // upstream git SHA -- PARAKEET_VERSION is frozen at 0.0.1
+  int32 parakeet_abi_version = 4;   // parakeet_capi_abi_version(), expect 6
+  string default_model = 5;
+  string backend = 6;               // "cpu" | "cuda"
+  string ggml_cpu_features = 7;     // catches a silently-scalar build (GGML_NATIVE=OFF trap)
+  uint32 max_concurrent_calls = 8;
+  uint32 active_calls = 9;
+  uint32 warm_spares = 10;
+}

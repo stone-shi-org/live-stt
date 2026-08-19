@@ -1,0 +1,24 @@
+grpcio>=1.76.0
+# grpcio ships a large C++ extension; cp314 wheel coverage is thin as of this
+# writing (host python is 3.14) and building it from source takes 15-25 min on
+# 6 cores. The runtime/test-unit Docker images pin python:3.12-slim precisely
+# to avoid this -- see build.sh's setup_venv() for the native-venv fallback.
+grpcio-tools>=1.76.0
+grpcio-health-checking>=1.76.0
+grpcio-reflection>=1.76.0
+protobuf>=5.28.0
+pydantic-settings>=2.0.0
+# mu-law/A-law LUT decode + 8k resample + RMS-for-backpressure. Deliberately
+# NOT audioop or audioop-lts: audioop was removed by PEP 594 in Python 3.13
+# (host is 3.14 -- `import audioop` fails), and a 256-entry numpy LUT is 3
+# lines, has no packaging risk, and is faster than the ctypes round-trip on
+# block-sized input.
+numpy>=1.26.0
+# High-quality 8kHz<->16kHz resampling for live_stt/client/telephony.py.
+# scipy is not present anywhere in the house and would be a heavier dependency
+# for one function; soxr is small and built exactly for this job. Naive
+# sample-doubling/zero-stuffing adds imaging artifacts that measurably hurt WER.
+soxr>=0.3.7
+prometheus-client>=0.20.0
+pytest>=7.0.0
+pytest-asyncio>=0.23.0

@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+junit_family = "xunit2"
+junit_logging = "system-out"
+addopts = "--strict-markers"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: hits a real external binary or service",
+    "model: needs the real GGUF mounted at LSTT_MODEL_PATH",
+    "slow: runs for more than 5 minutes",
+    "gpu: needs a CUDA device (10.100.0.50 only)",
+]
