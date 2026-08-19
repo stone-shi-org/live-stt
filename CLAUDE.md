@@ -7,6 +7,66 @@ C API, exposed over bidirectional gRPC to a Python telephony application:
 one phone call = one gRPC Transcribe stream = one logical ASR session
 ```
 
+## Serious open risk — read this before trusting rotation or crash recovery
+
+**Starting a fresh parakeet.cpp stream at certain audio content can cause it to silently drop
+several SECONDS of clear, present speech partway through the stream — with no error, no warning,
+just missing words. Found while testing Phase 3's rotation end to end against the real model, and
+confirmed to be an upstream/engine behavior, not a bug in this codebase's rotation logic.**
+
+**Reproduction** (`tools/repro_stream_start_dropout.py`, verified working as of this writing):
+against `~/src/transcript/output.wav` (16kHz mono, verified fixture), a **single worker process
+with zero rotation/dual-feed/promotion code involved** — just `parakeet_capi_stream_begin` fed
+audio starting at file offset **8.00s** — never transcribes "yes yes absolutely ok perfect well
+yeah" (7 words, ~3.6s of unambiguous speech that occurs ~10 seconds into that stream, at absolute
+file position ~18.08-21.68s). The exact same worker, model, and code, started at file offset
+**7.84s or 8.16s instead — each only 160ms away** — transcribes those same words correctly. Six
+offsets 160ms apart were probed; only the one landing exactly on 8.00s (= 50 model chunks = 100
+encoder frames from file start, suspiciously round numbers) failed:
+
+| start offset | "yes yes absolutely..." transcribed? |
+|---|---|
+| 7.68s | yes |
+| 7.84s | yes |
+| **8.00s** | **NO — silently dropped** |
+| 8.16s | yes |
+| 8.32s | yes |
+| 8.48s | yes |
+
+This was discovered because a rotation test showed a duplicated/missing word at a cutover seam.
+Investigation ruled out every piece of this codebase's own logic, in order: (1) the dedup slack
+window, (2) EOU-triggered vs deadline-only cutover (forced deadline-only, bug persisted), (3) the
+shadow-worker dual-feed/promotion mechanism itself (a hand-rolled two-process dual-feed-then-kill
+reproduction, bypassing `session.py` entirely, showed the SAME drop), (4) finally isolated to a
+**single worker, no dual-feed, no promotion at all** — just sensitive to which exact sample its
+own stream happens to start on. See git history around this entry for the elimination sequence if
+reproducing the investigation.
+
+**Why this matters more than it might first appear:** it is not a resource/timing problem with a
+graceful degradation path (like the #63 leak) — it is a **silent correctness failure**. The engine
+returns well-formed, HTTP-200-shaped JSON either way; there is no error to catch, no status to
+check, no signal that anything went wrong. Both **rotation** (a shadow worker begins a fresh
+stream at whatever sample happens to be current when a threshold trips) and **crash recovery** (a
+replacement worker begins a fresh stream at whatever sample was live when the crash happened)
+create a brand-new stream at an **effectively arbitrary, uncontrolled audio offset** relative to
+the call's content — exactly the condition this bug needs. Neither the dedup logic nor any check
+currently in this codebase would catch it if it fires in production: the transcript would just be
+missing words, indistinguishable from the model simply mis-hearing something.
+
+**Status: unresolved, not yet reported upstream, not mitigated in code.** The rotation state
+machine itself (triggers, budget/reserve accounting, dual-feed bookkeeping, EOU/deadline cutover,
+crash recovery, seam dedup) is fully implemented and passes 6/6 tests against a controllable fake
+worker (`tests/test_rotation.py`) that exercise every structural path correctly. What is NOT
+proven safe is what happens when a REAL rotation or crash-recovery lands a fresh stream on a "bad"
+starting offset in production. Do not treat Phase 3 as production-ready until this is either
+understood, reported and fixed upstream, or mitigated (candidate mitigations, none implemented:
+report this pattern to `mudler/parakeet.cpp` with the minimal repro above; extend
+`tools/repro_stream_start_dropout.py` into a sweep that characterizes how common "bad" offsets are
+across more content and more start positions, to size the actual production risk; if bad offsets
+turn out to be common, consider seeding a fresh stream's first few seconds with a short buffered
+lead-in that gets discarded, on the theory that a "warm" start might avoid whatever condition this
+is — untested).
+
 ## The one constraint that shapes everything
 
 **parakeet.cpp issue [#63](https://github.com/mudler/parakeet.cpp/issues/63) — open, unfixed.**

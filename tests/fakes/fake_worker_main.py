@@ -26,6 +26,10 @@ Env vars (all optional):
                              been fed
     FAKE_HANG_AFTER_SEC     stop responding (but stay alive) once this much
                              audio has been fed
+    FAKE_EOU_EVERY_SEC      fire a synthetic <EOU> (eou=1, plus an "eou"
+                             entry in "events") every time this much audio
+                             has been fed since the last one -- for testing
+                             rotation's early-cutover-at-EOU path
 """
 
 from __future__ import annotations
@@ -72,6 +76,7 @@ def main() -> None:
     crash_after_sec = os.environ.get("FAKE_CRASH_AFTER_SEC")
     abort_after_sec = os.environ.get("FAKE_ABORT_AFTER_SEC")
     hang_after_sec = os.environ.get("FAKE_HANG_AFTER_SEC")
+    eou_every_sec = os.environ.get("FAKE_EOU_EVERY_SEC")
 
     frame_type, payload = _read_frame()
     assert frame_type == FrameType.CONFIG
@@ -95,6 +100,7 @@ def main() -> None:
     leaked_chunks: list[bytes] = []  # retained on purpose, to simulate a real leak
     word_counter = 0
     words_owed = 0.0
+    audio_sec_since_last_eou = 0.0
 
     def rss_kb() -> int:
         try:
@@ -141,14 +147,24 @@ def main() -> None:
                     )
                     words_owed -= 1.0
 
+            eou_fired = 0
+            events = []
+            if eou_every_sec:
+                audio_sec_since_last_eou += audio_sec_this_feed
+                threshold = float(eou_every_sec)
+                if threshold > 0 and audio_sec_since_last_eou >= threshold:
+                    eou_fired = 1
+                    events.append({"type": "eou", "frame": 0, "t": fed_audio_sec})
+                    audio_sec_since_last_eou = 0.0
+
             doc = {
                 "rss_kb": rss_kb(),
                 "fed_samples": fed_samples,
                 "text": text,
-                "eou": 0,
+                "eou": eou_fired,
                 "eob": 0,
                 "frame_sec": 0.08,
-                "events": [],
+                "events": events,
                 "words": words,
             }
             response_type = FrameType.FINAL if frame_type == FrameType.FINALIZE else FrameType.RESULT

@@ -240,10 +240,10 @@ async def test_client_cancellation_does_not_hang_the_server() -> None:
             # (in this test) the same event loop but not the same
             # scheduling turn. Poll rather than assert immediately.
             for _ in range(50):
-                if server.servicer._active_calls == 0:
+                if server.servicer._budget.active_calls == 0:
                     break
                 await asyncio.sleep(0.05)
-            assert server.servicer._active_calls == 0, "admission slot leaked after client cancellation"
+            assert server.servicer._budget.active_calls == 0, "admission slot leaked after client cancellation"
 
             # The slot must be free now -- a second call should succeed,
             # not hit RESOURCE_EXHAUSTED from a leaked admission count.

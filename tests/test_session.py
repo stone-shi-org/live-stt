@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
 from live_stt.models import resolve
 from live_stt.pb.livestt.v1 import asr_pb2
@@ -23,11 +24,17 @@ def _settings(**overrides) -> Settings:
     return Settings(_env_file=None, worker_bin=str(FAKE_WORKER), models_dir="/fake", **overrides)
 
 
-def _session(settings: Settings | None = None, model_key: str = "realtime_eou_120m-v1") -> CallSession:
+def _session(
+    settings: Settings | None = None,
+    model_key: str = "realtime_eou_120m-v1",
+    budget: WorkerBudget | None = None,
+) -> CallSession:
     settings = settings or _settings()
     spec = resolve(model_key)
     config = asr_pb2.StreamConfig(encoding=asr_pb2.AUDIO_ENCODING_LINEAR16, sample_rate_hz=16000)
-    return CallSession(settings, spec, config)
+    budget = budget or WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots)
+    budget.try_admit_call()  # a real caller always admits before constructing a CallSession
+    return CallSession(settings, spec, config, budget)
 
 
 @pytest.mark.asyncio

@@ -21,10 +21,13 @@ WAV_PATH = "/data/homes/stoneshi/src/transcript/output.wav"
 CHUNK_MS = 20  # deliberately NOT the model's 160ms chunk -- exercises coalescing
 
 
+SECONDS = float(sys.argv[2]) if len(sys.argv) > 2 else 20.0
+
+
 async def audio_chunks():
     wf = wave.open(WAV_PATH, "rb")
     chunk_samples = int(wf.getframerate() * CHUNK_MS / 1000)
-    n_chunks = int(20 / (CHUNK_MS / 1000))  # ~20s of audio
+    n_chunks = int(SECONDS / (CHUNK_MS / 1000))
     for _ in range(n_chunks):
         pcm = wf.readframes(chunk_samples)
         if not pcm:
@@ -53,6 +56,8 @@ async def main() -> None:
         elif kind == "final":
             full_text += event.final.text
             print(f"FINAL: {event.final}")
+        elif kind == "recycled":
+            print(f"RECYCLED: {event.recycled}")
         else:
             print(f"{kind.upper()}: {getattr(event, kind)}")
 

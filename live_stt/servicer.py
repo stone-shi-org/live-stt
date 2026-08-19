@@ -1,10 +1,11 @@
 """StreamingASR servicer.
 
-Phase 2: Transcribe is wired to a single worker per call via CallSession,
-with no rotation (Phase 3) and no real admission control (Phase 3 -- the
-`_active_calls` counter below is a minimal, immediate-reject safety net
-against unbounded worker spawns during development, not the reserve/gate/
-trailers admission design in CLAUDE.md).
+Transcribe is wired to CallSession, which owns the full rotation state
+machine (Phase 3) -- see live_stt/session.py and CLAUDE.md. Admission here
+is the real reserve-aware design: WorkerBudget distinguishes call slots
+(gates whether a NEW call is admitted) from worker-process slots (gates
+whether an in-progress call's rotation can get a shadow), so the reserve is
+never handed to a new call.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from collections.abc import AsyncIterator
 import grpc
 
 from live_stt import __about__, models
+from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
 from live_stt.logging_config import get_logger
 from live_stt.pb.livestt.v1 import asr_pb2, asr_pb2_grpc
@@ -26,7 +28,7 @@ logger = get_logger("servicer")
 class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._active_calls = 0
+        self._budget = WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots)
 
     async def GetServerInfo(  # noqa: N802 -- generated base class naming
         self, request: asr_pb2.ServerInfoRequest, context: grpc.aio.ServicerContext
@@ -39,8 +41,8 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
             default_model=self._settings.default_model or models.DEFAULT_MODEL_KEY,
             backend=self._settings.backend,
             max_concurrent_calls=self._settings.max_concurrent_calls,
-            active_calls=self._active_calls,
-            warm_spares=0,  # no spare pool yet -- Phase 3
+            active_calls=self._budget.active_calls,
+            warm_spares=0,  # no PRE-warmed pool -- shadows are spawned on demand at rotation time
         )
 
     async def Transcribe(  # noqa: N802
@@ -48,18 +50,18 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
         request_iterator: AsyncIterator[asr_pb2.TranscriptionRequest],
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[asr_pb2.TranscriptionEvent]:
-        # Race-free without a lock: this check-then-increment has no `await`
-        # between its two halves, and grpc.aio servicers run on a single
-        # event loop thread, so no other Transcribe call can interleave here.
-        if self._active_calls >= self._settings.max_concurrent_calls:
+        # Race-free without a lock: try_admit_call()/release_call() have no
+        # `await` between reading and mutating their counters, and grpc.aio
+        # servicers run on a single event loop thread, so no other
+        # Transcribe call can interleave here.
+        if not self._budget.try_admit_call():
             await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "at capacity, try again shortly")
             return
-        self._active_calls += 1
         try:
             async for event in self._transcribe(request_iterator, context):
                 yield event
         finally:
-            self._active_calls -= 1
+            self._budget.release_call()
 
     async def _transcribe(
         self,
@@ -101,7 +103,7 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
             return
 
-        session = CallSession(self._settings, spec, config)
+        session = CallSession(self._settings, spec, config, self._budget)
         try:
             ready_event = await session.start()
         except WorkerError as exc:
