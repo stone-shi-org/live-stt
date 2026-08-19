@@ -53,19 +53,49 @@ the call's content — exactly the condition this bug needs. Neither the dedup l
 currently in this codebase would catch it if it fires in production: the transcript would just be
 missing words, indistinguishable from the model simply mis-hearing something.
 
+**Frequency, characterized** (`tools/sweep_stream_start_dropout.py`, results saved at
+`tools/sweep_results_example.csv`): built one continuous 82s baseline transcript with word
+timestamps, then swept 376 fresh-stream start offsets 160ms apart across the first 62s of the same
+file, each fed a 20s window, scoring word recall against the baseline in the matching absolute-time
+range (3s startup grace, 0.75s timing tolerance). **3 of 376 offsets (0.8%) scored recall < 0.6**
+(0.406, 0.542, 0.558), with a wider band of offsets around 17.4–18.0s scoring a consistently
+moderate ~0.61–0.63 — a softer version of the same failure, not just sweep noise. Spot-checked the
+worst (offset 29.68s, recall 0.406) word-by-word against the baseline: the candidate cleanly
+**drops "twenty thirty minutes or so and i just wanted to informally contact to chat a little bit
+more about what's going on here at reddit" in its entirety** (~10s, 15 words), then resumes and
+matches the baseline closely from "our business as well as..." onward — the exact same
+clean-block-of-silence shape as the original single-offset repro, not a diffuse mismatch.
+
+**The specific bad offsets are NOT fixed properties of the audio alone — they shift with
+`n_threads`.** The original repro (8.00s failing, 7.84s/8.16s fine) used `n_threads=4`; this sweep
+used `n_threads=1` throughout and did not flag 8.00s at all (nearby grid points 7.92s/8.08s both
+scored ~0.96), instead flagging different nearby offsets (8.72s among them). Since ggml's threaded
+reduction order changes floating-point summation order, and floating-point addition is not
+associative, this points to a **genuine numerical near-tie in some incremental decoding decision**
+(plausibly the RNN-T joint network's blank/non-blank gate, or a chunked-attention boundary weight)
+that a few ULPs of difference can tip either way — and tipping it the "wrong" way apparently drives
+the decoder into a state it takes several seconds to recover from. This also means the specific
+offsets found here are not portable to a different `n_threads`, a different quantization, a
+different CPU (SIMD reduction order), or a GPU build — only the *rate* (very roughly ~1% of
+arbitrary restart points, on this one file) is likely to be a useful estimate, and even that should
+not be assumed to generalize without testing on more content.
+
 **Status: unresolved, not yet reported upstream, not mitigated in code.** The rotation state
 machine itself (triggers, budget/reserve accounting, dual-feed bookkeeping, EOU/deadline cutover,
 crash recovery, seam dedup) is fully implemented and passes 6/6 tests against a controllable fake
 worker (`tests/test_rotation.py`) that exercise every structural path correctly. What is NOT
 proven safe is what happens when a REAL rotation or crash-recovery lands a fresh stream on a "bad"
-starting offset in production. Do not treat Phase 3 as production-ready until this is either
-understood, reported and fixed upstream, or mitigated (candidate mitigations, none implemented:
-report this pattern to `mudler/parakeet.cpp` with the minimal repro above; extend
-`tools/repro_stream_start_dropout.py` into a sweep that characterizes how common "bad" offsets are
-across more content and more start positions, to size the actual production risk; if bad offsets
-turn out to be common, consider seeding a fresh stream's first few seconds with a short buffered
-lead-in that gets discarded, on the theory that a "warm" start might avoid whatever condition this
-is — untested).
+starting offset in production — and at a measured ~1% incidence, this is not a theoretical edge
+case: a service doing dozens of rotations a day should expect to hit it. Do not treat Phase 3 as
+production-ready until this is either understood, reported and fixed upstream, or mitigated
+(candidate mitigations, none implemented: report this pattern to `mudler/parakeet.cpp` with the
+minimal repro and the sweep methodology above, since the numerical-near-tie theory is exactly the
+kind of thing a maintainer with access to the RNN-T joint network's internals could confirm or
+rule out quickly; extend the sweep to more/longer content and other `n_threads` values to check
+whether ~1% holds up; if it does, consider whether a rotation/crash-recovery could detect the
+failure signature live — e.g. an unusually long stretch with zero finalized words despite
+non-silent input — and retry with a fresh worker rather than accepting the loss silently, though
+that itself needs an audio-activity signal this codebase does not yet compute).
 
 ## The one constraint that shapes everything
 
