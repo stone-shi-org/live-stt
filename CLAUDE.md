@@ -12,19 +12,18 @@ one phone call = one gRPC Transcribe stream = one logical ASR session
 **parakeet.cpp issue [#63](https://github.com/mudler/parakeet.cpp/issues/63) — open, unfixed.**
 `parakeet_capi_stream_feed`/`_json` leaks memory linearly with audio fed, and `stream_free` +
 `stream_begin` does **not** reclaim it — only killing the process does. The issue reports
-19–41 MB **per second of audio fed**, measured on a CUDA Jetson build.
+19–41 MB **per second of audio fed**, measured on a CUDA Jetson build, and was never tested on CPU.
 
-**Update, measured on this repo's own CPU build (informal, not yet a rigorous Gate A — see
-"What's actually been measured" below): feeding 112s of real speech through one session grew RSS
-by only ~26 MB (~0.2 MB/s), two orders of magnitude below the CUDA number.** This is a real,
-repeatable local observation, not a citation — but it is far too short a run to trust as a
-capacity-planning constant. **Do not size `LSTT_ROTATE_AFTER_SEC` or `LSTT_WORKER_RSS_SOFT_KB`
-from it.** Run the full `tools/leak_curve.py` (Phase 1 Gate A: silence AND real speech, to 600s+,
-linear regression with R² check) before trusting any number here, on both backends this service
-ships. If it holds up, the aggressive worker-rotation design below may turn out to be far more
-conservative than the CPU backend actually needs — but the architecture should still support it,
-because CUDA (Phase 5) may need it and because "assume the worst until measured" is the only safe
-default for a service whose failure mode is OOM on a live phone call.
+**Measured on this repo's own CPU build (`tools/leak_curve.py`, Phase 1 Gate A — 600s runs, both
+conditions, linear regression): silence 0.076 MB/s (R²=0.69, oscillating rather than monotone),
+real speech 0.085 MB/s (R²=0.87, smoother). Both roughly 0.08 MB/s — 200–500x BELOW the CUDA
+number.** This is a rigorous measurement (not a spot check — two 600-second runs, R² checked),
+repeatable via `tests/test_leak_curve.py`'s tripwire (shorter 90s runs asserting the same order of
+magnitude). At this rate a 2-hour call leaks on the order of tens of MB, not tens of GB — the
+worker-rotation machinery below is a real safety net worth keeping, but `rotate_after_sec` is sized
+generously (3600s) rather than defensively, because the CPU backend plainly isn't reproducing the
+severity of the upstream report. **This does NOT transfer to a CUDA build — re-run Gate A on both
+`VmRSS` and per-process VRAM before Phase 5, and don't assume the same headroom.**
 
 Given that, the honest invariant this codebase is built on — not "one immortal `parakeet_stream`
 per call" — is:
@@ -104,15 +103,69 @@ in `configure()` and there is no loop anywhere near it.
   spawn/socketpair/rlimits — the actual production analogue of `tests/worker_harness.py`),
   `live_stt/pool/` (spares, admission), `live_stt/boundary.py`'s dedup wired into a real rotation,
   `live_stt/redaction.py`, `live_stt/metrics.py`. `Transcribe` is a stub.
-- **Not yet run:** the Phase 1 measurement gates as rigorous, decision-grade artifacts
-  (`tools/leak_curve.py`, `tools/thread_sweep.py`, the telephony-band WER penalty test). Only an
-  informal, short leak spot-check has been done (see above).
+- **Phase 1 (all three gates run for real, see "Phase 1 measurements" below):** the leak curve
+  (both conditions, 600s each), the thread sweep (n_threads 1-6 on this 6-core host), and the
+  telephony-band WER penalty (one NOTSOFAR-1 meeting, three arms). All three have permanent
+  regression tests (`tests/test_leak_curve.py`, `tests/test_telephony_band.py`) and standalone
+  re-runnable tools (`tools/leak_curve.py`, `tools/thread_sweep.py`, `tools/telephony_band_wer.py`).
 - **Docker:** `Dockerfile` has all targets (`parakeet-build`, `worker-build`, `runtime`,
-  `test-unit`, `test-integration`, `test-worker`) and `test-unit` has been built and verified.
-  `runtime`/`test-integration` are written but not yet built+run end-to-end in a container as of
-  this writing — verify before trusting them blindly.
+  `test-unit`, `test-integration`, `test-worker`). `test-unit` AND `runtime` have both been built
+  and verified — `runtime`'s worker binary was run via `docker exec` against a real
+  volume-mounted model inside the actual container (not just natively), confirming the `$ORIGIN`
+  rpath resolves the ggml `.so`s correctly in that environment. `test-integration` is written but
+  not yet built+run in a container — verify before trusting it blindly.
 - **docker-compose.yml, CUDA build, observability (metrics/redaction), long-call and concurrency
   tests:** not written yet.
+
+## Phase 1 measurements (all three gates, run for real on this repo's CPU build)
+
+**Gate A — leak curve.** See the top of this file. `tools/leak_curve.py --condition silence
+--audio-sec 600` and `--condition speech --audio-fixture ~/src/transcript/output.wav --audio-sec
+600`, both at `n_threads=4`: **0.076 MB/s (silence, R²=0.69) and 0.085 MB/s (speech, R²=0.87)** —
+same order of magnitude between conditions, so the leak (what little there is) tracks fed audio
+roughly evenly, not emitted tokens specifically. `tests/test_leak_curve.py` pins a wide tripwire
+band around this (0.02–0.6 MB/s) as a 90s-run regression check.
+
+**Gate B — thread sweep.** `tools/thread_sweep.py`, 60s of real speech per `n_threads` value, on
+this 6-core host:
+
+| n_threads | rtfx | aggregate throughput at W = floor(6×0.8/n_threads) |
+|---|---|---|
+| 1 | 2.48 | W=4 → **9.92** |
+| 2 | 3.87 | W=2 → 7.74 |
+| 3 | 4.85 | W=1 → 4.85 |
+| 4 | 5.54 | W=1 → 5.54 |
+| 6 | 4.75 | W=1 → 4.75 (more threads than cores available for anything else — worse than 4) |
+
+Non-obvious finding: per-thread returns are sharply sub-linear for this model (4x the threads
+only bought 2.2x the speed), so **more single-threaded workers beat fewer multi-threaded ones** on
+aggregate throughput here — `n_threads_per_worker=1` is the config default. Caveat: this measures
+one stream at a time, not real concurrent contention (shared L3/memory bandwidth across
+simultaneously-running workers is untested) — a Phase 4 concurrency test on a real multi-core box
+is still needed before trusting the W=4 number as a production capacity figure, and this sweep is
+dev-host-specific (6 cores) regardless.
+
+**Gate C — telephony band penalty.** `tools/telephony_band_wer.py` against NOTSOFAR-1 meeting
+`MTG_32089` (far-field single-channel audio, ~6 min, 1130 reference words):
+
+| arm | WER |
+|---|---|
+| native (16kHz) | 51.8% |
+| linear 8kHz roundtrip (no mu-law) | 67.7% (+15.9 points vs native) |
+| mu-law 8kHz roundtrip (full telephony leg) | 70.4% (+18.7 points vs native) |
+
+Narrowbanding costs a real, substantial WER penalty (~30-35% relative), and **most of it is
+bandwidth loss, not mu-law's quantization** (mu-law-only cost beyond linear-8kHz: +2.7 points).
+Caveat: this is one hard far-field, multi-speaker, single-channel meeting condition — harder than
+a real two-party phone call is likely to be, so the *absolute* WER here (51.8% even at native
+16kHz) should not be read as "what a phone call will score." The point is the *shape* of the
+penalty, not the absolute number, and `tests/test_telephony_band.py` pins the recorded deltas
+(with ±0.15 slack) plus the structural claim (`bandwidth_only > codec_only`) as a regression check.
+
+Reproducing Gate C needs `pip install audioop-lts` in the venv (not in `requirements.txt` — it's
+only used by `tools/telephony_band_wer.py`'s mu-law *encode* step, which exists purely to simulate
+the encode side of a telephony leg for this diagnostic; the service itself never encodes G.711,
+only decodes it, so this is deliberately not a runtime dependency of anything under `live_stt/`).
 
 ## Model choice
 

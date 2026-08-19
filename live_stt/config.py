@@ -26,19 +26,34 @@ class Settings(BaseSettings):
     default_model: str = DEFAULT_MODEL_KEY
     models_dir: str = "/models"
 
-    # Derived from tools/thread_sweep.py (Phase 1 Gate B) for the target
-    # concurrency; these are conservative placeholders until that sweep runs.
-    n_threads_per_worker: int = 4
+    # tools/thread_sweep.py (Phase 1 Gate B), measured on THIS repo's 6-core
+    # dev host, single-stream-at-a-time (not concurrent -- see CLAUDE.md's
+    # caveat about contention): n_threads=1 gave rtfx=2.48 and, because
+    # per-thread returns were sharply sub-linear (n_threads=4 only reached
+    # rtfx=5.54, 2.2x for 4x the threads), the highest AGGREGATE throughput
+    # (W * rtfx) came from running MORE single-threaded workers, not fewer
+    # multi-threaded ones. Re-run the sweep on the actual deployment box --
+    # these numbers are dev-host-only and not a production capacity signal.
+    n_threads_per_worker: int = 1
     max_concurrent_calls: int = 3
     # Admission always reserves this many slots so a mid-call rotation has
     # somewhere to put its overlap shadow. Never hand the reserve to a call.
     reserve_slots: int = 1
 
     # Rotation triggers (see live_stt/pool/supervisor.py). RSS is primary and
-    # backend-agnostic; audio_cap is the deterministic fallback used when Gate
-    # A hasn't run or the RSS watchdog is disabled for a test.
+    # backend-agnostic; audio_cap is the deterministic fallback.
+    #
+    # tools/leak_curve.py (Phase 1 Gate A), measured on THIS repo's CPU build:
+    # ~0.08 MB leaked per audio-second fed (600s runs, both silence and real
+    # speech, see CLAUDE.md) -- roughly 200-500x BELOW the 19-41 MB/s the
+    # upstream issue (mudler/parakeet.cpp#63) reports, which was only ever
+    # measured on a CUDA Jetson build. At this rate a 2-hour call leaks only
+    # ~35 MB, not tens of GB, so rotate_after_sec below is sized generously
+    # rather than defensively -- the RSS watchdog is the real safety net, not
+    # a tightly-tuned deadline. Re-measure before a CUDA (Phase 5) rollout;
+    # do not assume this number transfers to that backend.
     worker_rss_soft_kb: int = 2_400_000  # ~2.3 GB
-    rotate_after_sec: float = 1800.0
+    rotate_after_sec: float = 3600.0
     rotation_overlap_sec: float = 10.0  # > ~4.5s left context (att_context [70,1] @ 80ms/frame)
 
     # Backpressure / drift (live_stt/session.py's AudioRing + watchdog).
