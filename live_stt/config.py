@@ -26,6 +26,16 @@ class Settings(BaseSettings):
     default_model: str = DEFAULT_MODEL_KEY
     models_dir: str = "/models"
 
+    # Matches the Dockerfile runtime stage's layout (worker binary + its
+    # ggml .so's copied into the same directory so the $ORIGIN rpath baked
+    # in at link time resolves them -- see CLAUDE.md). worker_ggml_lib_dir
+    # is None in that case: LD_LIBRARY_PATH is not needed and not set.
+    # Native/dev use (scripts/build_worker.sh's output layout) needs it,
+    # since worker/build/live_stt_worker and worker/build-parakeet/.../ggml
+    # aren't co-located there.
+    worker_bin: str = "/app/worker/live_stt_worker"
+    worker_ggml_lib_dir: str | None = None
+
     # tools/thread_sweep.py (Phase 1 Gate B), measured on THIS repo's 6-core
     # dev host, single-stream-at-a-time (not concurrent -- see CLAUDE.md's
     # caveat about contention): n_threads=1 gave rtfx=2.48 and, because

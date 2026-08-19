@@ -97,17 +97,26 @@ in `configure()` and there is no loop anywhere near it.
   streaming session over real speech, produces a sensible multi-word transcript, and exits
   cleanly. `tests/test_capi_smoke.py` encodes this as a repeatable, real-binary integration test
   (6/6 passing as of this writing). The gRPC server, health/reflection services, and
-  `GetServerInfo` are real and working; `Transcribe` returns `UNIMPLEMENTED` on purpose.
-- **Not yet built (Phase 2/3):** `live_stt/session.py` (CallSession, the 4-coroutine structure,
-  AudioRing/backpressure, the rotation state machine), `live_stt/worker.py` (WorkerHandle:
-  spawn/socketpair/rlimits — the actual production analogue of `tests/worker_harness.py`),
-  `live_stt/pool/` (spares, admission), `live_stt/boundary.py`'s dedup wired into a real rotation,
-  `live_stt/redaction.py`, `live_stt/metrics.py`. `Transcribe` is a stub.
+  `GetServerInfo` are real and working.
 - **Phase 1 (all three gates run for real, see "Phase 1 measurements" below):** the leak curve
   (both conditions, 600s each), the thread sweep (n_threads 1-6 on this 6-core host), and the
   telephony-band WER penalty (one NOTSOFAR-1 meeting, three arms). All three have permanent
   regression tests (`tests/test_leak_curve.py`, `tests/test_telephony_band.py`) and standalone
   re-runnable tools (`tools/leak_curve.py`, `tools/thread_sweep.py`, `tools/telephony_band_wer.py`).
+- **Phase 2 (proven end-to-end, real gRPC client through a real worker and model — see
+  `scripts/e2e_grpc_smoke.py`):** `live_stt/worker.py` (the production `WorkerHandle`, asyncio
+  streams over the same socketpair IPC, the `pass_fds`-plus-`preexec_fn` fix baked in),
+  `live_stt/session.py` (`CallSession`: `start`/`feed_audio`/`finalize`/`close`, chunk coalescing
+  to `model_chunk_ms` — verified by feeding 20ms client frames against a 160ms model chunk and
+  confirming `audio_offset_sec` only advances once a full chunk is actually fed), and
+  `servicer.Transcribe` wired to it for real, including config validation (encoding, sample rate,
+  unknown model), half-close → `finalize()` → `Final`, and a minimal immediate-reject
+  `RESOURCE_EXHAUSTED` admission counter (NOT the full reserve/gate/trailers design in "Concurrency
+  and capacity" below — that's still Phase 3). `tests/fakes/fake_worker_main.py` is a real
+  subprocess speaking the real IPC protocol, driven by env vars (crash/abort/hang/leak/rtf/words),
+  making `tests/test_session.py` and `tests/test_servicer.py` (a real `grpc.aio` server on a
+  loopback port) fast and offline while still exercising real process/fd/signal behavior. No
+  rotation yet (Phase 3): one `WorkerHandle` lives for the whole call.
 - **Docker:** `Dockerfile` has all targets (`parakeet-build`, `worker-build`, `runtime`,
   `test-unit`, `test-integration`, `test-worker`). `test-unit` AND `runtime` have both been built
   and verified — `runtime`'s worker binary was run via `docker exec` against a real
@@ -296,6 +305,15 @@ single decision makes four separate hazards structurally impossible at once: the
 state). Target is 3-8 concurrent calls per instance — needs a ~20-core box; **this repo's dev host
 is 6 cores and sustains ~1-2 concurrent streams, functional testing only, never a capacity signal.**
 
+**gRPC gotcha found while testing admission rejection** (`tests/test_servicer.py`): if a client
+keeps writing request messages on a bidi stream immediately after the server has decided to
+`abort()` it (our `RESOURCE_EXHAUSTED` check runs before reading a single message, so this is
+easy to hit), the client can occasionally observe a generic `INTERNAL`/`"Internal error from
+Core"` instead of the intended status — a client-still-writing-vs-server-aborting race at the
+grpc-core transport level, not a servicer bug. A real client that stops writing as soon as it
+sees the RPC end (rather than pipelining further messages regardless) won't hit this. Worth
+knowing if a future client implementation pipelines aggressively.
+
 ## Conventions
 
 House conventions, mirrored from `~/src/my-meeting-notes`: flat top-level package (no `src/`
@@ -342,14 +360,14 @@ binary from Python in integration tests — see the fd-passing gotcha above befo
 
 0. **Skeleton + first light — DONE.** Worker builds and runs against a real model; gRPC/health/
    reflection/GetServerInfo work; `test-unit` Docker target builds.
-1. **Measure before designing the pool — NOT DONE AS RIGOROUS GATES.** `tools/leak_curve.py`
-   (CPU **and** CUDA), `tools/thread_sweep.py`, the telephony-band WER penalty test. Only an
-   informal leak spot-check exists so far (see top of this file). No pool config should be
-   finalized before these run properly.
-2. **Minimal end-to-end, one generation, no rotation.** `live_stt/session.py`,
-   `live_stt/worker.py` (the production `WorkerHandle`, mind the fd-passing gotcha),
-   `servicer.Transcribe` wired to a single worker, no rotation yet.
-3. **Survive the call.** `live_stt/pool/supervisor.py`, the overlapped-rotation state machine,
+1. **Measure before designing the pool — DONE.** `tools/leak_curve.py` (CPU; CUDA still pending,
+   Phase 5), `tools/thread_sweep.py`, the telephony-band WER penalty test — all three run for
+   real, with recorded numbers and permanent regression tests. See "Phase 1 measurements" above.
+2. **Minimal end-to-end, one generation, no rotation — DONE.** `live_stt/session.py`,
+   `live_stt/worker.py`, `servicer.Transcribe` wired to a single worker. Proven via a real gRPC
+   client through a real worker and model (`scripts/e2e_grpc_smoke.py`) and via
+   `tests/test_session.py`/`tests/test_servicer.py` against the fake worker.
+3. **Survive the call — NOT STARTED.** `live_stt/pool/supervisor.py`, the overlapped-rotation state machine,
    `boundary.py` wired in for real, admission control, the drift watchdog.
 4. **Production shape.** `docker-compose.yml`, `metrics.py`, `redaction.py`, graceful drain,
    Prometheus/Grafana wiring.
