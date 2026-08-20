@@ -127,3 +127,41 @@ async def test_health_endpoint_is_200_at_capacity_and_503_while_draining() -> No
             assert exc.code == 503
     finally:
         server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stats_web_page_endpoint() -> None:
+    settings = Settings(_env_file=None)
+    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+        for path in ("/", "/stats", "/dashboard"):
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as resp:
+                assert resp.status == 200
+                assert "text/html" in resp.headers.get("Content-Type", "")
+                html_body = resp.read().decode()
+                assert "Live-STT Streaming ASR" in html_body
+                assert "Admin & Real-time Stats Dashboard" in html_body
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_config_http_endpoint() -> None:
+    import json
+
+    settings = Settings(_env_file=None)
+    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/config", timeout=5) as resp:
+            assert resp.status == 200
+            doc = json.loads(resp.read().decode())
+            assert "grpc_port" in doc
+            assert "backend" in doc
+            assert "max_concurrent_calls" in doc
+    finally:
+        server.shutdown()
+
