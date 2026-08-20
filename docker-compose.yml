@@ -1,0 +1,63 @@
+services:
+  live-stt:
+    # Matches build.sh's default local tag (no -r/LSTT_REGISTRY): `./build.sh`
+    # then `docker compose up -d` reuses that image without a second,
+    # registry-less build here.
+    image: live-stt:latest
+    build:
+      context: .
+      target: runtime
+    container_name: live-stt
+    env_file:
+      - .env
+    init: true  # tini as PID 1 -- reaps zombies if a worker is ever orphaned
+    ulimits:
+      core: 0  # ggml aborts (not raises) on some allocation failures; this
+               # is the only containable defense against a multi-GB core
+               # file per crash/rotation -- /proc/sys/kernel/core_pattern is
+               # host-global and can't be set from inside a container.
+    # Backstop for parakeet.cpp#63 (see CLAUDE.md) -- measured much smaller
+    # on this repo's CPU build than the upstream CUDA report, but sized to
+    # survive being wrong about that, not to the measured number exactly.
+    mem_limit: 6g
+    # Must exceed LSTT_DRAIN_TIMEOUT_SEC (default 300s) -- Docker's own
+    # default of 10s would SIGKILL every active call before the servicer's
+    # own graceful drain even gets a chance to run.
+    stop_grace_period: 330s
+    ports:
+      - "4030:50051"  # gRPC -- dial this directly; see the Traefik note below
+      - "4031:8000"   # admin HTTP: /api/health /api/version /api/stats /metrics
+    volumes:
+      # Model MOUNTED, never baked into the image -- and read-only, so a bug
+      # in this service can't corrupt it.
+      - ./models:/models:ro
+      # Bind, not a named volume: same backup-ability reasoning as
+      # my-meeting-notes' ./data mount. Currently unused (no persisted
+      # state -- see CLAUDE.md) but reserved for future audio-dump-on-error
+      # output (LSTT_AUDIO_DUMP) and any future local cache.
+      - ./data:/app/data
+    restart: unless-stopped
+    networks:
+      - home-net
+    labels:
+      # Admin port only. Do NOT put the gRPC port behind Traefik: the
+      # shared web-secure entrypoint's writeTimeout=600s would silently
+      # truncate every call at 10 minutes (see CLAUDE.md's Ops notes). The
+      # telephony app is internal and already on home-net -- it dials
+      # live-stt:50051 directly, bypassing Traefik entirely.
+      - "traefik.enable=true"
+      - "traefik.docker.network=home-net"
+      - "traefik.http.services.live-stt.loadbalancer.server.port=8000"
+      - "traefik.http.routers.live-stt.rule=Host(`live-stt.local.shifamily.com`)"
+      - "traefik.http.routers.live-stt.entrypoints=web-secure"
+      - "traefik.http.routers.live-stt.tls=true"
+      - "traefik.http.routers.live-stt.tls.certresolver=le"
+      - "traefik.http.routers.live-stt-http.rule=Host(`live-stt.local.shifamily.com`)"
+      - "traefik.http.routers.live-stt-http.entrypoints=web"
+      - "traefik.http.routers.live-stt-http.middlewares=live-stt-https"
+      - "traefik.http.middlewares.live-stt-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.live-stt-https.redirectscheme.permanent=true"
+
+networks:
+  home-net:
+    external: true

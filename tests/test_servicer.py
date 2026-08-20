@@ -16,9 +16,11 @@ from pathlib import Path
 import grpc
 import pytest
 
+from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
 from live_stt.pb.livestt.v1 import asr_pb2, asr_pb2_grpc
 from live_stt.servicer import StreamingASRServicer
+from live_stt.state import ServerState
 
 FAKE_WORKER = Path(__file__).resolve().parent / "fakes" / "fake_worker_main.py"
 
@@ -30,7 +32,10 @@ def _settings(**overrides) -> Settings:
 class _Server:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.servicer = StreamingASRServicer(settings)
+        self.state = ServerState(
+            settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots)
+        )
+        self.servicer = StreamingASRServicer(self.state)
         self._server: grpc.aio.Server | None = None
         self.port: int | None = None
 

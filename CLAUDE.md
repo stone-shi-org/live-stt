@@ -207,14 +207,44 @@ in `configure()` and there is no loop anywhere near it.
   making `tests/test_session.py` and `tests/test_servicer.py` (a real `grpc.aio` server on a
   loopback port) fast and offline while still exercising real process/fd/signal behavior. No
   rotation yet (Phase 3): one `WorkerHandle` lives for the whole call.
+- **Phase 4 (proven end-to-end via a real `docker compose up` against the real model, active call
+  mid-drain included):** `live_stt/metrics.py` (`prometheus_client`, exposed at `GET /metrics`),
+  `live_stt/redaction.py` (the two-switch `LSTT_TRANSCRIPT_LOG`/`LSTT_AUDIO_DUMP` design, validated
+  at startup — refuses to start rather than silently downgrading), `live_stt/state.py`
+  (`ServerState`: the one shared object between `server.py`/`servicer.py`/`admin_http.py` — flags
+  and the `WorkerBudget`, deliberately NOT a session registry), `live_stt/admin_http.py`
+  (`/api/health` now capacity- and draining-aware, `/api/stats`, `/metrics`), and a real SIGTERM
+  handler in `server.py` that flips gRPC health to `NOT_SERVING` and `state.draining = True`
+  **immediately**, before `grpc.aio`'s own drain grace period even starts. Verified manually: with
+  one call in flight, SIGTERM makes `/api/health` report `"draining"` and `/api/stats` report
+  `active_calls: 1` right away, a *second* call attempted during that window gets
+  `UNAVAILABLE`, and the *original* in-flight call keeps running and reaches a normal `Final` —
+  confirmed via the lifecycle log line, which also confirms redaction is doing its job by showing
+  `chars=380 words=75` with **no transcript text**, the default (`off`) mode. `docker-compose.yml`
+  built and run for real (`docker compose up -d --build`) — not just `docker build`. Along the
+  way, running real load in a container (not just natively) surfaced a genuine grpc-core
+  fork-safety crash affecting every worker spawn in the service, not just tests — see
+  "Concurrency and capacity" below for the finding and the `GRPC_POLL_STRATEGY=poll` fix.
+  `docker-compose.gpu.yml` intentionally not written yet: there is no `runtime-cuda` Dockerfile
+  target for it to reference (Phase 5).
 - **Docker:** `Dockerfile` has all targets (`parakeet-build`, `worker-build`, `runtime`,
-  `test-unit`, `test-integration`, `test-worker`). `test-unit` AND `runtime` have both been built
-  and verified — `runtime`'s worker binary was run via `docker exec` against a real
-  volume-mounted model inside the actual container (not just natively), confirming the `$ORIGIN`
-  rpath resolves the ggml `.so`s correctly in that environment. `test-integration` is written but
-  not yet built+run in a container — verify before trusting it blindly.
-- **docker-compose.yml, CUDA build, observability (metrics/redaction), long-call and concurrency
-  tests:** not written yet.
+  `test-unit`, `test-integration`, `test-worker`). `test-unit`, `runtime`, and the full
+  `docker-compose.yml` stack have all been built and run for real — `runtime`'s worker binary was
+  run via `docker exec` against a real volume-mounted model inside the actual container (not just
+  natively), confirming the `$ORIGIN` rpath resolves the ggml `.so`s correctly in that environment.
+  `test-integration` is written but not yet built+run in a container — verify before trusting it
+  blindly.
+- **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
+  `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
+  in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and
+  calls the worker; there is no bounded ring, no drop-oldest policy, and no `behind_sec`
+  computation). `LSTT_AUDIO_DUMP` is validated at startup but has nothing to act on (no ring buffer
+  to dump from). Sending a live `Warning{SERVER_DRAINING}` event into an *already-open* stream when
+  a drain starts is also not implemented — draining currently only blocks *new* admission; an
+  active call gets no in-band notice that a deadline is coming, it just has up to
+  `drain_timeout_sec` to finish naturally before `grpc.aio`'s own stop-grace forcibly ends it.
+  CUDA build, Prometheus scrape-job/Grafana dashboard JSON, long-call and concurrency tests: not
+  written yet either.
 
 ## Phase 1 measurements (all three gates, run for real on this repo's CPU build)
 
@@ -404,6 +434,30 @@ grpc-core transport level, not a servicer bug. A real client that stops writing 
 sees the RPC end (rather than pipelining further messages regardless) won't hit this. Worth
 knowing if a future client implementation pipelines aggressively.
 
+**gRPC + fork() crash, found under container load, more severe than the above — mitigated, not
+just a test nuisance.** grpc-core's default `epoll1` polling engine has a fork-safety bug:
+`WorkerHandle.spawn()`'s `subprocess.Popen` calls `fork()`, and doing that from a process that also
+runs a live `grpc.aio.server()` (i.e. **every worker spawn in this entire service** — every call,
+every rotation, every crash recovery) can hit `F ... ev_epoll1_linux.cc:1121] Check failed:
+next_worker->state == KICKED` and abort the **whole process**, not just the spawn attempt. Reproduced
+intermittently (roughly 1-in-8 to 1-in-12 runs) in `tests/test_servicer.py` under
+`docker run`, essentially never natively — container CPU scheduling makes the race window easier to
+hit, but the hazard is not container-specific; production hits the identical fork pattern on every
+single call. `pass_fds` (required for the socketpair fd-passing scheme) unconditionally disables
+Python's safer `posix_spawn` path regardless of `preexec_fn`, so this could not be avoided by
+trimming what runs in the preexec hook. **Fix, verified 20/20 clean under the same stress that
+reproduced it 1-in-8: `GRPC_POLL_STRATEGY=poll`**, set as a Dockerfile `ENV` on the common ancestor
+of `runtime`/`test-unit`/`test-integration` (so nothing can run without it) and via
+`tests/conftest.py`'s `pytest_configure` for native/ad-hoc runs (must be set before grpc-core's
+first channel/server in the process — it picks its polling engine once and caches the choice, so a
+per-test fixture is too late). Isolated by testing each independently:
+`GRPC_ENABLE_FORK_SUPPORT=1` alone does **not** fix it; switching off `epoll1` is what matters.
+Also observed once, not reproduced (5/5 clean retries immediately after): a client's first message
+on a freshly-restarted container's first-ever connection got a generic `INTERNAL`/`"Internal error
+from Core"` on its own `SendMessageOperation` — plausibly a separate, benign first-connection
+warm-up transient, not chased further since a real client already needs to retry on `INTERNAL`
+regardless (see the failure semantics elsewhere in this file).
+
 ## Conventions
 
 House conventions, mirrored from `~/src/my-meeting-notes`: flat top-level package (no `src/`
@@ -457,9 +511,20 @@ binary from Python in integration tests — see the fd-passing gotcha above befo
    `live_stt/worker.py`, `servicer.Transcribe` wired to a single worker. Proven via a real gRPC
    client through a real worker and model (`scripts/e2e_grpc_smoke.py`) and via
    `tests/test_session.py`/`tests/test_servicer.py` against the fake worker.
-3. **Survive the call — NOT STARTED.** `live_stt/pool/supervisor.py`, the overlapped-rotation state machine,
-   `boundary.py` wired in for real, admission control, the drift watchdog.
-4. **Production shape.** `docker-compose.yml`, `metrics.py`, `redaction.py`, graceful drain,
-   Prometheus/Grafana wiring.
+3. **Survive the call — implemented, but see "Serious open risk" at the top of this file before
+   trusting it.** The overlapped-rotation state machine, `boundary.py` dedup wired in for real,
+   reserve-aware admission (`live_stt/admission.py`'s `WorkerBudget`), and crash recovery are all
+   built directly into `live_stt/session.py` (no separate `pool/supervisor.py` — the rotation logic
+   turned out to belong with the call it rotates, not a standalone pool manager) and pass 6/6 tests
+   against the fake worker. What's NOT proven safe: what happens when a real rotation or crash
+   recovery lands a fresh stream on a "bad" starting offset — measured at ~1% incidence, not a
+   theoretical edge case. The drift watchdog (`behind_sec`, the AudioRing backpressure design) was
+   never built — see the "Not yet built" note above.
+4. **Production shape — mostly done.** `docker-compose.yml`, `metrics.py`, `redaction.py`, and a
+   real graceful-drain SIGTERM handler are built and verified end-to-end (see above). Not done:
+   Prometheus scrape-job/Grafana dashboard artifacts (the `/metrics` endpoint itself works and was
+   verified to parse; wiring it into the estate's existing `prom/prometheus` instance is a
+   deploy-time step, not a code change, and hasn't been done), and in-band `Warning{SERVER_DRAINING}`
+   notification to an already-open stream (see above).
 5. **GPU and multilingual.** CUDA build target, VRAM-aware admission, nemotron's language-select
    path, a VAD to synthesize turn boundaries for the no-`<EOU>` model.

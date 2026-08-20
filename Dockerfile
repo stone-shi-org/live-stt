@@ -53,7 +53,20 @@ RUN cd worker && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 # ---- stage: Python dependencies (shared by runtime and test-unit) ---------
 FROM python:3.12-slim AS py-deps
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    # grpc-core's default epoll1 poller has a fork-safety bug: forking a
+    # worker subprocess (WorkerHandle.spawn -- every call, every rotation,
+    # every crash recovery) from a process that also runs a live
+    # grpc.aio.server() can hit "Check failed: next_worker->state ==
+    # KICKED" and crash the WHOLE PROCESS, not just the spawn attempt.
+    # Reproduced under load in this repo's own containerized test suite
+    # (intermittent, worse under container CPU scheduling than natively).
+    # GRPC_ENABLE_FORK_SUPPORT=1 alone does NOT fix it (tested); switching
+    # off epoll1 does. This must be set in every environment that runs
+    # live_stt/server.py, not just tests -- it is set here (the common
+    # ancestor of runtime, test-unit, and test-integration) rather than only
+    # in docker-compose.yml so nothing can accidentally run without it.
+    GRPC_POLL_STRATEGY=poll
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt --index-url https://pypi.org/simple/
@@ -104,6 +117,7 @@ FROM py-deps AS test-unit
 COPY --from=proto-build /app/live_stt/pb/ /app/live_stt/pb/
 COPY live_stt/ ./live_stt/
 COPY tests/ ./tests/
+COPY tools/ ./tools/
 COPY pyproject.toml ./
 RUN mkdir -p /app/test-reports
 CMD ["python", "-m", "pytest", "tests/", "-v", "-m", "not integration", \
@@ -113,6 +127,7 @@ CMD ["python", "-m", "pytest", "tests/", "-v", "-m", "not integration", \
 # runtime (docker run -v ./models:/models:ro), not baked into the image.
 FROM runtime AS test-integration
 COPY tests/ ./tests/
+COPY tools/ ./tools/
 COPY pyproject.toml ./
 RUN mkdir -p /app/test-reports
 CMD ["python", "-m", "pytest", "tests/", "-v", "-m", "integration and not slow and not gpu", \

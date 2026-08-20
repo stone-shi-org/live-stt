@@ -122,12 +122,20 @@ class WorkerHandle:
         config = json.dumps(
             {"gguf_path": gguf_path, "language": language, "n_threads": n_threads}
         )
-        writer.write(pack(FrameType.CONFIG, config.encode()))
-        await writer.drain()
-
         try:
+            # The write+drain must be in the SAME try as the read: a worker
+            # that died (or never started -- e.g. a transient fork/exec
+            # hiccup) before reading anything fails right here, not at the
+            # read below. An earlier version of this code only wrapped the
+            # read, so a dead-on-arrival worker surfaced as an uncaught
+            # ConnectionResetError instead of a clean WorkerError -- found
+            # via intermittent CI flakiness that traced back to exactly
+            # this gap, not a real bug in the retry/rotation logic it looked
+            # like it was in.
+            writer.write(pack(FrameType.CONFIG, config.encode()))
+            await writer.drain()
             frame_type, doc = await _read_json_frame(reader)
-        except (asyncio.IncompleteReadError, ConnectionError) as exc:
+        except (asyncio.IncompleteReadError, ConnectionError, OSError) as exc:
             handle.kill()
             raise WorkerError(f"worker died before CONFIG completed: {exc}") from exc
 
@@ -148,7 +156,7 @@ class WorkerHandle:
         try:
             await self._writer.drain()
             response_type, doc = await _read_json_frame(self._reader)
-        except (asyncio.IncompleteReadError, ConnectionError) as exc:
+        except (asyncio.IncompleteReadError, ConnectionError, OSError) as exc:
             raise WorkerError(f"worker connection lost: {exc}") from exc
         if response_type == FrameType.ERROR:
             raise WorkerError(f"worker reported an error: {doc}")

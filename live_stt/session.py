@@ -23,8 +23,10 @@ cut point (an <EOU> if one arrives, else the hard deadline).
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
+from live_stt import __about__, metrics
 from live_stt.admission import WorkerBudget
 from live_stt.boundary import dedup_incoming_words
 from live_stt.config import Settings
@@ -35,6 +37,10 @@ from live_stt.pb.livestt.v1 import asr_pb2
 from live_stt.worker import WorkerError, WorkerHandle
 
 logger = get_logger("session")
+
+
+def _reason_name(reason: int) -> str:
+    return asr_pb2.RecycleReason.Name(reason).removeprefix("RECYCLE_REASON_").lower()
 
 
 class CallSession:
@@ -88,13 +94,25 @@ class CallSession:
         ggml_lib_dir = (
             Path(self._settings.worker_ggml_lib_dir) if self._settings.worker_ggml_lib_dir else None
         )
-        return await WorkerHandle.spawn(
+        start = time.monotonic()
+        handle = await WorkerHandle.spawn(
             worker_bin=Path(self._settings.worker_bin),
             gguf_path=gguf_path,
             language=self._config.language,
             n_threads=self._settings.n_threads_per_worker,
             ggml_lib_dir=ggml_lib_dir,
         )
+        metrics.model_load_duration_seconds.observe(time.monotonic() - start)
+        version = __about__.info()
+        metrics.set_build_info(
+            version=version["hash"],
+            parakeet_ref=version["parakeet_ref"],
+            backend=self._settings.backend,
+            model=self._model_spec.key,
+            n_threads=self._settings.n_threads_per_worker,
+            ggml_features=handle.ready.get("ggml_features", ""),
+        )
+        return handle
 
     async def feed_audio(self, pcm16le: bytes) -> list[asr_pb2.TranscriptionEvent]:
         assert self._worker is not None, "feed_audio called before start()"
@@ -110,14 +128,18 @@ class CallSession:
         events: list[asr_pb2.TranscriptionEvent] = []
         n_samples = len(chunk) // 2
 
+        feed_start = time.monotonic()
         try:
             doc = await self._worker.feed(chunk)
         except WorkerError as exc:
             self._fed_samples += n_samples
+            metrics.asr_errors_total.labels(code="feed_failed").inc()
             events.extend(await self._recover_from_crash(exc))
             return events
+        metrics.feed_duration_seconds.observe(time.monotonic() - feed_start)
 
         self._fed_samples += n_samples
+        metrics.audio_seconds_total.inc(n_samples / 16000.0)
         self._last_rss_kb = doc.get("rss_kb", self._last_rss_kb)
         events.extend(self._doc_to_events(doc, time_offset_sec=self._active_generation_start_sec))
 
@@ -241,6 +263,8 @@ class CallSession:
                 )
             )
         )
+        metrics.rotations_total.labels(kind="warm").inc()
+        metrics.worker_restarts_total.labels(reason=_reason_name(self._rotation_reason)).inc()
 
         self._worker = self._incoming
         self._active_generation_start_sec = self._incoming_generation_start_sec
@@ -299,6 +323,9 @@ class CallSession:
         self._active_generation_start_sec = self.audio_offset_sec
         self._worker_generations += 1
         self._last_rss_kb = 0
+
+        metrics.rotations_total.labels(kind="cold").inc()
+        metrics.worker_restarts_total.labels(reason="crash").inc()
 
         return [
             asr_pb2.TranscriptionEvent(
