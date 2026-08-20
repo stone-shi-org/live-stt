@@ -1,0 +1,77 @@
+---
+# Bamboo YAML Specs for live-stt. Mirrors the my-meeting-notes-docker plan's
+# shape (checkout -> test.sh --docker -> JUnit parser -> build.sh -p push),
+# adapted for this repo's git submodule (worker/third_party/parakeet.cpp)
+# and its LSTT_REGISTRY convention.
+#
+# One-time manual setup still required in the Bamboo UI (not automatable via
+# the REST API used elsewhere in this repo's tooling -- there is no
+# project/plan-creation endpoint in this Bamboo instance's REST API):
+#   1. Administration -> Linked Repositories -> add this repo
+#      (https://github.com/stone-shi/live-stt.git, branch master).
+#   2. On that linked repository, enable "Scan for YAML Specs" so Bamboo
+#      picks up this file automatically. First scan creates project LSTT /
+#      plan LSTT-LSTT ("live-stt-docker"); every push after that re-applies
+#      this file, no further UI steps needed.
+#   3. Confirm at least one build agent advertises the "system.docker.executable"
+#      capability (needed for both `./test.sh --docker` and `./build.sh -p`).
+version: 2
+plan:
+  project-key: LSTT
+  key: LSTT
+  name: live-stt-docker
+stages:
+  - Default Stage:
+      manual: false
+      final: false
+      jobs:
+        - Default Job
+Default Job:
+  key: JOB1
+  tasks:
+    - checkout:
+        force-clean-build: 'false'
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |
+            set -euo pipefail
+            git submodule sync --recursive
+            git submodule update --init --recursive
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |
+            # Deliberately not `set -e`: test.sh already isn't (a failing
+            # run must still leave test-reports/*.xml for the JUnit parser
+            # task below, or Bamboo reports "no test results found" instead
+            # of naming the failure). --docker avoids the Python 3.14
+            # grpcio wheel gap on a native venv -- see CLAUDE.md.
+            ./test.sh --docker
+    - test-parser:
+        type: junit
+        test-results: '**/test-reports/*.xml'
+    - script:
+        interpreter: SHELL
+        scripts:
+          - |
+            set -euo pipefail
+            ./build.sh -p -r registry.shifamily.com/homestack
+  requirements:
+    - system.docker.executable
+triggers:
+  - polling:
+      period: '180'
+repositories:
+  - live-stt:
+      type: github
+      url: https://github.com/stone-shi/live-stt.git
+      branch: master
+branches:
+  create: manually
+  delete: never
+  link-to-jira: false
+notifications: []
+labels: []
+other:
+  concurrent-build-plugin: system-default
