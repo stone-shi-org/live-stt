@@ -1,0 +1,57 @@
+# Override, not standalone: docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Target hardware, VERIFIED via nvidia-smi over SSH on 10.100.0.50 (not
+# assumed): one NVIDIA RTX 3090, 24GB VRAM, driver 595.84 / CUDA 13.2,
+# nvidia-container-toolkit present. NOT the RTX 5090/Blackwell an earlier
+# draft speculated from unrelated circumstantial evidence -- see CLAUDE.md.
+#
+# That box is a SHARED home server (60+ containers, including LocalAI on the
+# same GPU) -- this is why LSTT_VRAM_PER_WORKER_MB / LSTT_VRAM_RESERVE_MB
+# exist as conscious budgets rather than "assume the whole card", and why
+# LSTT_MAX_CONCURRENT_CALLS is small here. No `runtime: nvidia`: the
+# reservation below (matching home-docker-script/homestacks/tei.yml, the
+# only other GPU-reservation example in this estate) is the modern
+# compose-native way and is what this host's docker info already reports
+# working (`Runtimes: ... nvidia runc`).
+services:
+  live-stt:
+    image: live-stt:latest-cuda
+    build:
+      context: .
+      target: runtime-cuda
+    shm_size: '2gb'
+    # Raised from an earlier 4g guess after actually running Gate A on this
+    # backend (see CLAUDE.md): a SINGLE worker's host-RAM RSS ramped to and
+    # plateaued around ~4.4GB after 300s of real speech (415MB -> ~4.37GB,
+    # flat thereafter) -- already more than the old 4g limit on its own, and
+    # nothing in live_stt/worker.py bounds a worker's RSS at the process
+    # level (only RLIMIT_CORE=0 is set, no RLIMIT_AS), so the container-wide
+    # mem_limit is the only backstop. With max_workers = max_concurrent_calls
+    # + reserve_slots = 3 here, worst case is ~3 x 4.4GB simultaneously
+    # (a rotation overlap plus a second call, or two calls rotating in the
+    # same window) = ~13.2GB, plus the Python front door's own overhead.
+    # 20g leaves real margin above that. Caveats, so this isn't oversold as
+    # calibrated: (1) the 300s measurement is one run, not a multi-hour
+    # steady-state, so a longer plateau shift can't be ruled out yet: (2)
+    # concurrent workers actually sharing host memory bandwidth/allocator
+    # behavior under real contention is untested, only inferred by
+    # multiplying one isolated worker's number; (3) this host's actual free
+    # RAM headroom against its other tenants (60+ containers incl. LocalAI)
+    # was NOT re-checked in this pass (a `free -h` was attempted but the SSH
+    # session to 10.100.0.50 hung on a stuck forwarded-agent socket before
+    # it could run) -- re-verify real headroom exists before trusting this
+    # in production, don't just trust the arithmetic above.
+    mem_limit: 20g
+    environment:
+      - LSTT_BACKEND=cuda
+      - LSTT_MAX_CONCURRENT_CALLS=2
+      - LSTT_RESERVE_SLOTS=1
+      - LSTT_VRAM_PER_WORKER_MB=3000
+      - LSTT_VRAM_RESERVE_MB=2000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

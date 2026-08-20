@@ -66,6 +66,18 @@ class Settings(BaseSettings):
     rotate_after_sec: float = 3600.0
     rotation_overlap_sec: float = 10.0  # > ~4.5s left context (att_context [70,1] @ 80ms/frame)
 
+    # Phase 5, CUDA only. 10.100.0.50 (verified via nvidia-smi over SSH: one
+    # RTX 3090, 24GB) is a SHARED box -- it also runs LocalAI and other GPU
+    # workloads, so this must be a conscious budget, not "assume the whole
+    # card". A CUDA allocation failure is an abort(), not a catchable
+    # exception (see CLAUDE.md), so under-provisioning this crashes a
+    # worker process, not just slows one down. Checked by live_stt/gpu.py
+    # via `nvidia-smi --query-gpu=memory.free`, not pynvml -- avoids a new
+    # dependency for one query, and nvidia-smi is already present in any
+    # nvidia/cuda-based image.
+    vram_per_worker_mb: int = 3000
+    vram_reserve_mb: int = 2000  # headroom for other tenants on the shared card
+
     # Backpressure / drift (live_stt/session.py's AudioRing + watchdog).
     queue_max_sec: float = 8.0
     ring_history_sec: float = 60.0

@@ -14,7 +14,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src/live-stt-worker
 COPY worker/third_party/parakeet.cpp/ third_party/parakeet.cpp/
-RUN --mount=type=cache,target=/build \
+# id= is required, not cosmetic: an unqualified cache mount target (the
+# default before this fix) is scoped just by its target PATH, "/build" --
+# generic enough that it collided with an unrelated Dockerfile elsewhere on
+# this host also using "/build", leaking a stale CMakeCache.txt in (from a
+# plain ubuntu:24.04 context where gcc-14 is the default) and causing a
+# baffling "No rule to make target .../14/libgomp.so" failure on THIS image,
+# which only ever has gcc-13. Found by actually diagnosing it, not guessed.
+RUN --mount=type=cache,target=/build,id=live-stt-parakeet-build-cpu \
     cmake -S third_party/parakeet.cpp -B /build/parakeet \
         -DCMAKE_BUILD_TYPE=Release \
         -DPARAKEET_SHARED=OFF \
@@ -38,6 +45,47 @@ RUN --mount=type=cache,target=/build \
     # stages later, discovered by actually building this.
     && cp -a /build/parakeet/third_party/ggml/src/libggml*.so* /out/lib/
 
+# ---- stage: parakeet.cpp, CUDA build (Phase 5) -----------------------------
+# sm_86 -- Ampere, the VERIFIED GPU on 10.100.0.50 (an RTX 3090, confirmed via
+# nvidia-smi over SSH; NOT the RTX 5090/Blackwell an earlier draft of this
+# repo speculated from unrelated circumstantial evidence -- see CLAUDE.md's
+# GPU section). Compiling here needs only the CUDA toolkit (nvcc), not a
+# real device or driver -- this stage builds fine on a driverless host; only
+# RUNNING the result needs the actual GPU box.
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS parakeet-build-cuda
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git bash ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src/live-stt-worker
+COPY worker/third_party/parakeet.cpp/ third_party/parakeet.cpp/
+RUN --mount=type=cache,target=/build,id=live-stt-parakeet-build-cuda \
+    cmake -S third_party/parakeet.cpp -B /build/parakeet \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DPARAKEET_SHARED=OFF \
+        -DPARAKEET_BUILD_CLI=OFF \
+        -DPARAKEET_BUILD_SERVER=OFF \
+        -DPARAKEET_BUILD_TESTS=OFF \
+        -DGGML_NATIVE=OFF \
+        -DGGML_AVX2=ON \
+        -DGGML_FMA=ON \
+        -DGGML_F16C=ON \
+        -DPARAKEET_GGML_CUDA=ON \
+        "-DCMAKE_CUDA_ARCHITECTURES=86" \
+    && cmake --build /build/parakeet -j"$(nproc)" \
+    && mkdir -p /out/lib \
+    && cp /build/parakeet/libparakeet.a /out/ \
+    && cp -a /build/parakeet/third_party/ggml/src/libggml*.so* /out/lib/ \
+    # libggml-cuda.so* is NOT alongside the others -- unlike libggml-cpu.so
+    # (which sits directly in third_party/ggml/src/), the CUDA backend builds
+    # one directory deeper, in third_party/ggml/src/ggml-cuda/. Missing this
+    # produced a build that LOOKED complete (parakeet-build-cuda succeeded,
+    # /out/lib had 3 libs) but broke the next stage: worker-build-cuda's link
+    # failed with "undefined reference to `ggml_backend_cuda_reg'" because
+    # libggml.so's backend-registry code needs this symbol from
+    # libggml-cuda.so and it was silently never copied. Found by actually
+    # building worker-build-cuda, not by reading cp's output.
+    && cp -a /build/parakeet/third_party/ggml/src/ggml-cuda/libggml-cuda.so* /out/lib/
+
 # ---- stage: the C++ worker, linked against the artifacts above ------------
 FROM python:3.12-slim AS worker-build
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -47,6 +95,18 @@ WORKDIR /src/live-stt-worker
 COPY worker/ ./worker/
 COPY --from=parakeet-build /out/libparakeet.a worker/build-parakeet/libparakeet.a
 COPY --from=parakeet-build /out/lib/ worker/build-parakeet/third_party/ggml/src/
+RUN cd worker && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build -j"$(nproc)"
+
+# ---- stage: the C++ worker, CUDA build -------------------------------------
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS worker-build-cuda
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src/live-stt-worker
+COPY worker/ ./worker/
+COPY --from=parakeet-build-cuda /out/libparakeet.a worker/build-parakeet/libparakeet.a
+COPY --from=parakeet-build-cuda /out/lib/ worker/build-parakeet/third_party/ggml/src/
 RUN cd worker && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build -j"$(nproc)"
 
@@ -105,6 +165,61 @@ EXPOSE 50051 8000
 # start-period than the house default 20s: a cold model load can genuinely
 # take that long, especially the first CUDA build's PTX JIT (Phase 5).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=4).status==200 else 1)"
+
+CMD ["python", "run.py"]
+
+# ---- stage: runtime, CUDA (Phase 5) ----------------------------------------
+# Ubuntu 24.04's system python3 IS 3.12 (matches the CPU image's python:3.12-
+# slim), so no deadsnakes/PPA needed -- just apt. --break-system-packages:
+# Ubuntu's apt-installed python3-pip marks the environment "externally
+# managed" per PEP 668; harmless here since the whole image is disposable.
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS runtime-cuda
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3-pip libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    GRPC_POLL_STRATEGY=poll \
+    # libggml.so.0 (CUDA build only) is itself built by ggml's own CMake with
+    # a hardcoded RUNPATH pointing at the standalone build's cache-mount dir
+    # (/build/parakeet/.../ggml/src) -- correct there, meaningless here where
+    # the .so's are copied to /app/worker/. And even if that path did exist,
+    # RUNPATH (unlike old-style RPATH) is NOT transitively inherited: the
+    # worker binary's own $ORIGIN RUNPATH only resolves ITS direct NEEDED
+    # entries, not the ones libggml.so.0 itself declares (libggml-cuda.so.0)
+    # -- confirmed empirically: `ldd` showed "libggml-cuda.so.0 => not found"
+    # despite the file sitting right next to the binary, until this was set.
+    # Not needed on the CPU image: CPU-only libggml.so has no CUDA backend to
+    # need, so this class of transitive lookup never arises there.
+    LD_LIBRARY_PATH=/app/worker
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt \
+        --index-url https://pypi.org/simple/
+
+COPY --from=worker-build-cuda /src/live-stt-worker/worker/build/live_stt_worker /app/worker/live_stt_worker
+COPY --from=worker-build-cuda /src/live-stt-worker/worker/build-parakeet/third_party/ggml/src/*.so* /app/worker/
+COPY --from=proto-build /app/live_stt/pb/ /app/live_stt/pb/
+COPY live_stt/ ./live_stt/
+COPY run.py version.txt* ./
+
+ENV LSTT_WORKER_BIN=/app/worker/live_stt_worker \
+    LSTT_BACKEND=cuda \
+    LSTT_GRPC_HOST=0.0.0.0 \
+    LSTT_GRPC_PORT=50051 \
+    LSTT_ADMIN_HOST=0.0.0.0 \
+    LSTT_ADMIN_PORT=8000 \
+    LSTT_MODELS_DIR=/models
+
+VOLUME ["/app/data"]
+EXPOSE 50051 8000
+
+# Longer start-period than the CPU image's 60s: a cold CUDA model load pays
+# for context/PTX setup the CPU path doesn't.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=4).status==200 else 1)"
 
 CMD ["python", "run.py"]

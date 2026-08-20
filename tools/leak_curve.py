@@ -41,6 +41,33 @@ DEFAULT_WORKER_BIN = REPO_ROOT / "worker" / "build" / "live_stt_worker"
 DEFAULT_GGML_LIB_DIR = REPO_ROOT / "worker" / "build-parakeet" / "third_party" / "ggml" / "src"
 
 
+def _vram_used_mb_for_pid(pid: int) -> int | None:
+    """Per-PROCESS VRAM, not total GPU memory.used: 10.100.0.50 (Phase 5's
+    CUDA target) is a SHARED box running LocalAI and other GPU tenants
+    concurrently, so a total-memory query would be contaminated by whatever
+    else happens to be running. Returns None (not 0) if nvidia-smi is
+    absent (e.g. the CPU backend) or the worker has no CUDA context yet --
+    callers must not treat that as "definitely zero"."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    for line in out.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2 and parts[0] == str(pid):
+            try:
+                return int(parts[1])
+            except ValueError:
+                return None
+    return None  # process not found in the list -- no CUDA context allocated (yet)
+
+
 class WorkerHandle:
     """Minimal standalone copy of tests/worker_harness.py's WorkerHandle --
     duplicated rather than imported so this script has no dependency on the
@@ -145,12 +172,12 @@ def run(
     else:
         raise ValueError(f"unknown condition: {condition}")
 
-    samples: list[tuple[float, int, float]] = []  # (audio_sec, rss_kb, wall_sec)
+    samples: list[tuple[float, int, float, int | None]] = []  # (audio_sec, rss_kb, wall_sec, vram_mb)
     audio_sec = 0.0
     next_sample_at = 0.0
     start = time.monotonic()
 
-    print("audio_sec,rss_kb,wall_sec")
+    print("audio_sec,rss_kb,wall_sec,vram_mb")
     while audio_sec < audio_sec_target:
         pcm = next(chunks)
         handle.send(FrameType.AUDIO, pcm)
@@ -161,8 +188,9 @@ def run(
         if audio_sec >= next_sample_at:
             wall_sec = time.monotonic() - start
             rss_kb = doc["rss_kb"]
-            samples.append((audio_sec, rss_kb, wall_sec))
-            print(f"{audio_sec:.2f},{rss_kb},{wall_sec:.2f}")
+            vram_mb = _vram_used_mb_for_pid(handle.proc.pid)
+            samples.append((audio_sec, rss_kb, wall_sec, vram_mb))
+            print(f"{audio_sec:.2f},{rss_kb},{wall_sec:.2f},{vram_mb if vram_mb is not None else ''}")
             sys.stdout.flush()
             next_sample_at += sample_every_sec
 
@@ -173,6 +201,14 @@ def run(
     xs = [s[0] for s in samples]
     ys_mb = [s[1] / 1024.0 for s in samples]
     slope_mb_per_audio_sec, intercept_mb, r_squared = linregress(xs, ys_mb)
+
+    vram_series = [(s[0], s[3]) for s in samples if s[3] is not None]
+    vram_slope_mb_per_audio_sec = None
+    vram_r_squared = None
+    if len(vram_series) >= 2:
+        vram_slope_mb_per_audio_sec, _, vram_r_squared = linregress(
+            [v[0] for v in vram_series], [float(v[1]) for v in vram_series]
+        )
 
     # Crude plateau check: compare the growth rate over the first half of the
     # run to the second half. A genuine plateau (no leak) would show the
@@ -197,6 +233,11 @@ def run(
         "worker_exit_code": exit_code,
         "rss_mb_start": ys_mb[0] if ys_mb else None,
         "rss_mb_end": ys_mb[-1] if ys_mb else None,
+        "vram_slope_mb_per_audio_sec": vram_slope_mb_per_audio_sec,
+        "vram_r_squared": vram_r_squared,
+        "vram_mb_start": vram_series[0][1] if vram_series else None,
+        "vram_mb_end": vram_series[-1][1] if vram_series else None,
+        "vram_samples": len(vram_series),
     }
 
 

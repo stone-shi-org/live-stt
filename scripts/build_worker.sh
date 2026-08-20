@@ -22,9 +22,16 @@ NPROC="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
 CUDA_ARGS=()
 if [[ "${1:-}" == "--cuda" ]]; then
-    # sm_90 (Hopper) + sm_120 (Blackwell, e.g. RTX 5090) -- "sm_75+" in
-    # upstream's docs does not mean the default arch list covers either.
-    CUDA_ARGS=(-DPARAKEET_GGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=90;120)
+    # sm_86 -- Ampere, the actual verified GPU on 10.100.0.50 (an RTX 3090;
+    # confirmed via nvidia-smi, NOT the RTX 5090/Blackwell an earlier
+    # version of this comment speculated from unrelated circumstantial
+    # evidence -- see CLAUDE.md). "sm_75+" in upstream's docs does not mean
+    # the default arch list covers this specific one; re-target if this
+    # ever runs on different hardware. The semicolon MUST be quoted here --
+    # unquoted, the shell parses it as a command separator, not part of the
+    # value (a latent bug in an earlier version of this script, never
+    # actually exercised until this one ran for real).
+    CUDA_ARGS=(-DPARAKEET_GGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=86")
 fi
 
 echo "==> Configuring parakeet.cpp (standalone build)"

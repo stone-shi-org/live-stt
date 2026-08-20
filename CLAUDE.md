@@ -80,6 +80,15 @@ different CPU (SIMD reduction order), or a GPU build — only the *rate* (very r
 arbitrary restart points, on this one file) is likely to be a useful estimate, and even that should
 not be assumed to generalize without testing on more content.
 
+*One data point consistent with the above, added during Phase 5 (see "GPU and multilingual"
+below): the original failing configuration — offset 8.00s, `n_threads=4`, same file — was re-run on
+the CUDA backend on the real RTX 3090 and did **NOT** drop the words ("yes yes absolutely okay
+perfect well yeah" transcribed correctly). That is exactly what the backend-specific-reduction-order
+theory predicts (CUDA's parallel reduction order differs entirely from CPU's threaded one), so it
+**supports** that theory and **does not** mean CUDA is immune — no offset sweep has been run on
+CUDA at all, so the ~1% rate is unmeasured on that backend and must be assumed to still apply, at
+different offsets. Nothing here changes the status below.*
+
 **Status: unresolved, not yet reported upstream, not mitigated in code.** The rotation state
 machine itself (triggers, budget/reserve accounting, dual-feed bookkeeping, EOU/deadline cutover,
 crash recovery, seam dedup) is fully implemented and passes 6/6 tests against a controllable fake
@@ -112,8 +121,23 @@ repeatable via `tests/test_leak_curve.py`'s tripwire (shorter 90s runs asserting
 magnitude). At this rate a 2-hour call leaks on the order of tens of MB, not tens of GB — the
 worker-rotation machinery below is a real safety net worth keeping, but `rotate_after_sec` is sized
 generously (3600s) rather than defensively, because the CPU backend plainly isn't reproducing the
-severity of the upstream report. **This does NOT transfer to a CUDA build — re-run Gate A on both
-`VmRSS` and per-process VRAM before Phase 5, and don't assume the same headroom.**
+severity of the upstream report. **None of this transfers to a CUDA build — which is why Gate A was
+re-run on both `VmRSS` and per-process VRAM in Phase 5 rather than assuming the same headroom:**
+
+**Gate A re-run on CUDA (Phase 5, real RTX 3090, 300s of real speech, `n_threads=4`,
+`tools/leak_curve.py` now sampling per-process VRAM via `nvidia-smi --query-compute-apps` alongside
+`VmRSS`): 11.95 MB/s RSS (R²=0.76) and 2.50 MB/s VRAM (R²=0.49) as raw slopes, but
+`plateau_detected: true` — and the plateau is the real story.** RSS went 415 MB → ~4.37 GB by
+roughly the 150s mark then stayed flat (4373–4386 MB) for the remaining 150s; VRAM went 474 MB →
+1828 MB over the same first half then sat at **exactly 1828 MB** for the whole second half. That
+shape — early ramp then genuine flat — is consistent with one-time buffer-pool/workspace allocation
+sized to the largest shapes seen plus CUDA context and graph-capture overhead, and is
+*structurally* different from the CPU backend's near-fully-linear curve (speech, R²=0.87, no
+plateau). So: real, moderately strong evidence that #63's per-audio-second leak either does not
+manifest the same way on CUDA or is too small to separate from ramp-up in a 300s window — but
+**not a settled conclusion.** A 600s run (matching the CPU methodology) is needed to show the
+plateau holds over hours rather than minutes before trusting long CUDA calls with no rotation
+safety net, and the raw CSV from this run was never promoted into the repo (see Phase 5 below).
 
 Given that, the honest invariant this codebase is built on — not "one immortal `parakeet_stream`
 per call" — is:
@@ -225,8 +249,69 @@ in `configure()` and there is no loop anywhere near it.
   way, running real load in a container (not just natively) surfaced a genuine grpc-core
   fork-safety crash affecting every worker spawn in the service, not just tests — see
   "Concurrency and capacity" below for the finding and the `GRPC_POLL_STRATEGY=poll` fix.
-  `docker-compose.gpu.yml` intentionally not written yet: there is no `runtime-cuda` Dockerfile
-  target for it to reference (Phase 5).
+  `docker-compose.gpu.yml` now exists (Phase 5) as an override layered over `docker-compose.yml`,
+  referencing the real `runtime-cuda` target.
+- **Phase 5 (CUDA build chain, real-GPU transcription, Gate A on CUDA, and the nemotron path all
+  verified for real on 10.100.0.50 — see "Ops notes" for the three build bugs found doing it):**
+  `docker build --target runtime-cuda -t live-stt:latest-cuda .` succeeds cleanly from scratch on
+  both the driverless dev host and the GPU box, after fixing a missed `libggml-cuda.so*` copy, a
+  missing `CUDA::cuda_driver`/`${GGML_CUDA_LIB}` link, and a non-transitive-RUNPATH runtime
+  resolution failure (all three detailed in "Ops notes"). Real transcription confirmed on the actual
+  RTX 3090 via `docker run --gpus all`, not merely a build success: the worker logged
+  `ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24123 MiB): Device 0: NVIDIA GeForce RTX 3090,
+  compute capability 8.6` and `[parakeet] pk::Backend using device: CUDA0`, and produced a full
+  correct transcript over 20s of the real speech fixture with the real
+  `realtime_eou_120m-v1-q8_0.gguf`. **Gate A re-run on CUDA** (300s, real speech, `n_threads=4`) —
+  the explicitly-open Phase 1 question of whether #63 leaks host RAM or VRAM on CUDA — found an
+  early ramp then a genuine plateau on *both* (RSS flat at ~4.37–4.39 GB, VRAM flat at exactly 1828
+  MB, `plateau_detected: true`); numbers and the not-yet-settled caveat are in "The one constraint
+  that shapes everything" above. **The nemotron multilingual path is proven end-to-end on the real
+  GPU:** real `nemotron-3.5-asr-streaming-0.6b-q8_0.gguf` (fetched via `scripts/fetch_model.sh`,
+  sha256 `ba2f13ec…f7a99f1`), configured with `language="en-US"` so the `stream_begin_lang` path is
+  exercised (the 120M smoke test only covers plain `stream_begin`), fed the same fixture at
+  nemotron's baked-in 320ms chunks, producing a real full transcript — lower quality than the 120M on
+  this fixture as expected for a different model ("i need happy to kind of dot straight in" vs the
+  120M's correct "i'd be happy to kind of dive straight in") — and **zero EOU events across the
+  entire run**, confirming for real the "Model choice" table's claim that nemotron's special tokens
+  are language tags, `eou_id_` stays -1, and turn detection must not be built on it. (The documented
+  `<en-US>` tag-leak quirk was simply not exercised by this audio window — not a contradiction of
+  it.) **VRAM-aware admission's read path verified against the real driver:**
+  `live_stt.gpu.free_vram_mb()` inside a `--gpus all` container returned `17655`, exactly matching a
+  concurrent host-side `nvidia-smi --query-gpu=memory.free` — so the exact call `servicer.py` makes
+  before admission reads real, correct data in the real container runtime, which the offline
+  `tests/test_gpu.py` (which only proves the no-`nvidia-smi` → `None` path) cannot show. **NOT yet
+  done / NOT verified:** the **rejection** branch was deliberately never exercised — 10.100.0.50 is
+  a shared box with LocalAI on the same card, and starving VRAM below the threshold to trigger it
+  risks disrupting that tenant, so a scope decision, not an oversight; treat "the reject path is
+  exactly right under real contention" as unverified. `vram_per_worker_mb=3000` /
+  `vram_reserve_mb=2000` are **still uncalibrated guesses** — nothing measured today isolates a
+  confident steady-state per-worker VRAM figure (Gate A's 1828 MB total-process growth is at least
+  the right ballpark, but wasn't designed to answer that). The Gate A CUDA run was interactive
+  (output to `/tmp/gate_a_cuda.log` on that box) and has **not** been promoted to a committed CSV
+  artifact or a `tests/test_leak_curve.py`-style permanent pin; a 600s re-run to match the CPU
+  methodology is still owed. `ggml_backend_cuda_graph_compute: CUDA graph warmup complete` was
+  observed logging **once per ~160ms chunk fed** rather than capturing once and reusing — exactly
+  the hazard the design plan flagged for `GGML_CUDA_GRAPHS` with variable-shaped streaming inputs.
+  Recorded as an observation worth chasing (possible RTF/latency cost, **not measured**, not a proven
+  problem); the documented escape hatch `LSTT_CUDA_GRAPHS=0` → `GGML_CUDA_DISABLE_GRAPHS=1` is
+  **not implemented in code yet**. The VAD for synthesizing turn boundaries on the no-`<EOU>` model
+  is also not built. **The full stack (not just the worker binary) was also run for real on CUDA:**
+  `docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d` on 10.100.0.50 came up
+  healthy with `backend: cuda` in `/api/health`; a real `scripts/e2e_grpc_smoke.py` run against it
+  (gRPC client → real `CallSession` → real worker → real CUDA model, not the isolated-worker probe
+  above) produced correct word-by-word deltas with timestamps and a normal `Final`
+  (`worker_generations: 1`); and `docker stop` sent a real SIGTERM that drained cleanly (exit code
+  0, the same `stt.server: SIGTERM received, draining` log line as the CPU path). Also: found and
+  fixed a **real capacity bug** while looking at the Gate A numbers — `docker-compose.gpu.yml`'s
+  `mem_limit` was `4g`, but a single worker's measured RSS (above) already plateaus around ~4.4GB
+  on its own, and nothing in `live_stt/worker.py`'s `preexec_fn` bounds a worker's RSS at the
+  process level (only `RLIMIT_CORE=0` is set, no `RLIMIT_AS`) — so with `max_workers` = 3 here, the
+  container-wide `mem_limit` was already below what a *single* worker alone needs, let alone three.
+  Raised to `20g` (~3 × 4.4GB + front-door overhead + margin); see that file's comment for the full
+  arithmetic and caveats (one 300s run, not a multi-hour steady-state; concurrent-worker contention
+  untested; the host's actual free-RAM headroom against its other 60+ tenants was **not**
+  re-verified in this pass — an attempted `free -h` over SSH hung on a stuck forwarded-agent socket
+  partway through this work and was not retried once real GPU-box access was lost).
 - **Docker:** `Dockerfile` has all targets (`parakeet-build`, `worker-build`, `runtime`,
   `test-unit`, `test-integration`, `test-worker`). `test-unit`, `runtime`, and the full
   `docker-compose.yml` stack have all been built and run for real — `runtime`'s worker binary was
@@ -243,8 +328,8 @@ in `configure()` and there is no loop anywhere near it.
   a drain starts is also not implemented — draining currently only blocks *new* admission; an
   active call gets no in-band notice that a deadline is coming, it just has up to
   `drain_timeout_sec` to finish naturally before `grpc.aio`'s own stop-grace forcibly ends it.
-  CUDA build, Prometheus scrape-job/Grafana dashboard JSON, long-call and concurrency tests: not
-  written yet either.
+  Prometheus scrape-job/Grafana dashboard JSON, long-call and concurrency tests: not written yet
+  either. (The CUDA build is no longer on this list — see the Phase 5 entry above.)
 
 ## Phase 1 measurements (all three gates, run for real on this repo's CPU build)
 
@@ -495,18 +580,84 @@ binary from Python in integration tests — see the fd-passing gotcha above befo
   dedicated gRPC entrypoint with all three timeouts at 0 plus `loadbalancer.server.scheme=h2c`.
 - **`home-net` (hyphen) is the real docker network on this host**, not `home_net` (underscore, which
   appears in one bootstrap script but doesn't exist as an actual network here).
-- Phase 5 (CUDA) targets are written into the Dockerfile as scaffolding
-  (`parakeet-build-cuda`/`runtime-cuda` are NOT yet split out — only CPU targets exist right now)
-  but are unbuilt and unverified; this dev host has no nvidia runtime at all, so that path can only
-  be smoke-tested on the GPU box.
+- **The GPU box is 10.100.0.50, and its hardware was WRONG in earlier drafts of this file — verified
+  for real via `nvidia-smi` over SSH, not inferred.** It is one **NVIDIA GeForce RTX 3090 (24GB,
+  Ampere, sm_86)**, driver 595.84 / CUDA 13.2, `nvidia-container-toolkit` present and
+  `docker info` reports the `nvidia` runtime registered. Earlier speculation about an RTX 5090
+  (Blackwell, sm_120) came from an unrelated repo's Best Buy stock-tracker (`check-gpu-cli`) and
+  was never actually checked against the real box — a reminder that circumstantial evidence in
+  someone's unrelated tooling is not verification. **`CMAKE_CUDA_ARCHITECTURES` must be `86`, not
+  `120` or `90;120`** — those targets would silently fail to run (or need PTX JIT with startup
+  latency, if they run at all) on this actual card. That box is also a **shared home server**: 60+
+  containers, 32 cores, 121GB RAM (often only ~15GB "available"), and the GPU already has another
+  tenant using ~6GB VRAM plus LocalAI on the same card — `LSTT_VRAM_PER_WORKER_MB`/
+  `LSTT_VRAM_RESERVE_MB` (`live_stt/gpu.py`, `live_stt/config.py`) exist because of this, not as a
+  generic best practice.
+- CUDA Dockerfile targets (`parakeet-build-cuda`, `worker-build-cuda`, `runtime-cuda`) exist and
+  build cleanly from scratch, verified both on the driverless dev host (6 cores, ~469s for the
+  parakeet CUDA stage alone) and on 10.100.0.50 itself (32 cores, faster) — compiling needs only the
+  CUDA toolkit, not a real device/driver. **Found and fixed while building them: a Docker BuildKit cache
+  mount collision** — `parakeet-build` and `parakeet-build-cuda` both used
+  `--mount=type=cache,target=/build` with no explicit `id=`, which is scoped by target path alone
+  and can collide with an UNRELATED Dockerfile elsewhere on the same host also using `/build`. That
+  leaked a stale `CMakeCache.txt` in from a plain `ubuntu:24.04` context (gcc-14 default) into this
+  image (gcc-13 only, per the `nvidia/cuda:12.8.1-devel-ubuntu24.04` base), producing a baffling
+  `No rule to make target '/usr/lib/gcc/x86_64-linux-gnu/14/libgomp.so'` link failure that had
+  nothing to do with CUDA at all. Fixed by giving each stage's cache mount a unique `id=`. **Also
+  found: `scripts/build_worker.sh`'s `--cuda` flag had a latent, never-executed shell bug** —
+  `-DCMAKE_CUDA_ARCHITECTURES=90;120` unquoted, where the shell would have parsed the `;` as a
+  command separator and broken the script the first time anyone actually ran it.
+- **Three more CUDA build bugs, each found only by actually building the chain end to end** (all
+  three fixed; none would have been caught by reading the code, and each one hid behind the previous
+  one):
+  - **`libggml-cuda.so*` was never copied out of `parakeet-build-cuda` at all.** The `cp -a
+    .../ggml/src/libggml*.so* /out/lib/` glob does not match it, because unlike `libggml-cpu.so`
+    (directly in `third_party/ggml/src/`) the CUDA backend builds **one directory deeper**, at
+    `third_party/ggml/src/ggml-cuda/libggml-cuda.so*`. The failure mode is the nasty part: that
+    stage still *succeeded*, with a plausible-looking 3-lib `/out/lib`, and broke the **next** stage
+    instead — `worker-build-cuda` failing at link time with `undefined reference to
+    'ggml_backend_cuda_reg'`. Fixed with a second explicit `cp -a .../ggml-cuda/libggml-cuda.so*
+    /out/lib/`.
+  - **`worker/CMakeLists.txt`'s CUDA comment was wrong, and the fix uncovered a second link
+    error.** The comment claimed ggml's backend registry `dlopen`s `libggml-cuda.so` by soname at
+    runtime and so "is never a direct link-time symbol dependency" — disproven by testing:
+    `ggml-backend-reg.cpp` is compiled into `libggml.so` with a **direct** (non-weak, non-`dlsym`)
+    reference to `ggml_backend_cuda_reg()` whenever the ggml build had CUDA enabled. A shared
+    library tolerates that unresolved at *its* link; our executable does not — so omitting
+    `target_link_libraries(live_stt_worker PRIVATE ${GGML_CUDA_LIB})` is a hard link error, not a
+    co-location nicety. Linking it then surfaced `libggml-cuda.so: undefined reference to
+    'cuMemCreate'` (also `cuDeviceGet`, `cuMemAddressReserve`, …) — CUDA **Driver** API symbols
+    living in `libcuda.so.1`, shipped by the NVIDIA *driver*, which does not exist on a driverless
+    build host. Fixed with `find_package(CUDAToolkit REQUIRED)` +
+    `target_link_libraries(live_stt_worker PRIVATE CUDA::cuda_driver)`, which resolves to the
+    toolkit's link-time **stub** (`/usr/local/cuda-12.8/targets/x86_64-linux/lib/stubs/libcuda.so`,
+    located with `find / -iname 'libcuda.so*'` inside the devel image) when no driver is present,
+    and to the real `libcuda.so.1` at container run time on the GPU box.
+  - **`$ORIGIN` rpath is not enough on CUDA: RUNPATH is not transitively inherited.** After the
+    above two fixes the `runtime-cuda` binary still failed at **runtime** — `ldd` showing
+    `libggml-cuda.so.0 => not found` with the file sitting right beside the binary in
+    `/app/worker/`. Cause: `libggml.so.0` (built by ggml's own separate CMake during
+    `parakeet-build-cuda`) has a **hardcoded RUNPATH baked in at its own build time** pointing at
+    the build cache-mount path (`/build/parakeet/third_party/ggml/src:.../ggml-cuda`) — correct
+    there, meaningless in the final image. And RUNPATH (the modern default, unlike old-style RPATH)
+    is **not** searched for a dependency's own dependencies: the worker binary's `$ORIGIN` RUNPATH
+    resolves only *its* direct `NEEDED` entries, not the ones `libggml.so.0` declares. This class
+    of bug is **CUDA-specific** — the CPU-only `libggml.so` has no CUDA backend to need, so it never
+    arises there, which is exactly why the `runtime` stage's `$ORIGIN` verification did not predict
+    it. Fixed with `ENV LD_LIBRARY_PATH=/app/worker` on the `runtime-cuda` stage —
+    `LD_LIBRARY_PATH`, unlike RUNPATH, *is* searched transitively for all dependencies regardless of
+    RUNPATH scoping. Verified by `ldd` before and after: afterwards everything resolves except
+    `libcuda.so.1`, which correctly stays "not found" on the driverless dev host and resolves under
+    `docker run --gpus all` on 10.100.0.50 (confirmed there).
 
 ## Implementation phases (see the original plan for full detail)
 
 0. **Skeleton + first light — DONE.** Worker builds and runs against a real model; gRPC/health/
    reflection/GetServerInfo work; `test-unit` Docker target builds.
-1. **Measure before designing the pool — DONE.** `tools/leak_curve.py` (CPU; CUDA still pending,
-   Phase 5), `tools/thread_sweep.py`, the telephony-band WER penalty test — all three run for
-   real, with recorded numbers and permanent regression tests. See "Phase 1 measurements" above.
+1. **Measure before designing the pool — DONE.** `tools/leak_curve.py` (CPU; CUDA re-run done in
+   Phase 5, 300s, plateau found — not yet pinned by a test), `tools/thread_sweep.py`, the
+   telephony-band WER penalty test — all three run for real, with recorded numbers and permanent
+   regression tests. See "Phase 1 measurements" above.
 2. **Minimal end-to-end, one generation, no rotation — DONE.** `live_stt/session.py`,
    `live_stt/worker.py`, `servicer.Transcribe` wired to a single worker. Proven via a real gRPC
    client through a real worker and model (`scripts/e2e_grpc_smoke.py`) and via
@@ -526,5 +677,15 @@ binary from Python in integration tests — see the fd-passing gotcha above befo
    verified to parse; wiring it into the estate's existing `prom/prometheus` instance is a
    deploy-time step, not a code change, and hasn't been done), and in-band `Warning{SERVER_DRAINING}`
    notification to an already-open stream (see above).
-5. **GPU and multilingual.** CUDA build target, VRAM-aware admission, nemotron's language-select
-   path, a VAD to synthesize turn boundaries for the no-`<EOU>` model.
+5. **GPU and multilingual — mostly done on real hardware, but three loose ends before trusting it
+   in production.** The CUDA build chain (`runtime-cuda`, `docker-compose.gpu.yml`) builds clean
+   after three real bugs found by building it (see "Ops notes"); real transcription, Gate A
+   (plateau, not a linear leak), the nemotron `stream_begin_lang` path (zero EOU events, confirmed),
+   and `gpu.free_vram_mb()` against the real driver (`17655`, matching `nvidia-smi`) are all
+   verified for real on the RTX 3090 — details in the Phase 5 entry above. Loose ends: (a) VRAM
+   admission's **reject** branch is untested for real (deliberately — shared box, LocalAI on the
+   same card) and `vram_per_worker_mb`/`vram_reserve_mb` remain uncalibrated guesses; (b) the CUDA
+   Gate A run is 300s, interactive, unpromoted to a committed artifact or a regression pin — a 600s
+   re-run is owed before trusting long CUDA calls without rotation; (c) CUDA graph capture appears
+   to re-warm per ~160ms chunk (cost unmeasured) and the `LSTT_CUDA_GRAPHS=0` escape hatch is not
+   implemented. Not started at all: a VAD to synthesize turn boundaries for the no-`<EOU>` model.

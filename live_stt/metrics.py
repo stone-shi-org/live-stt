@@ -65,6 +65,9 @@ words_total = Counter("live_stt_words_total", "Finalized words -- volume without
 transcript_chars_total = Counter(
     "live_stt_transcript_chars_total", "Finalized characters -- volume without content"
 )
+gpu_free_vram_mb = Gauge(
+    "live_stt_gpu_free_vram_mb", "Free VRAM as last observed at admission time (CUDA backend only)"
+)
 
 
 def set_build_info(

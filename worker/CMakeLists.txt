@@ -45,6 +45,21 @@ find_library(GGML_LIB ggml PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
 find_library(GGML_BASE_LIB ggml-base PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
 find_library(GGML_CPU_LIB ggml-cpu PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
 
+# Phase 5. NOT REQUIRED: absent entirely on a CPU-only build-parakeet output.
+#
+# Correction to an earlier assumption here: this comment used to claim ggml's
+# backend-registry dlopens libggml-cuda.so at runtime by soname and is "never
+# a direct link-time symbol dependency" -- disproven by actually building
+# this. ggml-backend-reg.cpp is compiled INTO libggml.so with a direct
+# (non-weak, non-dlsym) reference to ggml_backend_cuda_reg() whenever the
+# overall ggml build had CUDA enabled, so libggml.so itself carries a genuine
+# unresolved symbol. A shared library tolerates that (a .so's own link does
+# not require every symbol resolved), but our EXECUTABLE'S link does, so
+# omitting this target_link_libraries call below produces
+# "undefined reference to `ggml_backend_cuda_reg'" -- linking it here isn't
+# just for co-location, it's required to resolve the executable at all.
+find_library(GGML_CUDA_LIB ggml-cuda PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH)
+
 add_executable(live_stt_worker
     main.cpp
     session.cpp
@@ -53,6 +68,24 @@ add_executable(live_stt_worker
 )
 
 target_link_libraries(live_stt_worker PRIVATE parakeet ${GGML_LIB} ${GGML_BASE_LIB} ${GGML_CPU_LIB})
+if(GGML_CUDA_LIB)
+  target_link_libraries(live_stt_worker PRIVATE ${GGML_CUDA_LIB})
+  message(STATUS "live_stt_worker: linking CUDA backend ${GGML_CUDA_LIB}")
+
+  # libggml-cuda.so calls CUDA Driver API symbols (cuMemCreate,
+  # cuDeviceGet, ...) that live in libcuda.so.1 -- shipped by the NVIDIA
+  # DRIVER, not the CUDA toolkit, so it does not exist at all on a
+  # driverless build host (this dev box, and the "-devel" image used to
+  # compile this). find_package(CUDAToolkit) resolves CUDA::cuda_driver to
+  # the toolkit's link-time STUB (.../targets/x86_64-linux/lib/stubs/
+  # libcuda.so on the devel image used here) when no real driver is
+  # present, or the real libcuda.so.1 if one is -- exactly the "compile
+  # anywhere, run only where there's a GPU" split Phase 5 relies on.
+  # Confirmed the stub path exists by grepping the actual devel image
+  # rather than assuming a fixed path across CUDA versions.
+  find_package(CUDAToolkit REQUIRED)
+  target_link_libraries(live_stt_worker PRIVATE CUDA::cuda_driver)
+endif()
 
 # pk::set_num_threads / pk::shutdown_backend live in a private header
 # (parakeet.cpp's src/, not include/) -- see main.cpp's comment at the

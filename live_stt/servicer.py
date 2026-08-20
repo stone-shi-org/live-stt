@@ -17,7 +17,7 @@ from collections.abc import AsyncIterator
 
 import grpc
 
-from live_stt import __about__, metrics, models, redaction
+from live_stt import __about__, gpu, metrics, models, redaction
 from live_stt.logging_config import get_logger
 from live_stt.pb.livestt.v1 import asr_pb2, asr_pb2_grpc
 from live_stt.session import CallSession
@@ -69,6 +69,25 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
             metrics.admission_rejections_total.labels(reason="draining").inc()
             await context.abort(grpc.StatusCode.UNAVAILABLE, "draining")
             return
+
+        if self._settings.backend == "cuda":
+            # A CUDA allocation failure is an abort(), not a catchable
+            # exception (see CLAUDE.md) -- admitting a call this box can't
+            # actually fit crashes a worker process, not just slows one
+            # down. Checked before the (cheap, synchronous) call-slot check
+            # below since this one is the more expensive shell-out.
+            free = gpu.free_vram_mb()
+            if free is not None:
+                metrics.gpu_free_vram_mb.set(free)
+            required = self._settings.vram_per_worker_mb + self._settings.vram_reserve_mb
+            if free is not None and free < required:
+                metrics.admission_rejections_total.labels(reason="no_vram").inc()
+                await context.abort(
+                    grpc.StatusCode.RESOURCE_EXHAUSTED,
+                    f"insufficient VRAM: {free}MB free, {required}MB required",
+                )
+                return
+
         # Race-free without a lock: try_admit_call()/release_call() have no
         # `await` between reading and mutating their counters, and grpc.aio
         # servicers run on a single event loop thread, so no other
