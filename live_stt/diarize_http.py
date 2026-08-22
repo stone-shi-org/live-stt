@@ -94,8 +94,9 @@ def handle_diarize_request(
     this). Returns ``(http_status, json_body)``; never raises.
 
     ``tracker`` (``live_stt.state.ServerState.diarization_sessions`` in
-    production) records concurrent-session counts for ``/api/stats`` and the
-    admin dashboard -- see ``live_stt/diarize_sessions.py``. When
+    production) records concurrent-session counts AND a small live list of
+    in-flight requests (id/elapsed/device) for ``/api/stats`` and the admin
+    dashboard -- see ``live_stt/diarize_sessions.py``. When
     ``effective_settings.diarization_device == "cuda"``, this also gates
     admission on real free VRAM (``live_stt.gpu.free_vram_mb()``) against
     ``diarization_vram_mb`` -- see that setting's docstring for the real
@@ -165,12 +166,12 @@ def handle_diarize_request(
     with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
         tmp.write(fields["file"])
         tmp.flush()
-        tracker.start()
+        request_id = tracker.start(device=effective_settings.diarization_device)
         metrics.diarization_sessions_active.inc()
         try:
             result = diarize_file(tmp.name, settings=effective_settings, words=words)
         except DiarizationError as exc:
-            tracker.finish(ok=False)
+            tracker.finish(request_id, ok=False)
             metrics.diarization_sessions_active.dec()
             metrics.diarization_requests_total.labels(outcome="failed").inc()
             # A missing dependency or missing/bad token is a deployment
@@ -180,13 +181,13 @@ def handle_diarize_request(
             status = 503 if ("not installed" in msg or "HF_TOKEN" in msg or "Failed to load" in msg) else 400
             return status, {"error": {"message": msg}}
         except Exception as exc:  # noqa: BLE001 -- last-resort boundary; never crash the admin thread
-            tracker.finish(ok=False)
+            tracker.finish(request_id, ok=False)
             metrics.diarization_sessions_active.dec()
             metrics.diarization_requests_total.labels(outcome="failed").inc()
             logger.exception("unexpected diarization failure")
             return 500, {"error": {"message": f"internal error: {exc}"}}
         else:
-            tracker.finish(ok=True)
+            tracker.finish(request_id, ok=True)
             metrics.diarization_sessions_active.dec()
             metrics.diarization_requests_total.labels(outcome="ok").inc()
 

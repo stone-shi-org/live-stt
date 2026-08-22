@@ -155,6 +155,8 @@ async def test_stats_web_page_endpoint() -> None:
                 # Diarization model row (in addition to the pre-existing
                 # default_model/ASR row) -- CLAUDE.md's requested addition.
                 assert 'id="cfgDiarizationModel"' in html_body
+                # Live "what's running right now" table for diarization.
+                assert 'id="diarizeActiveTbody"' in html_body
     finally:
         server.shutdown()
 
@@ -203,13 +205,42 @@ async def test_stats_json_endpoint_includes_gpu_and_diarization() -> None:
             "used_vram_mb": None,
             "utilization_pct": None,
         }
-        # Fresh ServerState -- diarization_sessions starts at all zeros.
+        # Fresh ServerState -- diarization_sessions starts at all zeros,
+        # with no in-flight requests in the live list.
         assert doc["diarization"] == {
             "active": 0,
             "completed_total": 0,
             "failed_total": 0,
             "rejected_vram_total": 0,
+            "active_requests": [],
         }
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stats_json_endpoint_reflects_an_in_flight_diarization_request() -> None:
+    import json
+
+    settings = Settings(_env_file=None)
+    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+
+        request_id = state.diarization_sessions.start(device="cuda")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=5) as resp:
+            doc = json.loads(resp.read().decode())
+        active_requests = doc["diarization"]["active_requests"]
+        assert len(active_requests) == 1
+        assert active_requests[0]["id"] == request_id
+        assert active_requests[0]["device"] == "cuda"
+        assert active_requests[0]["elapsed_sec"] >= 0
+
+        state.diarization_sessions.finish(request_id, ok=True)
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=5) as resp:
+            doc = json.loads(resp.read().decode())
+        assert doc["diarization"]["active_requests"] == []
     finally:
         server.shutdown()
 

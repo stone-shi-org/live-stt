@@ -235,3 +235,25 @@ class TestSessionTracking:
         assert tracker.active == 0
         assert tracker.failed_total == 1
         assert tracker.completed_total == 0
+
+    def test_active_requests_snapshot_shows_device_while_running_and_clears_after(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # diarize_file runs synchronously inside handle_diarize_request, so
+        # the only way to observe the live-list entry "while running" is to
+        # read it from inside the fake pipeline call itself.
+        tracker = DiarizationSessionTracker()
+        captured = {}
+
+        def fake_diarize_file(path, *, settings, words):
+            captured["snapshot"] = tracker.snapshot_active()
+            return {"task": "diarize", "num_speakers": 0, "segments": [], "speakers": []}
+
+        monkeypatch.setattr(diarize_http, "diarize_file", fake_diarize_file)
+        body = _multipart_body({}, file_field="file", file_bytes=b"wav")
+        _call(content_type=CONTENT_TYPE, body=body, settings=_settings(diarization_device="cpu"), tracker=tracker)
+
+        assert len(captured["snapshot"]) == 1
+        assert captured["snapshot"][0]["device"] == "cpu"
+        assert captured["snapshot"][0]["elapsed_sec"] >= 0
+        assert tracker.snapshot_active() == []  # entry removed once finish() ran

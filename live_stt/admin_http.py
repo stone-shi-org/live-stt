@@ -418,6 +418,23 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- Active Diarization Requests -->
+        <div class="section-card">
+            <div class="section-title">🎤 Active Diarization Requests</div>
+            <table class="kv-table" id="diarizeActiveTable">
+                <thead>
+                    <tr>
+                        <td class="kv-key">ID</td>
+                        <td class="kv-key">Elapsed</td>
+                        <td class="kv-key">Device</td>
+                    </tr>
+                </thead>
+                <tbody id="diarizeActiveTbody">
+                    <tr><td colspan="3" class="card-subtext">No active diarization requests</td></tr>
+                </tbody>
+            </table>
+        </div>
+
         <!-- Server Configuration -->
         <div class="section-card">
             <div class="section-title">⚙️ Server Configuration & Settings</div>
@@ -564,12 +581,24 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     gpuInfo.utilization_pct != null ? gpuInfo.utilization_pct + '%' : 'N/A';
 
                 // Diarization sessions -- see live_stt/diarize_sessions.py.
-                // Aggregate counters, not a per-call registry (same category
-                // as active_calls/active_workers above).
+                // Aggregate counters, plus a small live list of in-flight
+                // requests (opaque id / elapsed / device) -- a deliberate,
+                // narrow exception to "not a per-call registry" (see that
+                // module's docstring), not the full ASR-style registry.
                 const diar = stats.diarization || {};
                 document.getElementById('valDiarizeActive').innerText = diar.active ?? 0;
                 document.getElementById('valDiarizeTotals').innerText =
                     `${diar.completed_total ?? 0} / ${diar.failed_total ?? 0} / ${diar.rejected_vram_total ?? 0}`;
+
+                const activeRequests = diar.active_requests || [];
+                const diarizeTbody = document.getElementById('diarizeActiveTbody');
+                if (activeRequests.length === 0) {
+                    diarizeTbody.innerHTML = '<tr><td colspan="3" class="card-subtext">No active diarization requests</td></tr>';
+                } else {
+                    diarizeTbody.innerHTML = activeRequests.map(r =>
+                        `<tr><td class="kv-val">#${r.id}</td><td class="kv-val">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val">${r.device}</td></tr>`
+                    ).join('');
+                }
             }
 
             // Config
@@ -670,6 +699,14 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                             "completed_total": diar.completed_total,
                             "failed_total": diar.failed_total,
                             "rejected_vram_total": diar.rejected_vram_total,
+                            # Small live list of in-flight requests
+                            # (opaque per-process id, elapsed seconds,
+                            # device) -- see diarize_sessions.py's
+                            # docstring for why this is a deliberate,
+                            # narrow exception to "not a session registry":
+                            # no call-identifying info, bounded to exactly
+                            # what's currently active.
+                            "active_requests": diar.snapshot_active(),
                         },
                     },
                 )
