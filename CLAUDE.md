@@ -361,9 +361,13 @@ in `configure()` and there is no loop anywhere near it.
   audio (via `live_stt.client.asr_client.ASRClient`, not this HTTP endpoint directly, but exercising
   the identical `CallSession`/`WorkerHandle` code this endpoint calls into). The HTTP endpoint
   itself specifically (`/v1/audio/transcriptions`) was still not hit with a real request against the
-  real worker in that pass -- only the gRPC path was. **What's still NOT proven:** the HTTP endpoint
-  against a real worker/model specifically, and never hit by an actual `httpx`-generated request
-  from a real my-meeting-notes checkout.
+  real worker in that pass -- only the gRPC path was at the time. **Since closed**: the actual
+  redeployed 10.100.0.50 production container was hit with real `curl` multipart POSTs to this exact
+  endpoint, both the plain JSON path and the `stream=true` SSE path, each producing the correct full
+  transcript of a real 358s recording via the real worker/model on CUDA -- see the "Deploy status"
+  paragraph in the diarization entry below. **What's still NOT proven:** never hit by an actual
+  `httpx`-generated request from a real my-meeting-notes checkout (only hand-built `curl`/`urllib`
+  requests so far).
 - **Post-call speaker diarization (`live_stt/diarization.py`, `live_stt/diarize_http.py`,
   `tools/diarize_call.py`) — interface, HTTP endpoint, and pure mapping logic implemented,
   unit-tested, AND now run for real end-to-end against the real gated model.**
@@ -514,18 +518,28 @@ in `configure()` and there is no loop anywhere near it.
   port -- 5/5 speakers, 130 segments, matching every prior CPU and venv-GPU run exactly; and the
   pyannote model persisting for real to the host path
   (`/data/docker-infra-data-vol-ssd/live-stt-data/hf-cache/hub/models--pyannote--speaker-diarization-community-1/`).
-  **Deploy status**: the image is built, tagged `registry.shifamily.com/homestack/live-stt:latest-cuda-diarize`,
-  and sitting locally on 10.100.0.50 (no registry push -- no credentials configured on that host, and
-  none needed since compose will find the matching local tag without pulling); `ai.env` in
-  `/data/env/home-docker-script/homestacks/` has been updated for real (GPU toggle uncommented, HF
-  token added); `ai.yml`'s `image:`/`environment:` for the live-stt service have **NOT** been updated
-  yet and the production container is still the old CPU one, untouched and healthy -- blocked
-  mid-edit by a stuck forwarded-SSH-agent socket to that host (the same class of issue Phase 5's
-  `free -h` attempt hit earlier in this file), not by anything wrong with the image or the plan.
-  Finishing this needs: swap `ai.yml`'s image tag to `:latest-cuda-diarize`, add
-  `LSTT_MAX_CONCURRENT_CALLS=2` to that service's `environment:` block (`ai.env`'s plain `=20` is the
-  CPU-path number), `homestack ai up -d live-stt`, then re-verify `/api/health`/`GetServerInfo` and a
-  real diarization request against the actual redeployed production container.
+  **Deploy status: DONE, cut over for real, verified against the actual redeployed production
+  container** (this was blocked mid-edit by a stuck forwarded-SSH-agent socket to that host --
+  the same class of issue Phase 5's `free -h` attempt hit earlier in this file -- and finished once
+  that was reconnected; not anything wrong with the image or the plan). `ai.yml`'s live-stt service:
+  `image:` swapped to `registry.shifamily.com/homestack/live-stt:latest-cuda-diarize` (built and
+  sitting locally on 10.100.0.50, never pushed -- no registry credentials configured on that host,
+  and none needed since compose finds the matching local tag without pulling), `environment:` gained
+  `LSTT_MAX_CONCURRENT_CALLS=2` alongside the existing `LSTT_RESERVE_SLOTS=1` (`ai.env`'s plain `=20`
+  is the CPU-path number). `ai.env` already had the GPU toggle uncommented and the diarization
+  token added from the earlier pass. Deployed with `./homestack ai up -d live-stt` (recreated only
+  that one service, no other stack service touched). **Verified against the real, running,
+  redeployed production container** (not a side-channel container, not a venv): `/api/health` and
+  `/api/stats` on the real exposed admin port (4031) report `backend: cuda`,
+  `max_concurrent_calls: 2`, `max_workers: 3`; a real gRPC `Transcribe` call over the real exposed
+  gRPC port (4030) against the full NOTSOFAR-1 meeting audio produced the same correct transcript as
+  every earlier test; a real `curl` multipart POST to `/v1/audio/diarization` on port 4031 returned
+  5/5 speakers and 130 segments in ~13.9s, matching every prior run exactly; and real `curl` POSTs to
+  `/v1/audio/transcriptions` — both the plain JSON path and the `stream=true` SSE path — each
+  produced the correct full transcript of the entire 358s recording, closing the one gap this
+  entry's own "Batch ASR over HTTP" counterpart still listed as unverified (that endpoint against a
+  real worker/model). Container has been stable and healthy for several minutes post-deploy with no
+  restarts.
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and
