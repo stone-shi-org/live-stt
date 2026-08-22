@@ -354,10 +354,16 @@ in `configure()` and there is no loop anywhere near it.
   socket-level smoke test of both the `stream=true` SSE path and the plain `verbose_json` path
   against a real running `admin_http` server, producing the exact expected wire shapes. Also
   re-verified the existing diarization endpoint still routes correctly (a 503 with a clear message,
-  not a hang or a 404) after the multipart refactor. **What's NOT proven:** never run against the
-  real worker binary or a real GGUF model (no `LSTT_MODEL_PATH` available while writing this), and
-  never hit by an actual `httpx`-generated request from a real my-meeting-notes checkout -- confirm
-  both before trusting this on real traffic.
+  not a hang or a 404) after the multipart refactor. **Since updated: run for real against the real
+  worker binary and a real GGUF model** during the 10.100.0.50 GPU deploy (see the diarization
+  entry below and the "GPU deploy" note) -- a real gRPC `Transcribe` call against the real
+  `realtime_eou_120m-v1` model on CUDA produced a correct transcript over real NOTSOFAR-1 meeting
+  audio (via `live_stt.client.asr_client.ASRClient`, not this HTTP endpoint directly, but exercising
+  the identical `CallSession`/`WorkerHandle` code this endpoint calls into). The HTTP endpoint
+  itself specifically (`/v1/audio/transcriptions`) was still not hit with a real request against the
+  real worker in that pass -- only the gRPC path was. **What's still NOT proven:** the HTTP endpoint
+  against a real worker/model specifically, and never hit by an actual `httpx`-generated request
+  from a real my-meeting-notes checkout.
 - **Post-call speaker diarization (`live_stt/diarization.py`, `live_stt/diarize_http.py`,
   `tools/diarize_call.py`) — interface, HTTP endpoint, and pure mapping logic implemented,
   unit-tested, AND now run for real end-to-end against the real gated model.**
@@ -482,8 +488,44 @@ in `configure()` and there is no loop anywhere near it.
   capacity number, the same caveat Gate B/C's numbers already carry elsewhere in this file; GPU VRAM
   used by pyannote itself was not isolated/measured (10.100.0.50 is the same shared card
   `vram_per_worker_mb`/`vram_reserve_mb` already budget around for the ASR worker — a real GPU
-  diarization deployment there would need its own VRAM accounting, not proven here); and the actual
-  production container was never touched, only a side-by-side venv on the same host.
+  diarization deployment there would need its own VRAM accounting, not proven here). (The venv vs.
+  container gap noted here originally is now closed -- see the next paragraph.)
+
+  **Real container image built and verified for real GPU deployment (still not yet cut over in
+  production as of this writing).** New Dockerfile stage `runtime-cuda-diarize` (extends
+  `runtime-cuda`, adds `requirements-diarization.txt`; `build.sh --cuda --diarize` builds it, tags
+  get a `-cuda-diarize` suffix). **Found a real, container-specific bug the venv testing above could
+  not have caught**: pyannote.audio 4.x decodes audio via `torchcodec`, which `dlopen`s
+  `libavutil`/`libavcodec`/etc at import time rather than linking them at build time --
+  `runtime-cuda`'s minimal base (`python3.12`/`python3-pip`/`libgomp1` only) has none of that, so the
+  first real container run failed with `OSError: libavutil.so.61: cannot open shared object file`
+  (repeated for every ffmpeg ABI version 4-9 torchcodec tried). Every dev machine this was built on
+  before this container already had `ffmpeg` installed for unrelated reasons, which is exactly how
+  this stayed invisible until a real container build+run. Fixed by adding `ffmpeg` via `apt-get` in
+  the new stage. Also: `HF_HOME` is set to `/app/data/hf-cache`, inside the already-mounted,
+  already-writable `live-stt-data:/app/data` volume -- the gated model then survives container
+  restarts using infrastructure that already exists, rather than a container-local cache that
+  re-downloads it (burning the token's rate limit) every time. **After the ffmpeg fix, verified for
+  real on 10.100.0.50, in the actual container (not a venv), with `--gpus all`**: real gRPC ASR
+  transcript over CUDA against real NOTSOFAR-1 meeting audio (via `ASRClient`, exercising the same
+  `CallSession`/`WorkerHandle` code `servicer.Transcribe` and the `/v1/audio/transcriptions` HTTP
+  endpoint both call into); real pyannote diarization over CUDA via both the direct `diarize_file()`
+  call and a real `curl` multipart POST to `/v1/audio/diarization` on the container's actual admin
+  port -- 5/5 speakers, 130 segments, matching every prior CPU and venv-GPU run exactly; and the
+  pyannote model persisting for real to the host path
+  (`/data/docker-infra-data-vol-ssd/live-stt-data/hf-cache/hub/models--pyannote--speaker-diarization-community-1/`).
+  **Deploy status**: the image is built, tagged `registry.shifamily.com/homestack/live-stt:latest-cuda-diarize`,
+  and sitting locally on 10.100.0.50 (no registry push -- no credentials configured on that host, and
+  none needed since compose will find the matching local tag without pulling); `ai.env` in
+  `/data/env/home-docker-script/homestacks/` has been updated for real (GPU toggle uncommented, HF
+  token added); `ai.yml`'s `image:`/`environment:` for the live-stt service have **NOT** been updated
+  yet and the production container is still the old CPU one, untouched and healthy -- blocked
+  mid-edit by a stuck forwarded-SSH-agent socket to that host (the same class of issue Phase 5's
+  `free -h` attempt hit earlier in this file), not by anything wrong with the image or the plan.
+  Finishing this needs: swap `ai.yml`'s image tag to `:latest-cuda-diarize`, add
+  `LSTT_MAX_CONCURRENT_CALLS=2` to that service's `environment:` block (`ai.env`'s plain `=20` is the
+  CPU-path number), `homestack ai up -d live-stt`, then re-verify `/api/health`/`GetServerInfo` and a
+  real diarization request against the actual redeployed production container.
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and

@@ -224,6 +224,47 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
 
 CMD ["python", "run.py"]
 
+# ---- stage: runtime-cuda + post-call diarization baked in ------------------
+# pyannote.audio/torch/torchaudio (requirements-diarization.txt) are
+# deliberately NOT in runtime/runtime-cuda themselves -- diarization is an
+# opt-in, offline-only tool, and every OTHER deployment of the always-on
+# grpc.aio server shouldn't pay for a multi-hundred-MB torch install it never
+# uses (see live_stt/diarization.py). This stage exists because a specific
+# deployment (10.100.0.50) wants BOTH GPU ASR and GPU diarization in the one
+# running container -- see CLAUDE.md's "Batch ASR over HTTP" /
+# "Post-call speaker diarization" entries. Kept as a separate stage/tag
+# (`-cuda-diarize`, not a change to what `-cuda` means) so CLAUDE.md's
+# existing Phase 5 description of runtime-cuda (built and verified WITHOUT
+# these deps) stays accurate rather than silently going stale.
+#
+# HF_HOME points inside the already-mounted, already-writable /app/data
+# volume (see docker-compose.yml/ai.yml: `live-stt-data:/app/data`) rather
+# than a new named volume -- the pyannote model then survives container
+# restarts/recreates for free, using infrastructure that already exists,
+# instead of a container-local cache that re-downloads the gated model from
+# HuggingFace (and burns a token's rate limit) on every restart.
+FROM runtime-cuda AS runtime-cuda-diarize
+ENV HF_HOME=/app/data/hf-cache
+# ffmpeg: pyannote.audio 4.x decodes audio via torchcodec, which dlopens
+# libavutil/libavcodec/etc at import time (tries several ffmpeg ABI versions
+# in turn) rather than linking them at build time -- found only by actually
+# running diarize_file() in a real container, not by reading either
+# project's docs: "OSError: libavutil.so.61: cannot open shared object
+# file", repeated for every ffmpeg 4-9 ABI torchcodec tried, on this image's
+# runtime-cuda base (python3.12/python3-pip/libgomp1 only, no media libs at
+# all). Every dev machine this was built/tested on before this container
+# already had ffmpeg installed for unrelated reasons, which is exactly how
+# this stayed invisible until the real container build+run in CLAUDE.md's
+# GPU deploy log.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements-diarization.txt .
+RUN pip install --no-cache-dir --break-system-packages -r requirements-diarization.txt \
+        --index-url https://pypi.org/simple/
+
+CMD ["python", "run.py"]
+
 # ---- stage: unit tests -- deliberately ships NO worker binary and NO model.
 # Offline-safety-by-construction: an accidental integration-shaped "unit"
 # test fails the build here (ModuleNotFoundError / FileNotFoundError)

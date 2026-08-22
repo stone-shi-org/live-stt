@@ -7,6 +7,10 @@
 #   ./build.sh -t v1.2                      add an extra tag
 #   ./build.sh -r registry.example.com/x    tag for a specific registry
 #   ./build.sh --cuda                       build runtime-cuda instead, tags get a -cuda suffix
+#   ./build.sh --cuda --diarize             build runtime-cuda-diarize (CUDA ASR + pyannote.audio
+#                                            baked in, see requirements-diarization.txt), tags get
+#                                            a -cuda-diarize suffix -- requires --cuda, no CPU+
+#                                            diarize image target exists
 #   LSTT_REGISTRY=registry.example.com/x ./build.sh   same, via environment
 #
 # Registry precedence: -r flag > LSTT_REGISTRY env var > unset (local image only).
@@ -22,6 +26,7 @@ IMAGE="live-stt"
 PUSH=0
 EXTRA_TAG=""
 CUDA=0
+DIARIZE=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -29,7 +34,8 @@ while [[ $# -gt 0 ]]; do
         -t|--tag)      EXTRA_TAG="$2"; shift 2 ;;
         -r|--registry) REGISTRY="$2"; shift 2 ;;
         --cuda)        CUDA=1; shift ;;
-        -h|--help)     sed -n '2,16p' "$0"; exit 0 ;;
+        --diarize)     DIARIZE=1; shift ;;
+        -h|--help)     sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -38,6 +44,11 @@ log() { echo "==> $*"; }
 
 if [ "$PUSH" -eq 1 ] && [ -z "$REGISTRY" ]; then
     echo "ERROR: --push needs a registry. Pass -r <registry> or set LSTT_REGISTRY." >&2
+    exit 1
+fi
+
+if [ "$DIARIZE" -eq 1 ] && [ "$CUDA" -ne 1 ]; then
+    echo "ERROR: --diarize currently requires --cuda -- no runtime-diarize (CPU) target exists." >&2
     exit 1
 fi
 
@@ -50,6 +61,10 @@ SUFFIX=""
 if [ "$CUDA" -eq 1 ]; then
     TARGET="runtime-cuda"
     SUFFIX="-cuda"
+fi
+if [ "$DIARIZE" -eq 1 ]; then
+    TARGET="runtime-cuda-diarize"
+    SUFFIX="-cuda-diarize"
 fi
 
 # version.txt is baked into the image and surfaced at GetServerInfo (and
