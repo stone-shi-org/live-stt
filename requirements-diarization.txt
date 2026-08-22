@@ -1,0 +1,21 @@
+# Post-call speaker diarization (live_stt/diarization.py, tools/diarize_call.py).
+#
+# Deliberately NOT in requirements.txt: pyannote.audio pulls in torch and
+# torchaudio (multi-hundred-MB), and diarization runs as an offline batch
+# step against a recorded WAV after a call ends -- never inside the
+# always-on grpc.aio server process (see live_stt/diarization.py's module
+# docstring for why pyannote's community-1 pipeline can't run inline
+# anyway: it processes a whole clip in one pass, no incremental feed API).
+# Bloating the runtime image for every deployment to support an opt-in
+# post-call tool would be the wrong tradeoff -- install this file into a
+# separate venv, or add it to a dedicated tooling image, only where the
+# tool is actually used.
+#
+# pyannote/speaker-diarization-community-1's model card lists pyannote.audio
+# 4.x compatibility; pin the floor, not an exact version, since this file
+# has not yet been exercised against a real gated-model download in this
+# repo (no HF token available while writing it -- see the "What is NOT
+# verified" note in live_stt/diarization.py).
+pyannote.audio>=4.0.0
+torch>=2.0.0
+torchaudio>=2.0.0

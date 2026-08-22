@@ -32,6 +32,14 @@ def _offline_safety(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LSTT_MODELS_DIR", "/nonexistent-lstt-model-dir")
     monkeypatch.setenv("LSTT_ALLOW_PII", "false")
     monkeypatch.delenv("LSTT_MODEL_PATH", raising=False)
+    # A real HF token lives in this dev host's shell env (~/.secrets/huggingface.env,
+    # sourced from .zshenv -- see CLAUDE.md) so ad-hoc diarization runs don't need
+    # it typed in. Settings(_env_file=None) only skips the .env FILE, not real
+    # process env vars, so without this a Settings()-defaults test here would
+    # silently pass or fail depending on which machine/shell it runs in --
+    # confirmed the hard way when installing requirements-diarization.txt for a
+    # real end-to-end test made test_diarization_defaults fail on this exact host.
+    monkeypatch.delenv("LSTT_DIARIZATION_HF_TOKEN", raising=False)
 
 
 @pytest.fixture()

@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from prometheus_client import generate_latest
 
-from live_stt import __about__
+from live_stt import __about__, diarize_http
 from live_stt.state import ServerState
 
 
@@ -595,6 +595,18 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                 self._write_json(200, state.settings.model_dump())
             elif self.path == "/metrics":
                 self._write(200, generate_latest(), "text/plain; version=0.0.4; charset=utf-8")
+            else:
+                self._write_json(404, {"error": "not found"})
+
+        def do_POST(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler's naming
+            if self.path == diarize_http.DIARIZE_PATH:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length) if length else b""
+                content_type = self.headers.get("Content-Type", "")
+                status, doc = diarize_http.handle_diarize_request(
+                    content_type=content_type, body=body, settings=state.settings
+                )
+                self._write_json(status, doc)
             else:
                 self._write_json(404, {"error": "not found"})
 

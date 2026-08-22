@@ -319,6 +319,132 @@ in `configure()` and there is no loop anywhere near it.
   natively), confirming the `$ORIGIN` rpath resolves the ggml `.so`s correctly in that environment.
   `test-integration` is written but not yet built+run in a container — verify before trusting it
   blindly.
+- **Post-call speaker diarization (`live_stt/diarization.py`, `live_stt/diarize_http.py`,
+  `tools/diarize_call.py`) — interface, HTTP endpoint, and pure mapping logic implemented,
+  unit-tested, AND now run for real end-to-end against the real gated model.**
+  Wraps `pyannote/speaker-diarization-community-1` (confirmed via its model card:
+  `Pipeline.from_pretrained(model, token=...)`, called as `pipeline("audio.wav")` — a
+  complete-clip-in-one-pass API, no incremental feed, unlike `parakeet_capi_stream_feed`). That
+  mismatch is why this is batch-only and runs *after* a call ends against a recorded WAV, never
+  inline in `Transcribe()` — and today that WAV has to come from somewhere out-of-band, since the
+  audio-dump ring buffer this would naturally consume from doesn't exist yet (see the very next
+  bullet). Deliberately **not** mapped to pyannote's native `Annotation`/RTTM shape: this house
+  already has one diarization consumer, `my-meeting-notes/app/services/diarize.py` (an HTTP client
+  against a LocalAI-compatible `/v1/audio/diarization` endpoint returning
+  `{num_speakers, segments, speakers}` JSON with per-segment `text`), and `live_stt/models.py`
+  already cites that file as prior art for the `<en-US>`-tag-stripping regex — so
+  `annotation_to_house_json`/`assign_text` map pyannote's `itertracks(yield_label=True)` output into
+  that exact same JSON shape, with segment `text` filled in by midpoint-overlap against the call's
+  own ASR word timestamps (`asr_pb2.Word`) rather than a single model producing both, since here
+  diarization (pyannote) and transcription (parakeet.cpp) are two separate engines. New `Settings`
+  fields: `diarization_model`, `diarization_hf_token` (the model is gated CC-BY-4.0, kept as its own
+  field so a logged model id never leaks it), `diarization_num_speakers` (defaults to 2 — most calls
+  through this service are one-on-one telephony, and pyannote's clustering does measurably better
+  given the true count than guessing). `pyannote.audio`/`torch`/`torchaudio` live in a separate
+  `requirements-diarization.txt`, deliberately excluded from `requirements.txt` — heavy dependencies
+  for an opt-in offline tool, not something every deployment of the always-on `grpc.aio` server
+  should pay for. `live_stt/diarize_http.py` wires `POST /v1/audio/diarization` into
+  `admin_http.py`'s existing `ThreadingHTTPServer` (admin_host/admin_port, not a new server, not
+  the gRPC path) — path and multipart fields (`file`/`model`/`include_text`/`response_format`)
+  deliberately match `my-meeting-notes/app/services/diarize.py`'s client exactly, so that existing
+  client can point at a live-stt instance with zero changes on its side. Two extension fields not
+  in that client today, `words` and `num_speakers`, exist because — unlike that client's other
+  backends — diarization (pyannote) and transcription (parakeet.cpp) are separate engines here, so
+  per-segment `text` can only be filled if the caller supplies the call's own ASR word timestamps;
+  `include_text=true` with no `words` field correctly comes back as empty-text segments, which the
+  my-meeting-notes client already treats as `DiarizationError("...ignored include_text=true...")` —
+  an honest, correctly-typed failure, not a silent wrong answer, but a real caller wanting text
+  through this endpoint MUST also pass `words`. Since Python 3.13 removed `cgi.FieldStorage` (this
+  host runs 3.14, same reason `live_stt/client/telephony.py` avoids `audioop`), multipart parsing
+  goes through a documented `email`-module trick (wrap the raw body as a synthetic MIME message
+  using the client's own Content-Type/boundary, let `email` split it) — verified binary-safe against
+  a synthetic 1KB payload covering all 256 byte values before relying on it, and separately verified
+  over a real socket (a real `urllib` multipart POST against a real running `admin_http` server
+  correctly routed to the handler and returned a real 503 for the real missing-pyannote-dependency
+  case, not a 404 or a crash). **What's proven:** the mapping/merge logic (13 tests,
+  `tests/test_diarization.py`) against a fake `itertracks`-shaped stand-in, both label conventions
+  pyannote's docs show (bare `Annotation` and the 4.x `.speaker_diarization`-wrapper output), the
+  HTTP request handler (11 tests, `tests/test_diarize_http.py`, pure-function-level plus one live
+  socket smoke test as above), the missing-dependency and missing-token error paths (forced via
+  `sys.modules` injection rather than relying on the venv's actual state — see the real-run gotcha
+  below), and that the CLI (`tools/diarize_call.py`) exits cleanly with a readable message on both.
+
+  **Real end-to-end run, done for real (not simulated), against NOTSOFAR-1's `MTG_32089`** — the
+  same meeting Gate C already used (`/data/vmfs/main01a_shared/Download/NOTSOFAR-1/eval_set/
+  240629.1_eval_small_with_GT/MTG/MTG_32089`), specifically `sc_meetup_0/ch0.wav` (16kHz mono,
+  358s, 5 real participants: Sarah/Donald/Ron/Beth/Rachel) plus its `gt_transcription.json`, which
+  conveniently has real per-speaker ground truth AND real word-level timestamps (1151 words) —
+  used the latter as a stand-in for "the call's own ASR word list" without needing the C++ worker
+  at all. `requirements-diarization.txt` installed clean into this repo's venv (torch 2.13.0,
+  pyannote.audio 4.0.7, confirming the `>=4.0.0` floor pin). HF token (real, accepted-terms account)
+  stored at `~/.secrets/huggingface.env` as `LSTT_DIARIZATION_HF_TOKEN`, sourced from `.zshenv` —
+  same convention as `BAMBOO_TOKEN` in the global CLAUDE.md, deliberately not typed inline anywhere.
+  **CLI path** (`tools/diarize_call.py --num-speakers 5`): real pyannote inference, **5/5 speakers
+  correctly counted**, 130 segments, 312.8s wall time on this 6-core CPU-only dev host (~447% CPU,
+  no GPU) — call this roughly real-time-ish for a ~6-minute meeting on CPU, not fast, and NOT yet
+  measured on the actual deployment box or on CUDA. Word-timestamp merge worked on real (not
+  synthetic) data: 96/130 segments got real, correctly-attached transcript text (spot-checked, e.g.
+  segment 3 = `"so uh rachel you're here just to like yes give us a rundown..."`, the real words in
+  the real time range). **Scored against real ground truth** with a simple 100ms-frame purity metric
+  (not a real DER — no optimal/Hungarian assignment, no miss/false-alarm penalty, sanity-check-grade
+  only): the 5 predicted clusters mapped **cleanly and bijectively** to the 5 real speakers (no
+  cluster split across two identities as its dominant match), per-cluster purity 0.73–0.86, overall
+  frame-level agreement **0.813** across 288.1s of overlapping scored audio. **HTTP path**: the exact
+  same audio+words sent as a real multipart POST over a real TCP socket to a real running
+  `admin_http` server → **HTTP 200 in 361.7s**, and the returned JSON scored **identically** (0.813)
+  to the CLI path, confirming the two code paths agree byte-for-byte in outcome, not just in shape.
+  **A real gotcha this run surfaced**: two unit tests were silently depending on ambient
+  environment state that stopped being true the moment the real dependency and real token existed
+  on this dev host — `test_missing_dependency_raises_diarization_error` assumed pyannote.audio was
+  actually absent (broke the instant it got installed for this run) and `test_diarization_defaults`
+  assumed `LSTT_DIARIZATION_HF_TOKEN` was unset (broke the instant `.zshenv` started sourcing the
+  real one) — `Settings(_env_file=None)` only skips the `.env` FILE, not real process env vars, and
+  `tests/conftest.py`'s offline-safety fixture cleared `LSTT_MODEL_PATH`/`LSTT_ALLOW_PII` but not
+  this new var. Fixed by forcing the import failure via `sys.modules["pyannote.audio"] = None`
+  (asserts the code path, not the venv's current state) and adding
+  `monkeypatch.delenv("LSTT_DIARIZATION_HF_TOKEN")` to that same fixture — the same class of bug the
+  fixture already exists to prevent, just not yet extended to this field.
+
+  **GPU support added (`Settings.diarization_device`, "cpu" default | "cuda") and measured for real
+  on 10.100.0.50's actual RTX 3090** — not simulated, not assumed from the ASR worker's separate CUDA
+  numbers. `load_pipeline` moves the pipeline with `pipeline.to(torch.device("cuda"))`, checking
+  `torch.cuda.is_available()` first and failing loudly (a clear `DiarizationError`) rather than
+  letting a missing GPU surface as a confusing failure deep inside pyannote's first forward pass —
+  this is independent of the ASR worker's own `backend` setting, since diarization runs as ordinary
+  Python/torch in this process, never in the C++ worker. **Deployment note: this was validated via a
+  standalone venv on 10.100.0.50 (`~/live-stt-diarize-test`, python3.14-venv installed via
+  `sudo apt-get install`, `requirements-diarization.txt` installed fresh against the real CUDA
+  driver there), NOT by rebuilding/redeploying the actual running `live-stt` Docker container** (the
+  one `docker ps` shows healthy on that box today, per the user's note that its ASR backend is
+  currently configured `cpu` there too) — wiring GPU diarization into that container's own image and
+  compose file is separate, not-yet-done work. Same exact file (`MTG_32089/sc_meetup_0/ch0.wav`,
+  already reachable at the same path on 10.100.0.50 too — `main01a_shared` is genuinely shared
+  network storage, no copy needed), same `words.json`, same `--num-speakers 5`, run four ways for a
+  clean CPU-vs-GPU, CLI-vs-HTTP comparison:
+
+  | path | device | wall time | speakers | segments | accuracy vs. ground truth |
+  |---|---|---|---|---|---|
+  | CLI | cpu (dev host, 6-core) | 312.8s | 5/5 | 130 | 0.813 frame agreement |
+  | CLI | cuda (10.100.0.50, RTX 3090) | **16.5s** | 5/5 | 130 | 0.813 (identical) |
+  | HTTP | cpu (dev host) | 361.7s | 5/5 | 130 | 0.813 (identical) |
+  | HTTP | cuda (10.100.0.50) | **10.8s** | 5/5 | 130 | 0.813 (identical) |
+
+  **~19x wall-time speedup, zero accuracy difference** — segment boundaries matched CPU output to
+  the float (max start-time delta across all 130 segments: 0.0s), despite pyannote disabling TF32 on
+  CUDA specifically for reproducibility (a real warning seen in this run's own logs:
+  `TensorFloat-32 (TF32) has been disabled as it might lead to reproducibility issues`). This turns
+  post-call diarization from "roughly as long as the call itself" (CPU, the caveat given right after
+  the CPU timing question was first asked) into a genuinely fast background step on hardware this
+  house already owns. **What's still NOT proven:** this was a 5-party conference meeting run with
+  `--num-speakers 5` explicitly, not the 2-party telephony call `diarization_num_speakers`'s default
+  (2) actually targets — the default path itself is untested against real audio; the HTTP request
+  was a hand-built multipart POST matching my-meeting-notes' client's contract, not that client's
+  actual code hitting this endpoint; CPU-only timing on the 6-core dev host is not a production
+  capacity number, the same caveat Gate B/C's numbers already carry elsewhere in this file; GPU VRAM
+  used by pyannote itself was not isolated/measured (10.100.0.50 is the same shared card
+  `vram_per_worker_mb`/`vram_reserve_mb` already budget around for the ASR worker — a real GPU
+  diarization deployment there would need its own VRAM accounting, not proven here); and the actual
+  production container was never touched, only a side-by-side venv on the same host.
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and

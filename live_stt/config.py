@@ -98,6 +98,39 @@ class Settings(BaseSettings):
     audio_dump: str = "off"  # off | on_error | always
     allow_pii: bool = False
 
+    # Post-call speaker diarization (live_stt/diarization.py). Confirmed via
+    # the model card that pyannote/speaker-diarization-community-1 processes
+    # a whole clip in one pass (pipeline("audio.wav") / pipeline({"waveform":
+    # ..., "sample_rate": ...})) -- there is no incremental-feed API, so this
+    # cannot run inline in Transcribe() the way the ASR worker does. It only
+    # ever runs AFTER a call ends, against a recorded WAV -- which itself
+    # requires audio_dump above (and therefore allow_pii=True) to have
+    # produced one; there is deliberately no separate PII gate here, it just
+    # inherits audio_dump's. Output is mapped into the same
+    # {num_speakers, segments, speakers} JSON shape as
+    # my-meeting-notes/app/services/diarize.py's LocalAI-compatible client
+    # (house convention), not pyannote's native Annotation/RTTM shape.
+    diarization_model: str = "pyannote/speaker-diarization-community-1"
+    # Gated model on HuggingFace (CC-BY-4.0, requires accepting pyannote's
+    # terms and passing a token) -- kept as its own field, never folded into
+    # diarization_model, so a log line that prints the model id never leaks it.
+    diarization_hf_token: str | None = None
+    # Most calls through this service are one-on-one telephony, so the
+    # speaker count is usually known in advance -- passing it to pyannote's
+    # pipeline (num_speakers=) measurably helps clustering accuracy over
+    # letting it guess. None means "let pyannote decide", the right default
+    # for anything that isn't a plain two-party call.
+    diarization_num_speakers: int | None = 2
+    # "cpu" | "cuda". Independent of the ASR worker's own `backend` setting
+    # above -- pyannote.audio runs in this Python process via torch, not in
+    # the C++ worker, so a CUDA ASR deployment and a CPU diarization
+    # deployment (or vice versa) are two separate choices, not one. Measured
+    # for real on a 6-core CPU dev host against a 358s NOTSOFAR-1 meeting:
+    # 312.8s wall time (~0.87x realtime) -- see CLAUDE.md. Defaults to "cpu"
+    # since that's what's actually been exercised; opt into "cuda" only on a
+    # box that actually has a CUDA-capable GPU and driver.
+    diarization_device: str = "cpu"
+
     @model_validator(mode="after")
     def _check_grace_period(self) -> "Settings":
         if self.finalize_timeout_sec > self.drain_timeout_sec:
