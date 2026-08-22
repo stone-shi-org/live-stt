@@ -319,6 +319,45 @@ in `configure()` and there is no loop anywhere near it.
   natively), confirming the `$ORIGIN` rpath resolves the ggml `.so`s correctly in that environment.
   `test-integration` is written but not yet built+run in a container — verify before trusting it
   blindly.
+- **Batch ASR over HTTP (`live_stt/transcribe_http.py`) — `POST /v1/audio/transcriptions`,
+  wired into `admin_http.py`'s `ThreadingHTTPServer`, real subprocess-level tests passing, not yet
+  run against the real worker binary/model.** Unlike diarization (a genuinely separate, offline-only
+  torch engine), this reuses the REAL production ASR path: `live_stt/session.py`'s `CallSession`
+  over a real spawned `WorkerHandle` -- the exact same code `servicer.Transcribe` drives for a gRPC
+  call, with one HTTP request treated as one short-lived "call" admitted through the SAME shared
+  `WorkerBudget` a gRPC call uses. **Found and fixed a real concurrency bug making this safe**:
+  `WorkerBudget` was documented and built as lock-free specifically because only the single-threaded
+  grpc.aio event loop ever touched it; sharing it with `admin_http.py`'s per-request OS threads broke
+  that argument outright (`active_calls += 1` is not atomic across real threads even under the GIL).
+  Fixed by adding one `threading.Lock` around every mutating method in `live_stt/admission.py` --
+  cheap (called a handful of times per call, never in a hot loop), and now this endpoint cannot spawn
+  worker processes past what the box was actually sized for, independent of concurrent gRPC load.
+  Long uploaded files even get `CallSession`'s normal worker-rotation safety net for free, for the
+  same reason. **Request/response contract confirmed against the actual house consumer, not
+  guessed**: `my-meeting-notes/app/routers/live_caption.py`'s `channel_worker_transcriptions` (the
+  "reinstated stateless per-chunk POST backend" for a deployment with no realtime pipeline model) --
+  multipart `file`/`model`/`stream`/`language`, and on `stream=true` (which that client always sends)
+  a Server-Sent-Events response where only `{"type": "transcript.text.done", "text": ...}` is read
+  and a literal `data: [DONE]` line ends it. Implemented as ONE such event carrying the full
+  transcript after the whole upload is processed, not genuine incremental streaming (no
+  `transcript.text.delta` mid-request) -- correct for that consumer, which never reads deltas anyway,
+  but not something to build a live partial-caption UI on top of. `stream` unset/`false` returns
+  OpenAI-Whisper-shaped JSON instead (`{"text": ...}`, or `response_format=verbose_json` for
+  `{task, language, duration, text, words}`). Only 16kHz mono 16-bit WAV is accepted, same
+  restriction `servicer.Transcribe` already enforces on the gRPC path, kept consistent rather than
+  adding a resampling dependency here. Multipart parsing was extracted from `diarize_http.py` into a
+  shared `live_stt/multipart.py` (nothing about it was diarization-specific) with a re-export so
+  existing call sites/tests were untouched. **What's proven:** 22 tests (`tests/test_transcribe_http.py`)
+  including several that go through the REAL `CallSession`/`WorkerHandle`/subprocess path against
+  `tests/fakes/fake_worker_main.py` (a real subprocess speaking the real IPC protocol, same pattern
+  `tests/test_session.py` already uses -- NOT the real C++ binary or a real model), and a real
+  socket-level smoke test of both the `stream=true` SSE path and the plain `verbose_json` path
+  against a real running `admin_http` server, producing the exact expected wire shapes. Also
+  re-verified the existing diarization endpoint still routes correctly (a 503 with a clear message,
+  not a hang or a 404) after the multipart refactor. **What's NOT proven:** never run against the
+  real worker binary or a real GGUF model (no `LSTT_MODEL_PATH` available while writing this), and
+  never hit by an actual `httpx`-generated request from a real my-meeting-notes checkout -- confirm
+  both before trusting this on real traffic.
 - **Post-call speaker diarization (`live_stt/diarization.py`, `live_stt/diarize_http.py`,
   `tools/diarize_call.py`) — interface, HTTP endpoint, and pure mapping logic implemented,
   unit-tested, AND now run for real end-to-end against the real gated model.**

@@ -10,12 +10,13 @@ rotation at exactly the moment it's needed.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from prometheus_client import generate_latest
 
-from live_stt import __about__, diarize_http
+from live_stt import __about__, diarize_http, transcribe_http
 from live_stt.state import ServerState
 
 
@@ -607,6 +608,26 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     content_type=content_type, body=body, settings=state.settings
                 )
                 self._write_json(status, doc)
+            elif self.path == transcribe_http.TRANSCRIBE_PATH:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length) if length else b""
+                content_type = self.headers.get("Content-Type", "")
+                # ThreadingHTTPServer gives this request its own OS thread
+                # with no pre-existing event loop, so asyncio.run() here is
+                # safe -- CallSession/WorkerHandle are async (the same
+                # production code servicer.Transcribe drives), and this
+                # handler is otherwise plain synchronous BaseHTTPRequestHandler
+                # code, same as diarize_http's branch above.
+                status, response_body, content_type = asyncio.run(
+                    transcribe_http.handle_transcribe_request(
+                        content_type=content_type,
+                        body=body,
+                        settings=state.settings,
+                        budget=state.budget,
+                        draining=state.draining,
+                    )
+                )
+                self._write(status, response_body, content_type)
             else:
                 self._write_json(404, {"error": "not found"})
 

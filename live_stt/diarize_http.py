@@ -33,27 +33,22 @@ support transcription.")`` -- an honest, correctly-typed failure, not a
 silent wrong answer, but a real caller wanting text-per-segment through this
 endpoint MUST also pass ``words``.
 
-**Not multipart-library-based**: ``cgi.FieldStorage`` (the traditional
-stdlib answer) was removed by PEP 594 in Python 3.13 (this host runs 3.14 --
-same reason ``live_stt/client/telephony.py`` doesn't use ``audioop``, see
-CLAUDE.md), and this repo carries no other multipart-parsing dependency.
-Standard workaround instead: wrap the raw body as a MIME message (borrowing
-the client's own Content-Type header, boundary and all) and let the
-``email`` package's MIME parser -- never deprecated -- do the real
-splitting. Verified binary-safe before relying on it here: fed a synthetic
-1KB payload covering all 256 byte values through it and confirmed a
-byte-for-byte round trip.
+**Multipart parsing lives in ``live_stt/multipart.py``** (shared with
+``live_stt/transcribe_http.py``) -- see that module's docstring for why this
+doesn't use ``cgi.FieldStorage`` and how it was verified binary-safe.
+``MultipartError``/``parse_multipart_form`` are re-exported here (imported
+into this module's namespace below) purely so existing call sites/tests that
+say ``diarize_http.parse_multipart_form`` keep working unchanged.
 
 **Not verified**: this whole module has not been exercised against a real
-``httpx``/browser multipart request or a real pyannote model (no HF token
-available while writing it -- same caveat as ``live_stt/diarization.py``).
-The multipart parser itself IS verified binary-safe (see above); what is
-not yet proven is the full request -> response path end to end.
+``httpx``/browser multipart request from an actual my-meeting-notes
+checkout (only a hand-built one and a synthetic binary-safety check) --
+though the real end-to-end run recorded in CLAUDE.md DID confirm the full
+request -> response path against a real pyannote model over a real socket.
 """
 
 from __future__ import annotations
 
-import email
 import json
 import tempfile
 from typing import Any
@@ -61,48 +56,14 @@ from typing import Any
 from live_stt.config import Settings
 from live_stt.diarization import DiarizationError, diarize_file
 from live_stt.logging_config import get_logger
+from live_stt.multipart import MultipartError, parse_multipart_form
 from live_stt.pb.livestt.v1 import asr_pb2
 
 logger = get_logger("diarize_http")
 
 DIARIZE_PATH = "/v1/audio/diarization"
 
-
-class MultipartError(ValueError):
-    """Malformed request body -- always maps to a 400, never a 500."""
-
-
-def parse_multipart_form(content_type: str, body: bytes) -> dict[str, bytes]:
-    """Parse a ``multipart/form-data`` body into ``{field_name: raw_bytes}``.
-
-    See the module docstring for why this doesn't use ``cgi.FieldStorage``.
-    Field values are returned as raw bytes -- callers decide how to decode
-    each one (UTF-8 text field vs. binary file upload).
-    """
-    if "multipart/form-data" not in content_type:
-        raise MultipartError(f"expected multipart/form-data, got {content_type!r}")
-
-    # Borrow the client's own Content-Type (boundary and all) as the
-    # top-level header of a synthetic MIME message, then let `email` do the
-    # actual multipart splitting -- see module docstring.
-    header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii")
-    msg = email.message_from_bytes(header + body)
-    if not msg.is_multipart():
-        raise MultipartError("body did not parse as multipart (missing/bad boundary?)")
-
-    fields: dict[str, bytes] = {}
-    for part in msg.get_payload():
-        disposition = part.get("Content-Disposition", "")
-        name = None
-        for piece in disposition.split(";"):
-            piece = piece.strip()
-            if piece.startswith("name="):
-                name = piece[len("name=") :].strip('"')
-        if name is None:
-            continue
-        payload = part.get_payload(decode=True)
-        fields[name] = payload if payload is not None else b""
-    return fields
+__all__ = ["DIARIZE_PATH", "MultipartError", "handle_diarize_request", "parse_multipart_form"]
 
 
 def _parse_words(raw: bytes | None) -> list[asr_pb2.Word]:
