@@ -580,11 +580,46 @@ in `configure()` and there is no loop anywhere near it.
   in `tests/test_diarize_http.py`, and a new `/api/stats` JSON-shape test plus a dashboard-markup
   test in `tests/test_metrics.py`) — including the VRAM-insufficient-rejects-before-touching-the-
   pipeline path, the fail-open-on-None path, and thread-safety of the tracker under concurrent
-  start/finish. **What's NOT proven:** none of this has been rebuilt into a new
-  `runtime-cuda-diarize` image or redeployed to 10.100.0.50 yet — the real 12GB number above came
-  from the PRE-existing deployed image (which has no VRAM gate at all yet), not from testing the new
-  gate itself against the real GPU. The dashboard's actual rendering (vs. just the HTML/JSON shape
-  tests above) has not been eyeballed in a real browser against a real backend either.
+  start/finish. **What's NOT proven:** the dashboard's actual rendering (vs. just the HTML/JSON
+  shape tests above) has not been eyeballed in a real browser against a real backend.
+
+  **Duration-scaling measured for real, and a real leak-shaped (not-actually-a-leak) finding fixed.**
+  Concatenated real meeting audio into synthetic 10/20/40-minute files (no natural NOTSOFAR-1
+  recording runs past ~8 minutes) and measured peak VRAM against the real RTX 3090, restarting the
+  container fresh before each duration so one file's plateau couldn't contaminate the next:
+
+  | duration | peak VRAM (this process's own PID) |
+  |---|---|
+  | 6 min | 10,796 MiB |
+  | 10 min | 11,424 MiB |
+  | 20 min | 10,320 MiB |
+  | 40 min | **2,328 MiB** (reproduced twice, with continuous 0.5s polling both times) |
+
+  **VRAM does not scale up with call duration** in this tested range — 6 to 20 minutes (a 3.3x
+  spread) stayed within ~10% of each other, consistent with pyannote batching sliding windows at a
+  bounded size internally rather than batching "the whole file" (which would show duration-scaling).
+  The 40-minute result being *lower*, not higher, is real and reproducible but its mechanism is
+  NOT understood (best guess: length-aware batching inside pyannote itself, unconfirmed against its
+  source). Practically: the original fear motivating this whole investigation (a long real phone
+  call blowing past 24GB) is not supported by this data, though it was only tested to 40 minutes,
+  not this service's full 150-minute `max_call_sec` ceiling.
+
+  Separately, and prompted directly by the question "why doesn't it release the VRAM after the job
+  finishes": confirmed the pre-existing deployed image had NO cleanup between requests at all --
+  `diarize_file` now calls `gc.collect()` + `torch.cuda.empty_cache()` in a `finally` after every
+  CUDA request (`live_stt/diarization.py::_release_cuda_memory`), trading some re-warm cost on the
+  next request for not permanently squatting on a shared card between requests. **Verified for real
+  on 10.100.0.50** (rebuilt the image, real GPU, real requests): peak VRAM during a request dropped
+  back from ~10.8GB to **370-398 MiB** (bare CUDA context) within ~1s of the request completing, and
+  stayed there rather than creeping back up on a second call -- and that second call was still
+  *faster* than the first (9.3s vs 14.0s), not slower, meaning cuDNN's algorithm-selection cache
+  (unaffected by `empty_cache()`, which only touches memory) still gives the repeat-call speedup
+  with none of the idle-VRAM cost. One genuinely useful side effect of testing this: the *old*,
+  not-yet-redeployed production container's own 12GB resting footprint (still running the
+  pre-fix image) blocked the new VRAM gate from admitting the test container at the default 13000MB
+  threshold -- a live demonstration, on the real box, of exactly the problem this fix solves.
+  **Deploy status: same as the VRAM-gate/dashboard work above -- built and verified in a throwaway
+  container, NOT yet redeployed to production.**
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and

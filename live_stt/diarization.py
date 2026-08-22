@@ -43,7 +43,11 @@ own ``backend`` setting, since this runs as ordinary Python/torch in this
 process, not in the C++ worker. Fails loudly at load time
 (``torch.cuda.is_available()`` checked explicitly) rather than letting a
 missing GPU surface as a confusing failure deep inside the first forward
-pass.
+pass. ``diarize_file`` releases CUDA memory back to the driver
+(``_release_cuda_memory``) after every request on the ``"cuda"`` device,
+trading some re-warm cost on the next request for not permanently holding
+~10-12GB on a card shared with the ASR workers and LocalAI -- see that
+function's docstring and CLAUDE.md's real measurement.
 """
 
 from __future__ import annotations
@@ -133,6 +137,34 @@ def load_pipeline(settings: Settings) -> Any:
         logger.info("diarization pipeline moved to cuda")
 
     return pipeline
+
+
+def _release_cuda_memory() -> None:
+    """Return this request's CUDA memory to the driver instead of letting
+    PyTorch's caching allocator hold it for reuse -- the allocator's default
+    behavior (keep freed memory in an internal pool rather than calling
+    ``cudaFree``, to avoid the real cost of repeated malloc/free) is the
+    right tradeoff for a GPU this process owns alone, and the wrong one for
+    a GPU shared with the ASR workers and LocalAI (see CLAUDE.md: a real
+    measurement found this process holding ~10-12GB at rest between
+    diarization requests otherwise -- not a leak, just an idle reservation).
+
+    Deliberate cost accepted for this: the NEXT diarization request on this
+    process re-pays the allocator's growth work from a cold pool (measured:
+    a request against an already-warm pool was faster than the first one on
+    a fresh process -- see CLAUDE.md), in exchange for not permanently
+    squatting on a large chunk of a shared card between requests.
+    ``gc.collect()`` first so any tensors only reachable via a reference
+    cycle are actually freed before ``empty_cache()`` runs -- otherwise
+    ``empty_cache()`` only returns memory the allocator already considers
+    unused, and a lingering Python-side reference would keep it "in use".
+    """
+    import gc
+
+    import torch
+
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def _itertracks(annotation: Any) -> Iterable[tuple[_SegmentLike, str]]:
@@ -263,6 +295,9 @@ def diarize_file(
         result = pipeline(str(path), **kwargs)
     except Exception as exc:  # noqa: BLE001 -- one clear error type at this boundary
         raise DiarizationError(f"Diarization failed on {path}: {exc}") from exc
+    finally:
+        if settings.diarization_device == "cuda":
+            _release_cuda_memory()
 
     house_json = annotation_to_house_json(result, model=settings.diarization_model)
     if words:

@@ -18,6 +18,7 @@ from live_stt.diarization import (
     DiarizationError,
     annotation_to_house_json,
     assign_text,
+    diarize_file,
     load_pipeline,
 )
 from live_stt.pb.livestt.v1 import asr_pb2
@@ -255,6 +256,108 @@ class TestLoadPipelineDevice:
         self._stub_torch_cuda(monkeypatch, available=True)
         load_pipeline(_settings(diarization_hf_token="tok", diarization_device="cuda"))
         assert moved["device"] == "device:cuda"
+
+
+class TestDiarizeFileCudaCleanup:
+    """diarize_file releases CUDA memory after every request on the "cuda"
+    device via _release_cuda_memory (torch.cuda.empty_cache(), after a
+    gc.collect()) -- otherwise this process permanently holds ~10-12GB on a
+    card shared with the ASR workers/LocalAI (a real measurement, see
+    CLAUDE.md), long after the request that needed it has finished. CPU must
+    never even import torch for this.
+    """
+
+    def _stub_pyannote_and_torch(self, monkeypatch: pytest.MonkeyPatch, *, cuda_available: bool = True):
+        import sys
+        import types
+
+        annotation = FakeAnnotation([(FakeSegment(0.0, 1.0), "SPEAKER_00")])
+
+        class FakePipelineInstance:
+            def to(self, device):
+                pass
+
+            def __call__(self, path, **kwargs):
+                return annotation
+
+        class FakePipelineClass:
+            @staticmethod
+            def from_pretrained(model, token):
+                return FakePipelineInstance()
+
+        fake_pyannote_audio = types.ModuleType("pyannote.audio")
+        fake_pyannote_audio.Pipeline = FakePipelineClass
+        fake_pyannote = types.ModuleType("pyannote")
+        fake_pyannote.audio = fake_pyannote_audio
+        monkeypatch.setitem(sys.modules, "pyannote", fake_pyannote)
+        monkeypatch.setitem(sys.modules, "pyannote.audio", fake_pyannote_audio)
+
+        calls = {"empty_cache": 0}
+        fake_torch = types.ModuleType("torch")
+        fake_torch.cuda = types.SimpleNamespace(
+            is_available=lambda: cuda_available,
+            empty_cache=lambda: calls.__setitem__("empty_cache", calls["empty_cache"] + 1),
+        )
+        fake_torch.device = lambda name: f"device:{name}"
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        return calls, fake_pyannote_audio
+
+    def test_cuda_releases_memory_after_a_successful_request(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        calls, _ = self._stub_pyannote_and_torch(monkeypatch)
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        result = diarize_file(wav, settings=_settings(diarization_hf_token="tok", diarization_device="cuda"))
+        assert result["num_speakers"] == 1
+        assert calls["empty_cache"] == 1
+
+    def test_cuda_releases_memory_even_when_the_pipeline_call_raises(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        calls, fake_pyannote_audio = self._stub_pyannote_and_torch(monkeypatch)
+
+        class RaisingPipeline:
+            def to(self, device):
+                pass
+
+            def __call__(self, path, **kwargs):
+                raise RuntimeError("boom")
+
+        fake_pyannote_audio.Pipeline.from_pretrained = staticmethod(lambda model, token: RaisingPipeline())
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        with pytest.raises(DiarizationError):
+            diarize_file(wav, settings=_settings(diarization_hf_token="tok", diarization_device="cuda"))
+        assert calls["empty_cache"] == 1
+
+    def test_cpu_device_never_imports_torch_at_all(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        import sys
+        import types
+
+        annotation = FakeAnnotation([(FakeSegment(0.0, 1.0), "SPEAKER_00")])
+
+        class FakePipelineInstance:
+            def __call__(self, path, **kwargs):
+                return annotation
+
+        class FakePipelineClass:
+            @staticmethod
+            def from_pretrained(model, token):
+                return FakePipelineInstance()
+
+        fake_pyannote_audio = types.ModuleType("pyannote.audio")
+        fake_pyannote_audio.Pipeline = FakePipelineClass
+        fake_pyannote = types.ModuleType("pyannote")
+        fake_pyannote.audio = fake_pyannote_audio
+        monkeypatch.setitem(sys.modules, "pyannote", fake_pyannote)
+        monkeypatch.setitem(sys.modules, "pyannote.audio", fake_pyannote_audio)
+        # Force any accidental `import torch` on the cpu path to raise,
+        # rather than silently succeeding against whatever's really
+        # installed in this dev venv -- proves the negative, not just
+        # assumes it.
+        monkeypatch.setitem(sys.modules, "torch", None)
+
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        result = diarize_file(wav, settings=_settings(diarization_hf_token="tok", diarization_device="cpu"))
+        assert result["num_speakers"] == 1
 
 
 class TestSettingsDefaults:
