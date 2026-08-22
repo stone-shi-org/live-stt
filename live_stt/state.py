@@ -8,16 +8,23 @@ the back door.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
+from live_stt.diarize_sessions import DiarizationSessionTracker
 
 
 @dataclass
 class ServerState:
     settings: Settings
     budget: WorkerBudget
+
+    # Diarization has no worker PROCESS the way ASR does (see
+    # DiarizationSessionTracker's own docstring), so it needed its own,
+    # separate counter rather than reusing `budget` -- still just an
+    # aggregate count, not a session registry, same as `budget` itself.
+    diarization_sessions: DiarizationSessionTracker = field(default_factory=DiarizationSessionTracker)
 
     # Set once, immediately, on SIGTERM -- before grpc.aio's own drain grace
     # period even starts. New calls are rejected from this instant.

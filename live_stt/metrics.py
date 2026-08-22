@@ -68,6 +68,14 @@ transcript_chars_total = Counter(
 gpu_free_vram_mb = Gauge(
     "live_stt_gpu_free_vram_mb", "Free VRAM as last observed at admission time (CUDA backend only)"
 )
+diarization_sessions_active = Gauge(
+    "live_stt_diarization_sessions_active", "Diarization requests currently running (pyannote inference in flight)"
+)
+diarization_requests_total = Counter(
+    "live_stt_diarization_requests_total",
+    "Completed diarization HTTP requests",
+    ["outcome"],  # ok|failed|rejected_vram
+)
 
 
 def set_build_info(

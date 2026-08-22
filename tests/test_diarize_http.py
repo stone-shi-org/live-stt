@@ -14,6 +14,7 @@ import pytest
 from live_stt import diarize_http
 from live_stt.config import Settings
 from live_stt.diarization import DiarizationError
+from live_stt.diarize_sessions import DiarizationSessionTracker
 
 BOUNDARY = "----test-boundary"
 
@@ -45,6 +46,12 @@ def _settings(**overrides) -> Settings:
     return Settings(_env_file=None, **overrides)
 
 
+def _call(*, content_type: str, body: bytes, settings: Settings, tracker: DiarizationSessionTracker | None = None):
+    return diarize_http.handle_diarize_request(
+        content_type=content_type, body=body, settings=settings, tracker=tracker or DiarizationSessionTracker()
+    )
+
+
 class TestParseMultipartForm:
     def test_round_trips_text_and_binary_fields(self):
         wav_bytes = bytes(range(256)) * 3  # exercise every byte value
@@ -65,25 +72,25 @@ class TestParseMultipartForm:
 class TestHandleDiarizeRequest:
     def test_missing_file_field_is_400(self):
         body = _multipart_body({"model": "x"})
-        status, doc = diarize_http.handle_diarize_request(content_type=CONTENT_TYPE, body=body, settings=_settings())
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
         assert status == 400
         assert "file" in doc["error"]["message"]
 
     def test_unsupported_response_format_is_400(self):
         body = _multipart_body({"response_format": "text"}, file_field="file", file_bytes=b"wav")
-        status, doc = diarize_http.handle_diarize_request(content_type=CONTENT_TYPE, body=body, settings=_settings())
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
         assert status == 400
         assert "response_format" in doc["error"]["message"]
 
     def test_malformed_words_json_is_400(self):
         body = _multipart_body({"words": "not json"}, file_field="file", file_bytes=b"wav")
-        status, doc = diarize_http.handle_diarize_request(content_type=CONTENT_TYPE, body=body, settings=_settings())
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
         assert status == 400
         assert "words" in doc["error"]["message"]
 
     def test_non_integer_num_speakers_is_400(self):
         body = _multipart_body({"num_speakers": "two"}, file_field="file", file_bytes=b"wav")
-        status, doc = diarize_http.handle_diarize_request(content_type=CONTENT_TYPE, body=body, settings=_settings())
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
         assert status == 400
         assert "num_speakers" in doc["error"]["message"]
 
@@ -93,7 +100,7 @@ class TestHandleDiarizeRequest:
 
         monkeypatch.setattr(diarize_http, "diarize_file", fake_diarize_file)
         body = _multipart_body({}, file_field="file", file_bytes=b"wav")
-        status, doc = diarize_http.handle_diarize_request(content_type=CONTENT_TYPE, body=body, settings=_settings())
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
         assert status == 503
         assert "not installed" in doc["error"]["message"]
 
@@ -108,7 +115,7 @@ class TestHandleDiarizeRequest:
 
         monkeypatch.setattr(diarize_http, "diarize_file", fake_diarize_file)
         body = _multipart_body({"model": "override-model", "num_speakers": "3"}, file_field="file", file_bytes=b"wav")
-        status, doc = diarize_http.handle_diarize_request(content_type=CONTENT_TYPE, body=body, settings=_settings())
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
 
         assert status == 200
         assert doc == expected
@@ -126,7 +133,7 @@ class TestHandleDiarizeRequest:
         monkeypatch.setattr(diarize_http, "diarize_file", fake_diarize_file)
         words_json = json.dumps([{"text": "hi", "start_sec": 0.1, "end_sec": 0.3}])
         body = _multipart_body({"words": words_json}, file_field="file", file_bytes=b"wav")
-        status, _ = diarize_http.handle_diarize_request(content_type=CONTENT_TYPE, body=body, settings=_settings())
+        status, _ = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
 
         assert status == 200
         assert len(captured["words"]) == 1
@@ -139,6 +146,92 @@ class TestHandleDiarizeRequest:
 
         monkeypatch.setattr(diarize_http, "diarize_file", fake_diarize_file)
         body = _multipart_body({}, file_field="file", file_bytes=b"wav")
-        status, doc = diarize_http.handle_diarize_request(content_type=CONTENT_TYPE, body=body, settings=_settings())
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
         assert status == 500
         assert "boom" in doc["error"]["message"]
+
+
+class TestVramAdmission:
+    """diarization_device="cuda" gates admission on live_stt.gpu.free_vram_mb()
+    -- see live_stt/config.py's diarization_vram_mb docstring for the real
+    12.3GB measurement behind the default. CPU (the test default) never
+    checks VRAM at all, same as the "cpu default never touches torch.cuda"
+    invariant tests/test_diarization.py already pins for load_pipeline.
+    """
+
+    def test_cpu_device_never_calls_free_vram_mb(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(diarize_http.gpu, "free_vram_mb", lambda: (_ for _ in ()).throw(AssertionError("called")))
+        monkeypatch.setattr(diarize_http, "diarize_file", lambda *a, **k: {"task": "diarize", "num_speakers": 0, "segments": [{"id": 0, "speaker": "x", "label": "x", "start": 0, "end": 1, "text": ""}], "speakers": []})
+        body = _multipart_body({}, file_field="file", file_bytes=b"wav")
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings(diarization_device="cpu"))
+        assert status == 200
+
+    def test_cuda_with_insufficient_vram_is_503_before_touching_the_pipeline(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(diarize_http.gpu, "free_vram_mb", lambda: 5000)
+
+        def fake_diarize_file(*a, **k):
+            raise AssertionError("pipeline must not run when VRAM is insufficient")
+
+        monkeypatch.setattr(diarize_http, "diarize_file", fake_diarize_file)
+        tracker = DiarizationSessionTracker()
+        body = _multipart_body({}, file_field="file", file_bytes=b"wav")
+        status, doc = _call(
+            content_type=CONTENT_TYPE,
+            body=body,
+            settings=_settings(diarization_device="cuda", diarization_vram_mb=13000),
+            tracker=tracker,
+        )
+        assert status == 503
+        assert "5000" in doc["error"]["message"] and "13000" in doc["error"]["message"]
+        assert tracker.rejected_vram_total == 1
+        assert tracker.active == 0  # never started -- rejected before start()
+
+    def test_cuda_with_sufficient_vram_runs_normally(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(diarize_http.gpu, "free_vram_mb", lambda: 20000)
+        expected = {"task": "diarize", "num_speakers": 1, "segments": [], "speakers": []}
+        monkeypatch.setattr(diarize_http, "diarize_file", lambda *a, **k: expected)
+        tracker = DiarizationSessionTracker()
+        body = _multipart_body({}, file_field="file", file_bytes=b"wav")
+        status, doc = _call(
+            content_type=CONTENT_TYPE,
+            body=body,
+            settings=_settings(diarization_device="cuda"),
+            tracker=tracker,
+        )
+        assert status == 200
+        assert doc == expected
+        assert tracker.completed_total == 1
+        assert tracker.active == 0
+
+    def test_free_vram_unavailable_fails_open_not_closed(self, monkeypatch: pytest.MonkeyPatch):
+        # nvidia-smi missing/unreachable returns None -- "cannot check", not
+        # "zero VRAM free" (see live_stt/gpu.py). Must not block admission.
+        monkeypatch.setattr(diarize_http.gpu, "free_vram_mb", lambda: None)
+        expected = {"task": "diarize", "num_speakers": 1, "segments": [], "speakers": []}
+        monkeypatch.setattr(diarize_http, "diarize_file", lambda *a, **k: expected)
+        body = _multipart_body({}, file_field="file", file_bytes=b"wav")
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings(diarization_device="cuda"))
+        assert status == 200
+
+
+class TestSessionTracking:
+    def test_active_returns_to_zero_after_success(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(diarize_http, "diarize_file", lambda *a, **k: {"task": "diarize", "num_speakers": 0, "segments": [{"id": 0, "speaker": "x", "label": "x", "start": 0, "end": 1, "text": ""}], "speakers": []})
+        tracker = DiarizationSessionTracker()
+        body = _multipart_body({}, file_field="file", file_bytes=b"wav")
+        _call(content_type=CONTENT_TYPE, body=body, settings=_settings(), tracker=tracker)
+        assert tracker.active == 0
+        assert tracker.completed_total == 1
+        assert tracker.failed_total == 0
+
+    def test_active_returns_to_zero_after_failure(self, monkeypatch: pytest.MonkeyPatch):
+        def fake_diarize_file(*a, **k):
+            raise DiarizationError("no segments")
+
+        monkeypatch.setattr(diarize_http, "diarize_file", fake_diarize_file)
+        tracker = DiarizationSessionTracker()
+        body = _multipart_body({}, file_field="file", file_bytes=b"wav")
+        _call(content_type=CONTENT_TYPE, body=body, settings=_settings(), tracker=tracker)
+        assert tracker.active == 0
+        assert tracker.failed_total == 1
+        assert tracker.completed_total == 0

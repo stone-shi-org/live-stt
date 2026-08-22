@@ -28,6 +28,9 @@ EXPECTED_METRICS = {
     "live_stt_admission_rejections_total",
     "live_stt_words_total",
     "live_stt_transcript_chars_total",
+    "live_stt_gpu_free_vram_mb",
+    "live_stt_diarization_sessions_active",
+    "live_stt_diarization_requests_total",
 }
 
 
@@ -143,6 +146,12 @@ async def test_stats_web_page_endpoint() -> None:
                 html_body = resp.read().decode()
                 assert "Live-STT Streaming ASR" in html_body
                 assert "Admin & Real-time Stats Dashboard" in html_body
+                # GPU/VRAM and diarization-session cards (see admin_http.py).
+                assert 'id="valGpuVramFree"' in html_body
+                assert 'id="valGpuUtil"' in html_body
+                assert 'id="valDiarizeActive"' in html_body
+                assert 'id="valDiarizeTotals"' in html_body
+                assert 'id="vramProgressBar"' in html_body
     finally:
         server.shutdown()
 
@@ -162,6 +171,42 @@ async def test_config_http_endpoint() -> None:
             assert "grpc_port" in doc
             assert "backend" in doc
             assert "max_concurrent_calls" in doc
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stats_json_endpoint_includes_gpu_and_diarization() -> None:
+    import json
+
+    settings = Settings(_env_file=None)
+    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=5) as resp:
+            assert resp.status == 200
+            doc = json.loads(resp.read().decode())
+
+        # Pre-existing fields still present.
+        assert "active_calls" in doc
+        assert "max_concurrent_calls" in doc
+
+        # This dev host has no nvidia-smi -- all four gpu fields None
+        # together (never a mix of some real, some None; see gpu.py).
+        assert doc["gpu"] == {
+            "free_vram_mb": None,
+            "total_vram_mb": None,
+            "used_vram_mb": None,
+            "utilization_pct": None,
+        }
+        # Fresh ServerState -- diarization_sessions starts at all zeros.
+        assert doc["diarization"] == {
+            "active": 0,
+            "completed_total": 0,
+            "failed_total": 0,
+            "rejected_vram_total": 0,
+        }
     finally:
         server.shutdown()
 

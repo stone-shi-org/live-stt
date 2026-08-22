@@ -540,6 +540,51 @@ in `configure()` and there is no loop anywhere near it.
   entry's own "Batch ASR over HTTP" counterpart still listed as unverified (that endpoint against a
   real worker/model). Container has been stable and healthy for several minutes post-deploy with no
   restarts.
+- **Diarization VRAM admission + GPU/diarization visibility in the admin dashboard
+  (`live_stt/gpu.py`, `live_stt/diarize_sessions.py`, `live_stt/diarize_http.py`,
+  `live_stt/admin_http.py`) — unit-tested for real, not yet redeployed to 10.100.0.50.**
+  Prompted by a real measurement: `nvidia-smi --query-compute-apps` against the actual redeployed
+  production container (see the "Deploy status" paragraph above) found **12,312 MiB used, isolated
+  to the live-stt process's own PID**, after a single diarization request over the ~6-minute
+  NOTSOFAR-1 meeting — baseline was 41 MiB. A second back-to-back request on the same file used
+  essentially the same VRAM (12,320 MiB) and was *faster* (8.8s vs 13.7s), not slower or larger:
+  the signature of PyTorch's CUDA caching allocator sizing itself once to the batched
+  sliding-window peak for that file and reusing the pool, not a leak. The pyannote model itself is
+  tens of MB (confirmed earlier: the pre-warmed HF cache is ~32MB) — the 12GB is allocator/activation
+  overhead, not model weights. Caveat carried into the new setting's own docstring: measured on ONE
+  358s file: VRAM plausibly scales with audio duration (bigger batched windows for longer
+  recordings), untested across a range of durations.
+
+  `live_stt.gpu` gained `total_vram_mb()`/`used_vram_mb()`/`utilization_pct()`/`snapshot()` alongside
+  the existing `free_vram_mb()` (all `_query_gpu()`-backed, same None-on-unavailable contract, and
+  `snapshot()` is guaranteed all-None together, never a partial mix, since a nvidia-smi failure mode
+  isn't field-specific). `Settings.diarization_vram_mb` (default 13000, ~700MB margin above the one
+  real measurement) is checked against `gpu.free_vram_mb()` in `diarize_http.handle_diarize_request`
+  before running the pipeline, the same admission pattern `servicer.py` already uses for ASR — and
+  for the same reason: a CUDA allocation failure inside pyannote/torch is not guaranteed to be a
+  catchable Python exception any more than parakeet.cpp's is. Fails OPEN (admits) when
+  `free_vram_mb()` returns `None` (nvidia-smi unavailable = "cannot check", never "zero free" — same
+  contract the ASR path already relies on), and does nothing at all on the `"cpu"` default device
+  (no VRAM to check). A new `DiarizationSessionTracker` (`live_stt/diarize_sessions.py`) — a
+  thread-safe aggregate counter, explicitly NOT a session registry (same category as
+  `WorkerBudget`'s own `active_calls`/`active_workers`, consistent with `live_stt/state.py`'s
+  "Deliberately NOT a session registry" invariant) — now lives on `ServerState` and tracks
+  active/completed/failed/VRAM-rejected diarization requests, exposed at `/api/stats` under a new
+  `"diarization"` key and via two new Prometheus metrics
+  (`live_stt_diarization_sessions_active`, `live_stt_diarization_requests_total{outcome}`).
+  `/api/stats` also gained a `"gpu"` key (`gpu.snapshot()`) and the admin HTML dashboard got four new
+  cards (GPU VRAM free/total, GPU utilization, active diarization sessions, diarization
+  completed/failed/rejected-VRAM totals) plus a VRAM usage progress bar, all null-safe when no GPU
+  is present (renders "N/A", hides the VRAM bar row entirely rather than showing "NaN%"/"undefined").
+  **What's proven:** 17 new tests (`tests/test_gpu.py`, `tests/test_diarize_sessions.py`, new cases
+  in `tests/test_diarize_http.py`, and a new `/api/stats` JSON-shape test plus a dashboard-markup
+  test in `tests/test_metrics.py`) — including the VRAM-insufficient-rejects-before-touching-the-
+  pipeline path, the fail-open-on-None path, and thread-safety of the tracker under concurrent
+  start/finish. **What's NOT proven:** none of this has been rebuilt into a new
+  `runtime-cuda-diarize` image or redeployed to 10.100.0.50 yet — the real 12GB number above came
+  from the PRE-existing deployed image (which has no VRAM gate at all yet), not from testing the new
+  gate itself against the real GPU. The dashboard's actual rendering (vs. just the HTML/JSON shape
+  tests above) has not been eyeballed in a real browser against a real backend either.
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and

@@ -130,6 +130,23 @@ class Settings(BaseSettings):
     # since that's what's actually been exercised; opt into "cuda" only on a
     # box that actually has a CUDA-capable GPU and driver.
     diarization_device: str = "cpu"
+    # VRAM required to admit a diarization request when diarization_device
+    # is "cuda" -- checked against live_stt.gpu.free_vram_mb() the same way
+    # servicer.py already gates ASR admission, since a CUDA allocation
+    # failure is an abort(), not a catchable exception (see CLAUDE.md).
+    # Measured for real on 10.100.0.50's RTX 3090 (nvidia-smi
+    # --query-compute-apps, isolated to the live-stt process's own PID):
+    # ~12.3GB held after a single diarization call over a ~6-minute
+    # NOTSOFAR-1 recording, and a second back-to-back call used essentially
+    # the same (12262 -> 12270 MiB) rather than growing further -- PyTorch's
+    # CUDA caching allocator sizing itself once to the batched
+    # sliding-window peak for that file length and reusing it, not a leak.
+    # 13000 leaves a ~700MB margin above the one real measurement available;
+    # NOT yet tested across a range of audio durations, and VRAM plausibly
+    # scales with file length (bigger batched windows for longer audio) --
+    # re-measure with a much longer recording before trusting this on calls
+    # significantly longer than ~6 minutes.
+    diarization_vram_mb: int = 13000
 
     @model_validator(mode="after")
     def _check_grace_period(self) -> "Settings":

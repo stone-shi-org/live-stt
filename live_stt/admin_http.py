@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from prometheus_client import generate_latest
 
-from live_stt import __about__, diarize_http, transcribe_http
+from live_stt import __about__, diarize_http, gpu, transcribe_http
 from live_stt.state import ServerState
 
 
@@ -360,6 +360,30 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- GPU & Diarization Cards -->
+        <div class="grid-cards">
+            <div class="card">
+                <div class="card-label">GPU VRAM Free</div>
+                <div class="card-value" id="valGpuVramFree">-</div>
+                <div class="card-subtext" id="subGpuVramTotal">of - total</div>
+            </div>
+            <div class="card">
+                <div class="card-label">GPU Utilization</div>
+                <div class="card-value" id="valGpuUtil">-</div>
+                <div class="card-subtext">Compute, whole card</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Diarization Sessions</div>
+                <div class="card-value" id="valDiarizeActive">0</div>
+                <div class="card-subtext">Currently running</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Diarization Totals</div>
+                <div class="card-value" id="valDiarizeTotals" style="font-size:1.1rem;">0 / 0 / 0</div>
+                <div class="card-subtext">ok / failed / VRAM-rejected</div>
+            </div>
+        </div>
+
         <!-- Connection & Capacity Progress -->
         <div class="section-card">
             <div class="section-title">📊 Capacity & Resource Usage</div>
@@ -380,6 +404,15 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     </div>
                     <div class="progress-bar-bg">
                         <div class="progress-bar-fill" id="workerProgressBar"></div>
+                    </div>
+                </div>
+                <div class="progress-item" id="vramProgressRow" style="display:none;">
+                    <div class="progress-label-row">
+                        <span>GPU VRAM Usage (whole card, all tenants)</span>
+                        <span id="vramUsageText">- / - (0%)</span>
+                    </div>
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="vramProgressBar"></div>
                     </div>
                 </div>
             </div>
@@ -501,6 +534,40 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 const workerPct = Math.min(100, Math.round((activeWorkers / maxWorkers) * 100));
                 document.getElementById('workerUsageText').innerText = `${activeWorkers} / ${maxWorkers} (${workerPct}%)`;
                 document.getElementById('workerProgressBar').style.width = workerPct + '%';
+
+                // GPU / VRAM -- gpu.snapshot() is all-None together when
+                // nvidia-smi is unavailable (CPU backend / no GPU), never a
+                // mix of some real some None (see live_stt/gpu.py), so one
+                // null check covers the whole block.
+                const gpuInfo = stats.gpu || {};
+                const vramRow = document.getElementById('vramProgressRow');
+                if (gpuInfo.free_vram_mb != null && gpuInfo.total_vram_mb != null) {
+                    const freeGb = (gpuInfo.free_vram_mb / 1024).toFixed(1);
+                    const totalGb = (gpuInfo.total_vram_mb / 1024).toFixed(1);
+                    document.getElementById('valGpuVramFree').innerText = freeGb + ' GB';
+                    document.getElementById('subGpuVramTotal').innerText = 'of ' + totalGb + ' GB total';
+
+                    const usedMb = gpuInfo.used_vram_mb ?? (gpuInfo.total_vram_mb - gpuInfo.free_vram_mb);
+                    const vramPct = Math.min(100, Math.round((usedMb / gpuInfo.total_vram_mb) * 100));
+                    document.getElementById('vramUsageText').innerText =
+                        `${(usedMb / 1024).toFixed(1)} GB / ${totalGb} GB (${vramPct}%)`;
+                    document.getElementById('vramProgressBar').style.width = vramPct + '%';
+                    vramRow.style.display = '';
+                } else {
+                    document.getElementById('valGpuVramFree').innerText = 'N/A';
+                    document.getElementById('subGpuVramTotal').innerText = 'no GPU / nvidia-smi';
+                    vramRow.style.display = 'none';
+                }
+                document.getElementById('valGpuUtil').innerText =
+                    gpuInfo.utilization_pct != null ? gpuInfo.utilization_pct + '%' : 'N/A';
+
+                // Diarization sessions -- see live_stt/diarize_sessions.py.
+                // Aggregate counters, not a per-call registry (same category
+                // as active_calls/active_workers above).
+                const diar = stats.diarization || {};
+                document.getElementById('valDiarizeActive').innerText = diar.active ?? 0;
+                document.getElementById('valDiarizeTotals').innerText =
+                    `${diar.completed_total ?? 0} / ${diar.failed_total ?? 0} / ${diar.rejected_vram_total ?? 0}`;
             }
 
             // Config
@@ -582,6 +649,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
             elif self.path == "/api/version":
                 self._write_json(200, __about__.info())
             elif self.path == "/api/stats":
+                diar = state.diarization_sessions
                 self._write_json(
                     200,
                     {
@@ -590,6 +658,16 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         "max_concurrent_calls": state.budget.max_concurrent_calls,
                         "max_workers": state.budget.max_workers,
                         "draining": state.draining,
+                        # None fields throughout when nvidia-smi is
+                        # unavailable (CPU backend / no GPU) -- see
+                        # live_stt/gpu.py's snapshot() docstring.
+                        "gpu": gpu.snapshot(),
+                        "diarization": {
+                            "active": diar.active,
+                            "completed_total": diar.completed_total,
+                            "failed_total": diar.failed_total,
+                            "rejected_vram_total": diar.rejected_vram_total,
+                        },
                     },
                 )
             elif self.path == "/api/config":
@@ -605,7 +683,10 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                 body = self.rfile.read(length) if length else b""
                 content_type = self.headers.get("Content-Type", "")
                 status, doc = diarize_http.handle_diarize_request(
-                    content_type=content_type, body=body, settings=state.settings
+                    content_type=content_type,
+                    body=body,
+                    settings=state.settings,
+                    tracker=state.diarization_sessions,
                 )
                 self._write_json(status, doc)
             elif self.path == transcribe_http.TRANSCRIBE_PATH:
