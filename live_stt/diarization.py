@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Any, Iterable, Protocol
 
 from live_stt.config import Settings
+from live_stt.diarization_models import resolve as resolve_diarization_model
 from live_stt.logging_config import get_logger
 from live_stt.pb.livestt.v1 import asr_pb2
 
@@ -79,7 +80,19 @@ def load_pipeline(settings: Settings) -> Any:
     pulls in torch/torchaudio (see requirements-diarization.txt), which is
     deliberately NOT a dependency of the always-on grpc.aio server process,
     only of this opt-in, offline tool.
+
+    ``settings.diarization_model`` is a registry key
+    (``live_stt/diarization_models.py``), resolved and validated FIRST --
+    before even attempting the pyannote.audio import -- so an unknown model
+    name fails fast and cheap regardless of whether the heavy dependency is
+    installed, the same "validate before touching the engine" order ASR's
+    ``models.resolve()`` already uses.
     """
+    try:
+        spec = resolve_diarization_model(settings.diarization_model)
+    except KeyError as exc:
+        raise DiarizationError(str(exc)) from exc
+
     try:
         from pyannote.audio import Pipeline
     except ImportError as exc:
@@ -90,29 +103,25 @@ def load_pipeline(settings: Settings) -> Any:
             "use post-call diarization."
         ) from exc
 
-    if not settings.diarization_hf_token:
+    if spec.gated and not settings.diarization_hf_token:
         raise DiarizationError(
             "LSTT_DIARIZATION_HF_TOKEN is not set. "
-            f"{settings.diarization_model!r} is a gated HuggingFace model "
+            f"{spec.hf_repo_id!r} is a gated HuggingFace model "
             "(CC-BY-4.0, requires accepting pyannote's terms) and will not "
             "load without a token."
         )
 
     try:
-        pipeline = Pipeline.from_pretrained(
-            settings.diarization_model, token=settings.diarization_hf_token
-        )
+        pipeline = Pipeline.from_pretrained(spec.hf_repo_id, token=settings.diarization_hf_token)
     except Exception as exc:  # noqa: BLE001 -- surfaced as one clear error type
-        raise DiarizationError(
-            f"Failed to load {settings.diarization_model!r}: {exc}"
-        ) from exc
+        raise DiarizationError(f"Failed to load {spec.hf_repo_id!r}: {exc}") from exc
 
     if pipeline is None:
         # pyannote.audio returns None (not an exception) when the caller has
         # not accepted the model's gated-access terms on HuggingFace, which
         # otherwise fails silently downstream on the first real call.
         raise DiarizationError(
-            f"Pipeline.from_pretrained({settings.diarization_model!r}) "
+            f"Pipeline.from_pretrained({spec.hf_repo_id!r}) "
             "returned None -- most likely the HF token's account has not "
             "accepted this model's user conditions on huggingface.co."
         )
@@ -287,8 +296,13 @@ def diarize_file(
         raise DiarizationError(f"No such audio file: {path}")
 
     pipeline = load_pipeline(settings)
+    # Already validated by load_pipeline (which raises DiarizationError on
+    # an unknown key before we'd ever get here) -- re-resolving is a cheap,
+    # pure dict lookup, not worth threading the spec through load_pipeline's
+    # return value just to avoid it.
+    spec = resolve_diarization_model(settings.diarization_model)
     kwargs: dict[str, Any] = {}
-    if settings.diarization_num_speakers is not None:
+    if spec.supports_num_speakers_hint and settings.diarization_num_speakers is not None:
         kwargs["num_speakers"] = settings.diarization_num_speakers
 
     try:
@@ -299,7 +313,7 @@ def diarize_file(
         if settings.diarization_device == "cuda":
             _release_cuda_memory()
 
-    house_json = annotation_to_house_json(result, model=settings.diarization_model)
+    house_json = annotation_to_house_json(result, model=spec.hf_repo_id)
     if words:
         house_json = assign_text(house_json, words)
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from live_stt.diarization_models import DEFAULT_DIARIZATION_MODEL_KEY
 from live_stt.models import DEFAULT_MODEL_KEY
 
 
@@ -110,7 +111,13 @@ class Settings(BaseSettings):
     # {num_speakers, segments, speakers} JSON shape as
     # my-meeting-notes/app/services/diarize.py's LocalAI-compatible client
     # (house convention), not pyannote's native Annotation/RTTM shape.
-    diarization_model: str = "pyannote/speaker-diarization-community-1"
+    #
+    # A REGISTRY KEY (live_stt/diarization_models.py), not a raw HF repo
+    # string passed straight through unvalidated -- mirrors default_model
+    # above / live_stt.models.resolve() for ASR. Resolved (and rejected, if
+    # unknown) by live_stt.diarization.load_pipeline before pyannote.audio
+    # is ever touched.
+    diarization_model: str = DEFAULT_DIARIZATION_MODEL_KEY
     # Gated model on HuggingFace (CC-BY-4.0, requires accepting pyannote's
     # terms and passing a token) -- kept as its own field, never folded into
     # diarization_model, so a log line that prints the model id never leaks it.

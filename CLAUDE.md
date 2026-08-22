@@ -620,6 +620,33 @@ in `configure()` and there is no loop anywhere near it.
   threshold -- a live demonstration, on the real box, of exactly the problem this fix solves.
   **Deploy status: same as the VRAM-gate/dashboard work above -- built and verified in a throwaway
   container, NOT yet redeployed to production.**
+- **Diarization model registry (`live_stt/diarization_models.py`) — closes a real validation gap,
+  unit-tested, not yet redeployed.** Before this, `Settings.diarization_model` was a bare string
+  passed straight to `pyannote.audio.Pipeline.from_pretrained` with zero validation — unlike ASR's
+  `live_stt/models.py::resolve()`, which rejects an unknown key with a clear error before ever
+  touching the engine. Mirrors that pattern exactly: `DIARIZATION_MODELS: dict[str,
+  DiarizationModelSpec]`, `DEFAULT_DIARIZATION_MODEL_KEY`, `resolve()` raising `KeyError` on an
+  unknown key. `load_pipeline` now resolves and validates FIRST, before even attempting the
+  pyannote.audio import — same "cheap check before the heavy one" ordering ASR already uses — so a
+  typo'd model name fails fast regardless of whether the dependency is installed. `diarize_http.py`
+  needed **zero changes** for this to produce the right HTTP status: an "unknown diarization model"
+  `DiarizationError` doesn't match that handler's existing `"not installed"`/`"HF_TOKEN"`/`"Failed
+  to load"` substrings, so it already fell through to the existing `else 400` branch correctly.
+  `DiarizationModelSpec` carries real metadata beyond just the HF repo id: `gated` (only requires
+  `LSTT_DIARIZATION_HF_TOKEN` if the specific model actually needs one — the one registered model,
+  `pyannote/speaker-diarization-community-1`, does), `supports_num_speakers_hint` (only passes
+  `num_speakers=` to the pipeline if the model actually accepts it), and `measured_peak_vram_mb`
+  (11424 — the highest of the real 6/10/20-minute measurements above; the 40-minute result was
+  reproducibly *lower*, not a worse case, so it's deliberately excluded from "peak"). That VRAM
+  figure is informative metadata only, not yet wired into a per-model admission threshold —
+  `Settings.diarization_vram_mb` stays one global, operator-tunable value regardless of which model
+  is selected, since a per-model lookup isn't worth the complexity with only one registry entry.
+  **What's proven:** 11 new tests (`tests/test_diarization_models.py` plus new cases in
+  `tests/test_diarization.py`) covering unknown-key rejection (including that it happens before
+  pyannote.audio is ever imported), a non-gated fake model skipping the token check, and a
+  no-hint fake model never receiving `num_speakers=` even when `diarization_num_speakers` is
+  configured. **What's NOT proven:** not yet redeployed to 10.100.0.50 — same status as the
+  VRAM-gate/dashboard/release-fix work above, all still sitting in throwaway test containers.
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and

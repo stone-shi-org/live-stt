@@ -183,6 +183,46 @@ class TestLoadPipelineErrors:
         with pytest.raises(DiarizationError, match="LSTT_DIARIZATION_HF_TOKEN"):
             load_pipeline(_settings(diarization_hf_token=None))
 
+    def test_unknown_model_key_is_rejected_before_importing_pyannote(self, monkeypatch: pytest.MonkeyPatch):
+        # No pyannote.audio stub at all here, deliberately -- an unknown
+        # registry key must fail on that alone, before load_pipeline ever
+        # tries the (heavy, possibly-missing) import. If this test needed a
+        # stub to pass, that would mean the ordering regressed.
+        with pytest.raises(DiarizationError, match="unknown diarization model"):
+            load_pipeline(_settings(diarization_hf_token="tok", diarization_model="not-a-real-model"))
+
+    def test_non_gated_model_does_not_require_a_token(self, monkeypatch: pytest.MonkeyPatch):
+        import sys
+        import types
+
+        from live_stt.diarization_models import DiarizationModelSpec
+
+        fake_pyannote_audio = types.ModuleType("pyannote.audio")
+
+        class FakePipelineClass:
+            @staticmethod
+            def from_pretrained(model, token):
+                return object()
+
+        fake_pyannote_audio.Pipeline = FakePipelineClass
+        fake_pyannote = types.ModuleType("pyannote")
+        fake_pyannote.audio = fake_pyannote_audio
+        monkeypatch.setitem(sys.modules, "pyannote", fake_pyannote)
+        monkeypatch.setitem(sys.modules, "pyannote.audio", fake_pyannote_audio)
+
+        import live_stt.diarization as diarization_module
+
+        monkeypatch.setattr(
+            diarization_module,
+            "resolve_diarization_model",
+            lambda key: DiarizationModelSpec(
+                key="open-model", hf_repo_id="someone/open-model", gated=False, supports_num_speakers_hint=True
+            ),
+        )
+        # No token set at all -- must not raise, since this fake model isn't gated.
+        pipeline = load_pipeline(_settings(diarization_hf_token=None, diarization_model="open-model"))
+        assert pipeline is not None
+
 
 class TestLoadPipelineDevice:
     """load_pipeline's device handling, stubbed against fake pyannote.audio
@@ -256,6 +296,70 @@ class TestLoadPipelineDevice:
         self._stub_torch_cuda(monkeypatch, available=True)
         load_pipeline(_settings(diarization_hf_token="tok", diarization_device="cuda"))
         assert moved["device"] == "device:cuda"
+
+
+class TestDiarizeFileModelSpecAwareness:
+    """diarize_file consults the resolved DiarizationModelSpec, not just
+    Settings, for whether to pass num_speakers= at all -- a model whose spec
+    says it doesn't accept the hint must never receive it, even if the
+    operator has diarization_num_speakers configured (that setting is
+    telephony-shaped default tuning, not a promise every model supports it).
+    """
+
+    def _stub_pyannote(self, monkeypatch: pytest.MonkeyPatch, capture: dict):
+        import sys
+        import types
+
+        annotation = FakeAnnotation([(FakeSegment(0.0, 1.0), "SPEAKER_00")])
+
+        class FakePipelineInstance:
+            def __call__(self, path, **kwargs):
+                capture["kwargs"] = kwargs
+                return annotation
+
+        class FakePipelineClass:
+            @staticmethod
+            def from_pretrained(model, token):
+                return FakePipelineInstance()
+
+        fake_pyannote_audio = types.ModuleType("pyannote.audio")
+        fake_pyannote_audio.Pipeline = FakePipelineClass
+        fake_pyannote = types.ModuleType("pyannote")
+        fake_pyannote.audio = fake_pyannote_audio
+        monkeypatch.setitem(sys.modules, "pyannote", fake_pyannote)
+        monkeypatch.setitem(sys.modules, "pyannote.audio", fake_pyannote_audio)
+
+    def test_num_speakers_passed_when_the_spec_supports_it(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        capture: dict = {}
+        self._stub_pyannote(monkeypatch, capture)
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        diarize_file(
+            wav,
+            settings=_settings(diarization_hf_token="tok", diarization_num_speakers=3),
+        )
+        assert capture["kwargs"] == {"num_speakers": 3}
+
+    def test_num_speakers_withheld_when_the_spec_does_not_support_it(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        import live_stt.diarization as diarization_module
+        from live_stt.diarization_models import DiarizationModelSpec
+
+        capture: dict = {}
+        self._stub_pyannote(monkeypatch, capture)
+        monkeypatch.setattr(
+            diarization_module,
+            "resolve_diarization_model",
+            lambda key: DiarizationModelSpec(
+                key="no-hint-model", hf_repo_id="someone/no-hint-model", gated=False, supports_num_speakers_hint=False
+            ),
+        )
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        diarize_file(
+            wav,
+            settings=_settings(diarization_hf_token="tok", diarization_model="no-hint-model", diarization_num_speakers=3),
+        )
+        assert capture["kwargs"] == {}
 
 
 class TestDiarizeFileCudaCleanup:

@@ -66,7 +66,11 @@ def main() -> None:
             "for as long as either persists."
         ),
     )
-    parser.add_argument("--model", default=None, help="overrides LSTT_DIARIZATION_MODEL")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="overrides LSTT_DIARIZATION_MODEL -- must be a key in live_stt.diarization_models.DIARIZATION_MODELS",
+    )
     parser.add_argument("--num-speakers", type=int, default=None, help="overrides LSTT_DIARIZATION_NUM_SPEAKERS")
     parser.add_argument(
         "--device",
