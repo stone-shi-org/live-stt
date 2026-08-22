@@ -7,7 +7,7 @@ import pytest
 from prometheus_client import REGISTRY
 from prometheus_client.parser import text_string_to_metric_families
 
-from live_stt import metrics
+from live_stt import diarization_models, metrics, models
 from live_stt.admin_http import serve_admin_http
 from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
@@ -152,6 +152,9 @@ async def test_stats_web_page_endpoint() -> None:
                 assert 'id="valDiarizeActive"' in html_body
                 assert 'id="valDiarizeTotals"' in html_body
                 assert 'id="vramProgressBar"' in html_body
+                # Diarization model row (in addition to the pre-existing
+                # default_model/ASR row) -- CLAUDE.md's requested addition.
+                assert 'id="cfgDiarizationModel"' in html_body
     finally:
         server.shutdown()
 
@@ -207,6 +210,50 @@ async def test_stats_json_endpoint_includes_gpu_and_diarization() -> None:
             "failed_total": 0,
             "rejected_vram_total": 0,
         }
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_v1_models_endpoint_lists_asr_and_diarization_models() -> None:
+    import json
+
+    settings = Settings(_env_file=None)
+    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=5) as resp:
+            assert resp.status == 200
+            assert "application/json" in resp.headers.get("Content-Type", "")
+            doc = json.loads(resp.read().decode())
+
+        assert doc["object"] == "list"
+        by_id = {entry["id"]: entry for entry in doc["data"]}
+
+        # Every ASR model in the registry is present, typed correctly, and
+        # exactly one is marked default (the configured default_model).
+        for key, spec in models.MODELS.items():
+            assert key in by_id
+            entry = by_id[key]
+            assert entry["object"] == "model"
+            assert entry["type"] == "asr"
+            assert entry["model_chunk_ms"] == spec.model_chunk_ms
+            assert entry["has_eou"] == spec.has_eou
+            assert entry["default"] == (key == settings.default_model)
+        assert sum(e["default"] for e in by_id.values() if e["type"] == "asr") == 1
+
+        # Every diarization model in the registry is present too, typed
+        # correctly, with exactly one marked default.
+        for key, spec in diarization_models.DIARIZATION_MODELS.items():
+            assert key in by_id
+            entry = by_id[key]
+            assert entry["object"] == "model"
+            assert entry["type"] == "diarization"
+            assert entry["gated"] == spec.gated
+            assert entry["supports_num_speakers_hint"] == spec.supports_num_speakers_hint
+            assert entry["default"] == (key == settings.diarization_model)
+        assert sum(e["default"] for e in by_id.values() if e["type"] == "diarization") == 1
     finally:
         server.shutdown()
 

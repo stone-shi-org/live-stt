@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from prometheus_client import generate_latest
 
-from live_stt import __about__, diarize_http, gpu, transcribe_http
+from live_stt import __about__, diarization_models, diarize_http, gpu, models, transcribe_http
 from live_stt.state import ServerState
 
 
@@ -429,6 +429,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                         <tr><td class="kv-key">admin_host:port</td><td class="kv-val" id="cfgAdmin">-</td></tr>
                         <tr><td class="kv-key">backend</td><td class="kv-val" id="cfgBackend">-</td></tr>
                         <tr><td class="kv-key">default_model</td><td class="kv-val" id="cfgModel">-</td></tr>
+                        <tr><td class="kv-key">diarization_model</td><td class="kv-val" id="cfgDiarizationModel">-</td></tr>
                         <tr><td class="kv-key">models_dir</td><td class="kv-val" id="cfgModelsDir">-</td></tr>
                     </table>
                 </div>
@@ -473,6 +474,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 <a href="/api/stats" target="_blank" class="btn-link">📈 /api/stats</a>
                 <a href="/api/config" target="_blank" class="btn-link">🛠️ /api/config</a>
                 <a href="/api/version" target="_blank" class="btn-link">ℹ️ /api/version</a>
+                <a href="/v1/models" target="_blank" class="btn-link">🧩 /v1/models</a>
                 <a href="/metrics" target="_blank" class="btn-link">📊 /metrics (Prometheus)</a>
             </div>
         </div>
@@ -576,6 +578,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 document.getElementById('cfgAdmin').innerText = `${config.admin_host}:${config.admin_port}`;
                 document.getElementById('cfgBackend').innerText = config.backend || 'cpu';
                 document.getElementById('cfgModel').innerText = config.default_model || '-';
+                document.getElementById('cfgDiarizationModel').innerText = config.diarization_model || '-';
                 document.getElementById('cfgModelsDir').innerText = config.models_dir || '-';
 
                 document.getElementById('cfgThreads').innerText = config.n_threads_per_worker ?? '-';
@@ -672,6 +675,42 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                 )
             elif self.path == "/api/config":
                 self._write_json(200, state.settings.model_dump())
+            elif self.path == "/v1/models":
+                # OpenAI-style listing ({"object": "list", "data": [...]})
+                # covering BOTH model registries this service has --
+                # live_stt/models.py (ASR, fed to parakeet.cpp) and
+                # live_stt/diarization_models.py (pyannote, fed to
+                # /v1/audio/diarization) -- distinguished by "type" since
+                # OpenAI's own shape has no room for two engine kinds under
+                # one list. "default" marks whichever key this instance is
+                # currently configured with (state.settings.default_model /
+                # .diarization_model), not just "the first entry."
+                asr_data = [
+                    {
+                        "id": spec.key,
+                        "object": "model",
+                        "type": "asr",
+                        "default": spec.key == state.settings.default_model,
+                        "model_chunk_ms": spec.model_chunk_ms,
+                        "has_eou": spec.has_eou,
+                        "has_punctuation": spec.has_punctuation,
+                        "multilingual": spec.multilingual,
+                    }
+                    for spec in models.MODELS.values()
+                ]
+                diarization_data = [
+                    {
+                        "id": spec.key,
+                        "object": "model",
+                        "type": "diarization",
+                        "default": spec.key == state.settings.diarization_model,
+                        "gated": spec.gated,
+                        "supports_num_speakers_hint": spec.supports_num_speakers_hint,
+                        "measured_peak_vram_mb": spec.measured_peak_vram_mb,
+                    }
+                    for spec in diarization_models.DIARIZATION_MODELS.values()
+                ]
+                self._write_json(200, {"object": "list", "data": asr_data + diarization_data})
             elif self.path == "/metrics":
                 self._write(200, generate_latest(), "text/plain; version=0.0.4; charset=utf-8")
             else:
