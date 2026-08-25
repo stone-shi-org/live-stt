@@ -122,12 +122,39 @@ class Settings(BaseSettings):
     # terms and passing a token) -- kept as its own field, never folded into
     # diarization_model, so a log line that prints the model id never leaks it.
     diarization_hf_token: str | None = None
-    # Most calls through this service are one-on-one telephony, so the
-    # speaker count is usually known in advance -- passing it to pyannote's
-    # pipeline (num_speakers=) measurably helps clustering accuracy over
-    # letting it guess. None means "let pyannote decide", the right default
-    # for anything that isn't a plain two-party call.
-    diarization_num_speakers: int | None = 2
+    # --- Speaker-count hints, three independent knobs -------------------
+    #
+    # diarization_num_speakers: an EXACT count, forwarded as pyannote's
+    # `num_speakers=`. Only safe when the caller actually KNOWS the true
+    # count for THIS call (e.g. a UI where a user confirmed "this was a
+    # two-person call") -- an exact hint that's WRONG is worse than no hint
+    # at all. Measured for real, not assumed: a real 3-speaker NOTSOFAR-1
+    # meeting (MTG_32063, see CLAUDE.md/tools/speaker_count_experiment.py)
+    # was diarized with num_speakers hardcoded to 2 (this field's OLD
+    # default) -- frame-level agreement against ground truth dropped to
+    # 0.675 (the worst of six configs tested) and one real speaker's
+    # cluster purity collapsed to 0.40 (that person's speech ends up
+    # attributed to the wrong name more often than not). Defaults to None
+    # -- do NOT hardcode this to 2 "because most calls are two-party";
+    # that exact failure mode is what the measurement above demonstrates.
+    # Has no effect on min/max below when set (pyannote's own contract).
+    diarization_num_speakers: int | None = None
+    # diarization_min_speakers / diarization_max_speakers: a BOUND, not a
+    # guess, forwarded as pyannote's `min_speakers=`/`max_speakers=` --
+    # only used when diarization_num_speakers is None. Pyannote's actual
+    # clustering (VBxClustering for the registered community-1 model,
+    # confirmed by reading the installed pyannote.audio source) already
+    # auto-estimates the speaker count and only forces a re-cluster when
+    # that estimate falls OUTSIDE [min, max]. Measured for real on the same
+    # MTG_32063 meeting: min=1,max=5 (a band bracketing the true count of 3)
+    # produced output BYTE-IDENTICAL to passing no hint at all -- this is a
+    # true no-op when the band is already correct, and only clamps a
+    # pathological auto-estimate at the extremes. Defaults (1, 6) are a
+    # generous telephony-to-small-meeting band, not independently tuned --
+    # only one meeting/one true-count value has been measured so far (see
+    # CLAUDE.md); revisit if this service starts handling larger calls.
+    diarization_min_speakers: int | None = 1
+    diarization_max_speakers: int | None = 6
     # "cpu" | "cuda". Independent of the ASR worker's own `backend` setting
     # above -- pyannote.audio runs in this Python process via torch, not in
     # the C++ worker, so a CUDA ASR deployment and a CPU diarization

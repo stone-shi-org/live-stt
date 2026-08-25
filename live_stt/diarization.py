@@ -302,8 +302,25 @@ def diarize_file(
     # return value just to avoid it.
     spec = resolve_diarization_model(settings.diarization_model)
     kwargs: dict[str, Any] = {}
-    if spec.supports_num_speakers_hint and settings.diarization_num_speakers is not None:
-        kwargs["num_speakers"] = settings.diarization_num_speakers
+    if spec.supports_num_speakers_hint:
+        if settings.diarization_num_speakers is not None:
+            # Exact hint -- only forwarded when the caller asserted a true
+            # count (see Settings.diarization_num_speakers's docstring for
+            # the real measurement showing a WRONG exact hint is worse than
+            # none at all). min/max below are skipped entirely here: they
+            # have no effect once num_speakers is set anyway (pyannote's own
+            # contract), so there's no reason to compute or pass them.
+            kwargs["num_speakers"] = settings.diarization_num_speakers
+        else:
+            # No asserted-true count -- pass a BOUND, not a guess. Real
+            # measurement (see Settings.diarization_min_speakers's
+            # docstring): when the true count already falls inside
+            # [min, max], this is a byte-identical no-op vs passing nothing;
+            # it only kicks in to clamp a pathological auto-estimate.
+            if settings.diarization_min_speakers is not None:
+                kwargs["min_speakers"] = settings.diarization_min_speakers
+            if settings.diarization_max_speakers is not None:
+                kwargs["max_speakers"] = settings.diarization_max_speakers
 
     try:
         result = pipeline(str(path), **kwargs)

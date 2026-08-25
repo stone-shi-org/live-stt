@@ -361,6 +361,90 @@ class TestDiarizeFileModelSpecAwareness:
         )
         assert capture["kwargs"] == {}
 
+    def test_min_max_speakers_passed_when_num_speakers_is_unset(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        """The default shape: no asserted-true count, so a bound is
+        forwarded instead of an exact guess -- see Settings.diarization_min_speakers's
+        docstring for the real measurement backing this as the safer default."""
+        capture: dict = {}
+        self._stub_pyannote(monkeypatch, capture)
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        diarize_file(
+            wav,
+            settings=_settings(
+                diarization_hf_token="tok",
+                diarization_num_speakers=None,
+                diarization_min_speakers=1,
+                diarization_max_speakers=6,
+            ),
+        )
+        assert capture["kwargs"] == {"min_speakers": 1, "max_speakers": 6}
+
+    def test_num_speakers_takes_priority_over_min_max_when_both_are_set(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ):
+        """Mirrors pyannote's own contract ('min/max has no effect when
+        num_speakers is provided') -- diarize_file doesn't even compute
+        min/max kwargs in this case, rather than passing all three and
+        relying on pyannote to ignore two of them."""
+        capture: dict = {}
+        self._stub_pyannote(monkeypatch, capture)
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        diarize_file(
+            wav,
+            settings=_settings(
+                diarization_hf_token="tok",
+                diarization_num_speakers=3,
+                diarization_min_speakers=1,
+                diarization_max_speakers=6,
+            ),
+        )
+        assert capture["kwargs"] == {"num_speakers": 3}
+
+    def test_min_max_withheld_when_the_spec_does_not_support_it(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        import live_stt.diarization as diarization_module
+        from live_stt.diarization_models import DiarizationModelSpec
+
+        capture: dict = {}
+        self._stub_pyannote(monkeypatch, capture)
+        monkeypatch.setattr(
+            diarization_module,
+            "resolve_diarization_model",
+            lambda key: DiarizationModelSpec(
+                key="no-hint-model", hf_repo_id="someone/no-hint-model", gated=False, supports_num_speakers_hint=False
+            ),
+        )
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        diarize_file(
+            wav,
+            settings=_settings(
+                diarization_hf_token="tok",
+                diarization_model="no-hint-model",
+                diarization_num_speakers=None,
+                diarization_min_speakers=1,
+                diarization_max_speakers=6,
+            ),
+        )
+        assert capture["kwargs"] == {}
+
+    def test_only_min_speakers_set_passes_only_min(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        capture: dict = {}
+        self._stub_pyannote(monkeypatch, capture)
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        diarize_file(
+            wav,
+            settings=_settings(
+                diarization_hf_token="tok",
+                diarization_num_speakers=None,
+                diarization_min_speakers=2,
+                diarization_max_speakers=None,
+            ),
+        )
+        assert capture["kwargs"] == {"min_speakers": 2}
+
 
 class TestDiarizeFileCudaCleanup:
     """diarize_file releases CUDA memory after every request on the "cuda"
@@ -469,7 +553,13 @@ class TestSettingsDefaults:
         settings = _settings()
         assert settings.diarization_model == "pyannote/speaker-diarization-community-1"
         assert settings.diarization_hf_token is None
-        assert settings.diarization_num_speakers == 2
+        # NOT hardcoded to an exact count -- see the docstring on this field
+        # in live_stt/config.py for the real measurement (MTG_32063) showing
+        # a wrong exact hint (the old default, 2) is worse than no hint at
+        # all. Bounds, not a guess, are the default instead.
+        assert settings.diarization_num_speakers is None
+        assert settings.diarization_min_speakers == 1
+        assert settings.diarization_max_speakers == 6
         assert settings.diarization_device == "cpu"
 
     def test_token_overridable_via_env(self, monkeypatch: pytest.MonkeyPatch):

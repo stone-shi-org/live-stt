@@ -31,7 +31,12 @@ class DiarizationModelSpec:
     key: str
     hf_repo_id: str  # passed verbatim to pyannote.audio.Pipeline.from_pretrained
     gated: bool  # requires an accepted-terms HF token -- see Settings.diarization_hf_token
-    supports_num_speakers_hint: bool  # accepts num_speakers= as a __call__ kwarg
+    # Accepts num_speakers=/min_speakers=/max_speakers= as __call__ kwargs --
+    # one flag for all three since they're the same pyannote pipeline kwarg
+    # surface (see pyannote.audio.pipelines.speaker_diarization.apply()); a
+    # model that doesn't take one almost certainly doesn't take any of them.
+    # False for a model withholds ALL THREE, not just the exact hint.
+    supports_num_speakers_hint: bool
     # Real measurement, one file, one box (RTX 3090) -- the highest of the
     # 6/10/20-minute peaks in CLAUDE.md's duration-scaling entry (the
     # 40-minute result was reproducibly LOWER, not a worse case; see that

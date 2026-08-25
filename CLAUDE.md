@@ -387,9 +387,38 @@ in `configure()` and there is no loop anywhere near it.
   own ASR word timestamps (`asr_pb2.Word`) rather than a single model producing both, since here
   diarization (pyannote) and transcription (parakeet.cpp) are two separate engines. New `Settings`
   fields: `diarization_model`, `diarization_hf_token` (the model is gated CC-BY-4.0, kept as its own
-  field so a logged model id never leaks it), `diarization_num_speakers` (defaults to 2 — most calls
-  through this service are one-on-one telephony, and pyannote's clustering does measurably better
-  given the true count than guessing). `pyannote.audio`/`torch`/`torchaudio` live in a separate
+  field so a logged model id never leaks it), `diarization_num_speakers` (originally defaulted to 2 —
+  most calls through this service are one-on-one telephony, and pyannote's clustering does measurably
+  better given the true count than guessing). **Since corrected — that default was itself the bug.**
+  A real experiment (`tools/speaker_count_experiment.py`, results in
+  `tools/speaker_count_experiment_results.json`) ran 6 configs of pyannote's actual installed
+  `speaker-diarization-community-1` pipeline against a real NOTSOFAR-1 meeting with a KNOWN true
+  count — `MTG_32063` (Beth/Linda/Rachel, 3 speakers, 366s, no 2-speaker meeting exists anywhere in
+  this eval set) — scored against ground truth with the same frame-purity methodology as the earlier
+  MTG_32089 run. `num_speakers=2` (the old hardcoded default, deliberately WRONG for this 3-speaker
+  file) scored **worst of all six configs** (0.675 frame agreement, vs. 0.729 for either no hint at
+  all or the exact correct hint of 3) and collapsed one real speaker's cluster purity to **0.396**
+  (Beth's speech ends up attributed to the wrong name more often than not). Reading pyannote's
+  installed source directly (`pyannote/audio/pipelines/clustering.py`) also confirmed
+  `VBxClustering.expects_num_clusters = False` — the actual algorithm this registered model uses
+  already auto-estimates the speaker count and only forces a re-cluster via `KMeans` when that
+  estimate falls **outside** an explicit `[min_speakers, max_speakers]` band. Measured for real:
+  `min_speakers=1, max_speakers=5` (a band bracketing the true count) produced output
+  **byte-identical** to passing no hint at all — proving the band is a genuine no-op when already
+  correct, not merely a theoretical claim from the docs. So: `diarization_num_speakers` now defaults
+  to `None` (do not reintroduce a hardcoded exact default), and two new fields —
+  `diarization_min_speakers` (default `1`) / `diarization_max_speakers` (default `6`) — carry the
+  bound instead, wired through `live_stt/diarization.py::diarize_file` (num_speakers, when set, still
+  takes priority and min/max are skipped entirely, matching pyannote's own contract), the
+  `min_speakers`/`max_speakers` multipart fields on `POST /v1/audio/diarization`
+  (`live_stt/diarize_http.py`), and `tools/diarize_call.py --min-speakers`/`--max-speakers`. An exact
+  `num_speakers=` hint remains supported and is still the right choice — but only when the caller
+  actually asserts a true count for that specific call, not as a blanket default. Caveat carried
+  forward in the new fields' own docstrings: this is one meeting, one true-count value (3); the
+  qualitative conclusion (wrong exact default is worse than no hint; a correct-or-bracketing band is
+  a safe no-op) is real, but the specific band defaults `(1, 6)` are not independently tuned beyond
+  it. 15 new/updated tests cover the priority ordering (`tests/test_diarization.py`,
+  `tests/test_diarize_http.py`). `pyannote.audio`/`torch`/`torchaudio` live in a separate
   `requirements-diarization.txt`, deliberately excluded from `requirements.txt` — heavy dependencies
   for an opt-in offline tool, not something every deployment of the always-on `grpc.aio` server
   should pay for. `live_stt/diarize_http.py` wires `POST /v1/audio/diarization` into

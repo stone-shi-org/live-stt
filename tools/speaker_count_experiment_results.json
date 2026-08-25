@@ -1,0 +1,144 @@
+[
+  {
+    "label": "none (no hint at all)",
+    "kwargs": {},
+    "wall_sec": 318.1,
+    "predicted_num_speakers": 3,
+    "num_segments": 163,
+    "predicted_num_clusters": 3,
+    "cluster_to_gt": {
+      "SPEAKER_00": "Rachel",
+      "SPEAKER_01": "Linda",
+      "SPEAKER_02": "Beth"
+    },
+    "cluster_purity": {
+      "SPEAKER_00": 0.8904494382022472,
+      "SPEAKER_01": 0.47585513078470826,
+      "SPEAKER_02": 0.6706484641638225
+    },
+    "frame_agreement": 0.7294642857142857,
+    "scored_frames": 3360,
+    "scored_sec": 336.0
+  },
+  {
+    "label": "num_speakers=2 (current hardcoded DEFAULT)",
+    "kwargs": {
+      "num_speakers": 2
+    },
+    "wall_sec": 317.9,
+    "predicted_num_speakers": 2,
+    "num_segments": 118,
+    "predicted_num_clusters": 2,
+    "cluster_to_gt": {
+      "SPEAKER_00": "Beth",
+      "SPEAKER_01": "Rachel"
+    },
+    "cluster_purity": {
+      "SPEAKER_00": 0.39552760307477286,
+      "SPEAKER_01": 0.8828408501814412
+    },
+    "frame_agreement": 0.6752976190476191,
+    "scored_frames": 3360,
+    "scored_sec": 336.0
+  },
+  {
+    "label": "num_speakers=3 (exact, matches truth)",
+    "kwargs": {
+      "num_speakers": 3
+    },
+    "wall_sec": 313.4,
+    "predicted_num_speakers": 3,
+    "num_segments": 163,
+    "predicted_num_clusters": 3,
+    "cluster_to_gt": {
+      "SPEAKER_00": "Rachel",
+      "SPEAKER_01": "Linda",
+      "SPEAKER_02": "Beth"
+    },
+    "cluster_purity": {
+      "SPEAKER_00": 0.8904494382022472,
+      "SPEAKER_01": 0.47585513078470826,
+      "SPEAKER_02": 0.6706484641638225
+    },
+    "frame_agreement": 0.7294642857142857,
+    "scored_frames": 3360,
+    "scored_sec": 336.0
+  },
+  {
+    "label": "num_speakers=5 (hardcoded too HIGH)",
+    "kwargs": {
+      "num_speakers": 5
+    },
+    "wall_sec": 307.9,
+    "predicted_num_speakers": 5,
+    "num_segments": 190,
+    "predicted_num_clusters": 5,
+    "cluster_to_gt": {
+      "SPEAKER_00": "Rachel",
+      "SPEAKER_01": "Linda",
+      "SPEAKER_02": "Rachel",
+      "SPEAKER_03": "Beth",
+      "SPEAKER_04": "Linda"
+    },
+    "cluster_purity": {
+      "SPEAKER_00": 0.8081683168316832,
+      "SPEAKER_01": 0.43217665615141954,
+      "SPEAKER_02": 0.9562737642585551,
+      "SPEAKER_03": 0.7005649717514124,
+      "SPEAKER_04": 0.5122699386503068
+    },
+    "frame_agreement": 0.7446428571428572,
+    "scored_frames": 3360,
+    "scored_sec": 336.0
+  },
+  {
+    "label": "min=1,max=5 (loose band bracketing truth)",
+    "kwargs": {
+      "min_speakers": 1,
+      "max_speakers": 5
+    },
+    "wall_sec": 309.4,
+    "predicted_num_speakers": 3,
+    "num_segments": 163,
+    "predicted_num_clusters": 3,
+    "cluster_to_gt": {
+      "SPEAKER_00": "Rachel",
+      "SPEAKER_01": "Linda",
+      "SPEAKER_02": "Beth"
+    },
+    "cluster_purity": {
+      "SPEAKER_00": 0.8904494382022472,
+      "SPEAKER_01": 0.47585513078470826,
+      "SPEAKER_02": 0.6706484641638225
+    },
+    "frame_agreement": 0.7294642857142857,
+    "scored_frames": 3360,
+    "scored_sec": 336.0
+  },
+  {
+    "label": "min=4,max=6 (band EXCLUDING truth)",
+    "kwargs": {
+      "min_speakers": 4,
+      "max_speakers": 6
+    },
+    "wall_sec": 312.9,
+    "predicted_num_speakers": 4,
+    "num_segments": 159,
+    "predicted_num_clusters": 4,
+    "cluster_to_gt": {
+      "SPEAKER_00": "Rachel",
+      "SPEAKER_01": "Linda",
+      "SPEAKER_02": "Rachel",
+      "SPEAKER_03": "Beth"
+    },
+    "cluster_purity": {
+      "SPEAKER_00": 0.5107296137339056,
+      "SPEAKER_01": 0.5215469613259669,
+      "SPEAKER_02": 0.9462227912932138,
+      "SPEAKER_03": 0.7166276346604216
+    },
+    "frame_agreement": 0.7422619047619048,
+    "scored_frames": 3360,
+    "scored_sec": 336.0
+  }
+]

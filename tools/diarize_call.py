@@ -71,7 +71,24 @@ def main() -> None:
         default=None,
         help="overrides LSTT_DIARIZATION_MODEL -- must be a key in live_stt.diarization_models.DIARIZATION_MODELS",
     )
-    parser.add_argument("--num-speakers", type=int, default=None, help="overrides LSTT_DIARIZATION_NUM_SPEAKERS")
+    parser.add_argument(
+        "--num-speakers",
+        type=int,
+        default=None,
+        help=(
+            "overrides LSTT_DIARIZATION_NUM_SPEAKERS -- an EXACT count, only "
+            "safe when you actually KNOW the true speaker count for this "
+            "file. A wrong exact count measurably hurts output (see "
+            "live_stt/config.py's diarization_num_speakers docstring); "
+            "prefer --min-speakers/--max-speakers when you don't know it."
+        ),
+    )
+    parser.add_argument(
+        "--min-speakers", type=int, default=None, help="overrides LSTT_DIARIZATION_MIN_SPEAKERS (a bound, not a guess)"
+    )
+    parser.add_argument(
+        "--max-speakers", type=int, default=None, help="overrides LSTT_DIARIZATION_MAX_SPEAKERS (a bound, not a guess)"
+    )
     parser.add_argument(
         "--device",
         default=None,
@@ -89,6 +106,10 @@ def main() -> None:
         settings = settings.model_copy(update={"diarization_model": args.model})
     if args.num_speakers is not None:
         settings = settings.model_copy(update={"diarization_num_speakers": args.num_speakers})
+    if args.min_speakers is not None:
+        settings = settings.model_copy(update={"diarization_min_speakers": args.min_speakers})
+    if args.max_speakers is not None:
+        settings = settings.model_copy(update={"diarization_max_speakers": args.max_speakers})
     if args.device:
         settings = settings.model_copy(update={"diarization_device": args.device})
 

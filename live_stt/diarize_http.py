@@ -18,7 +18,12 @@ client can point ``MMN_DIARIZATION_URL`` at a live-stt instance's admin port
 and just work, with no changes on that side. Two fields are live-stt-specific
 extensions, not part of that client today: ``words`` (a JSON array of
 ``{"text", "start_sec", "end_sec"}`` -- the call's own ASR transcript word
-timestamps, same shape as ``asr_pb2.Word``) and ``num_speakers``.
+timestamps, same shape as ``asr_pb2.Word``), ``num_speakers`` (an EXACT
+count -- only safe when the caller actually knows it, see
+``Settings.diarization_num_speakers``'s docstring for why a wrong exact
+hint measurably hurts output), and ``min_speakers``/``max_speakers`` (a
+bound, not a guess -- the recommended default when the true count isn't
+known; see ``Settings.diarization_min_speakers``'s docstring).
 
 **Known, deliberate incompatibility**: my-meeting-notes' client always sends
 ``include_text=true`` and expects real per-segment transcript text, because
@@ -139,6 +144,23 @@ def handle_diarize_request(
             overrides["diarization_num_speakers"] = int(num_speakers)
         except ValueError:
             return 400, {"error": {"message": f"'num_speakers' must be an integer, got {num_speakers!r}"}}
+    # min_speakers/max_speakers: a BOUND, not an exact assertion -- see
+    # Settings.diarization_min_speakers's docstring for why this is the
+    # safer default shape when the caller doesn't know the true count.
+    # diarize_file gives num_speakers priority over these when both are
+    # present (pyannote's own contract), so no ordering guard is needed here.
+    min_speakers = fields.get("min_speakers")
+    if min_speakers:
+        try:
+            overrides["diarization_min_speakers"] = int(min_speakers)
+        except ValueError:
+            return 400, {"error": {"message": f"'min_speakers' must be an integer, got {min_speakers!r}"}}
+    max_speakers = fields.get("max_speakers")
+    if max_speakers:
+        try:
+            overrides["diarization_max_speakers"] = int(max_speakers)
+        except ValueError:
+            return 400, {"error": {"message": f"'max_speakers' must be an integer, got {max_speakers!r}"}}
     effective_settings = settings.model_copy(update=overrides) if overrides else settings
 
     include_text = fields.get("include_text", b"false").decode("utf-8", "replace").strip().lower() == "true"

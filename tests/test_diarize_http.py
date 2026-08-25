@@ -94,6 +94,35 @@ class TestHandleDiarizeRequest:
         assert status == 400
         assert "num_speakers" in doc["error"]["message"]
 
+    def test_non_integer_min_speakers_is_400(self):
+        body = _multipart_body({"min_speakers": "two"}, file_field="file", file_bytes=b"wav")
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
+        assert status == 400
+        assert "min_speakers" in doc["error"]["message"]
+
+    def test_non_integer_max_speakers_is_400(self):
+        body = _multipart_body({"max_speakers": "two"}, file_field="file", file_bytes=b"wav")
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
+        assert status == 400
+        assert "max_speakers" in doc["error"]["message"]
+
+    def test_min_max_speakers_forwarded_as_settings_overrides(self, monkeypatch: pytest.MonkeyPatch):
+        captured = {}
+
+        def fake_diarize_file(path, *, settings, words):
+            captured["settings"] = settings
+            return {"task": "diarize", "num_speakers": 0, "segments": [], "speakers": []}
+
+        monkeypatch.setattr(diarize_http, "diarize_file", fake_diarize_file)
+        body = _multipart_body(
+            {"min_speakers": "2", "max_speakers": "4"}, file_field="file", file_bytes=b"wav"
+        )
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
+
+        assert status == 200
+        assert captured["settings"].diarization_min_speakers == 2
+        assert captured["settings"].diarization_max_speakers == 4
+
     def test_missing_dependency_is_503_not_400(self, monkeypatch: pytest.MonkeyPatch):
         def fake_diarize_file(*args, **kwargs):
             raise DiarizationError("pyannote.audio is not installed. ...")
