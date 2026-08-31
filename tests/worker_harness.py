@@ -25,15 +25,25 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKER_BIN = REPO_ROOT / "worker" / "build" / "live_stt_worker"
 GGML_LIB_DIR = REPO_ROOT / "worker" / "build-parakeet" / "third_party" / "ggml" / "src"
 
+# The whisper engine's equivalents -- see tests/test_capi_smoke_whisper.py.
+# No LD_LIBRARY_PATH needed for it (unlike parakeet's WORKER_BIN above):
+# live_stt_worker_whisper links its vendored ggml fully static (verified by
+# actually building it, see worker/CMakeLists.txt), so there is no .so to
+# point at.
+WORKER_BIN_WHISPER = REPO_ROOT / "worker" / "build" / "live_stt_worker_whisper"
+
 
 class WorkerHandle:
-    def __init__(self) -> None:
+    def __init__(self, worker_bin: Path = WORKER_BIN, ggml_lib_dir: Path | None = GGML_LIB_DIR) -> None:
         self._parent_sock, child_sock = socket.socketpair()
         child_fd = child_sock.fileno()
+        env = dict(os.environ)
+        if ggml_lib_dir is not None:
+            env["LD_LIBRARY_PATH"] = str(ggml_lib_dir)
         self.proc = subprocess.Popen(
-            [str(WORKER_BIN)],
+            [str(worker_bin)],
             pass_fds=(child_fd, 3),
-            env={**os.environ, "LD_LIBRARY_PATH": str(GGML_LIB_DIR)},
+            env=env,
             preexec_fn=lambda: os.dup2(child_fd, 3),
         )
         child_sock.close()

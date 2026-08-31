@@ -1,3 +1,6 @@
 [submodule "worker/third_party/parakeet.cpp"]
 	path = worker/third_party/parakeet.cpp
 	url = https://github.com/mudler/parakeet.cpp
+[submodule "worker/third_party/whisper.cpp"]
+	path = worker/third_party/whisper.cpp
+	url = https://github.com/ggerganov/whisper.cpp

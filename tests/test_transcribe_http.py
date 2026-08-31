@@ -181,6 +181,45 @@ class TestHandleTranscribeRequestValidation:
         assert status == 503
         assert "capacity" in json.loads(resp)["error"]["message"]
 
+    @pytest.mark.asyncio
+    async def test_insufficient_vram_on_cuda_backend_is_503(self, monkeypatch: pytest.MonkeyPatch):
+        # Mirrors live_stt/servicer.py's gRPC-side gate, now closed here too
+        # (see the comment in transcribe_http.py) -- this endpoint spawns
+        # the exact same kind of worker process through the exact same
+        # CallSession/WorkerHandle path, and is whisper's ONLY entry point.
+        monkeypatch.setattr(transcribe_http.gpu, "free_vram_mb", lambda: 100)
+        body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes())
+        status, resp, ct = await transcribe_http.handle_transcribe_request(
+            content_type=CONTENT_TYPE,
+            body=body,
+            settings=_settings(backend="cuda", vram_per_worker_mb=3000, vram_reserve_mb=2000),
+            budget=_budget(),
+            draining=False,
+        )
+        assert status == 503
+        assert "VRAM" in json.loads(resp)["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_vram_check_is_a_noop_on_cpu_backend(self, monkeypatch: pytest.MonkeyPatch):
+        # free_vram_mb() would return None anyway without a real nvidia-smi
+        # (see tests/test_gpu.py), but this pins the actual guard: the check
+        # is skipped entirely off the cuda backend, not merely tolerant of
+        # a None reading.
+        monkeypatch.setattr(
+            transcribe_http.gpu, "free_vram_mb", lambda: (_ for _ in ()).throw(AssertionError("should not be called"))
+        )
+        self_patch_module = transcribe_http
+
+        async def fake_run(pcm, *, settings, spec, language, budget):
+            return "hello", [], 1.0, 1
+
+        monkeypatch.setattr(self_patch_module, "_run_transcription", fake_run)
+        body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes())
+        status, resp, ct = await transcribe_http.handle_transcribe_request(
+            content_type=CONTENT_TYPE, body=body, settings=_settings(backend="cpu"), budget=_budget(), draining=False
+        )
+        assert status == 200
+
 
 class TestHandleTranscribeRequestResponses:
     """_run_transcription monkeypatched -- these test response shaping only."""
@@ -321,3 +360,36 @@ class TestRealCallSessionIntegration:
             content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False
         )
         assert status == 400
+
+    @pytest.mark.asyncio
+    async def test_batch_only_whisper_model_succeeds_over_http_unlike_grpc(self):
+        # The whole point of the streaming_capable gate (see
+        # tests/test_servicer.py's test_transcribe_rejects_batch_only_whisper_model)
+        # is that it's specific to the gRPC Transcribe RPC -- this endpoint
+        # is already engine-agnostic and must NOT reject a batch-only model.
+        # worker_bin_whisper here points at the same fake as worker_bin --
+        # the fake doesn't distinguish engines, only the dispatch logic in
+        # live_stt/session.py does (see tests/test_session.py's
+        # test_whisper_engine_spawns_the_whisper_binary_not_the_parakeet_one
+        # for the test that actually proves the dispatch, not just this
+        # end-to-end happy path).
+        os.environ["FAKE_WORDS_PER_SEC"] = "50"
+        try:
+            body = _multipart_body(
+                {"model": "whisper-base.en-q8_0"},
+                file_field="file",
+                file_bytes=_wav_bytes(n_frames=2560),
+            )
+            status, resp, ct = await transcribe_http.handle_transcribe_request(
+                content_type=CONTENT_TYPE,
+                body=body,
+                settings=_settings(worker_bin_whisper=str(FAKE_WORKER)),
+                budget=_budget(),
+                draining=False,
+            )
+        finally:
+            os.environ.pop("FAKE_WORDS_PER_SEC", None)
+
+        assert status == 200
+        doc = json.loads(resp)
+        assert doc["text"]

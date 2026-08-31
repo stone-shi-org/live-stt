@@ -91,16 +91,38 @@ class CallSession:
 
     async def _spawn_worker(self) -> WorkerHandle:
         gguf_path = str(Path(self._settings.models_dir) / self._model_spec.gguf_filename)
-        ggml_lib_dir = (
-            Path(self._settings.worker_ggml_lib_dir) if self._settings.worker_ggml_lib_dir else None
-        )
+        # Engine-based dispatch: which binary/lib-dir/thread-count pair to
+        # use. WorkerHandle.spawn() itself is engine-agnostic (it just execs
+        # whatever worker_bin it's given and speaks the same IPC framing
+        # either way) -- this is the one place that decides WHICH binary.
+        if self._model_spec.engine == "whisper":
+            worker_bin = Path(self._settings.worker_bin_whisper)
+            ggml_lib_dir = (
+                Path(self._settings.worker_ggml_lib_dir_whisper)
+                if self._settings.worker_ggml_lib_dir_whisper
+                else None
+            )
+            n_threads = self._settings.n_threads_whisper
+        else:
+            worker_bin = Path(self._settings.worker_bin)
+            ggml_lib_dir = (
+                Path(self._settings.worker_ggml_lib_dir)
+                if self._settings.worker_ggml_lib_dir
+                else None
+            )
+            n_threads = self._settings.n_threads_per_worker
         start = time.monotonic()
         handle = await WorkerHandle.spawn(
-            worker_bin=Path(self._settings.worker_bin),
+            worker_bin=worker_bin,
             gguf_path=gguf_path,
             language=self._config.language,
-            n_threads=self._settings.n_threads_per_worker,
+            n_threads=n_threads,
             ggml_lib_dir=ggml_lib_dir,
+            # Only load-bearing for the whisper engine (see WorkerHandle.spawn's
+            # comment) -- Settings.backend is the one image-wide CPU/CUDA
+            # choice already used for the parakeet engine's metrics label
+            # below, reused here rather than inventing a second knob.
+            use_gpu=self._settings.backend == "cuda",
         )
         metrics.model_load_duration_seconds.observe(time.monotonic() - start)
         version = __about__.info()
@@ -109,7 +131,7 @@ class CallSession:
             parakeet_ref=version["parakeet_ref"],
             backend=self._settings.backend,
             model=self._model_spec.key,
-            n_threads=self._settings.n_threads_per_worker,
+            n_threads=n_threads,
             ggml_features=handle.ready.get("ggml_features", ""),
         )
         return handle
@@ -153,6 +175,19 @@ class CallSession:
         return events
 
     def _should_start_rotation(self, active_doc: dict) -> int | None:
+        # Batch-only engines (whisper) only emit a transcript at finalize()
+        # -- see live_stt/models.py's docstring and worker/session_whisper.hpp.
+        # A rotation SIGKILLs the active worker mid-call; for a streaming
+        # engine that's safe because every word up to that point was already
+        # captured progressively (self._doc_to_events already ran on each
+        # prior RESULT frame), but whisper's worker has emitted NOTHING yet
+        # at that point -- everything buffered since start() would be
+        # silently lost. So rotation is unconditionally disabled for these;
+        # long HTTP uploads rely on max_call_sec/finalize_timeout_sec as the
+        # outer bound instead. Checked first, before any threshold math.
+        if not self._model_spec.streaming_capable:
+            return None
+
         if self._last_rss_kb >= self._settings.worker_rss_soft_kb:
             return asr_pb2.RECYCLE_REASON_RSS_THRESHOLD
 

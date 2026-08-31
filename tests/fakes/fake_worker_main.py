@@ -92,7 +92,16 @@ def main() -> None:
     _write_frame(
         FrameType.READY,
         json.dumps(
-            {"abi_version": 6, "n_threads": config.get("n_threads", 1), "ggml_features": "fake"}
+            {
+                "abi_version": 6,
+                "n_threads": config.get("n_threads", 1),
+                "ggml_features": "fake",
+                # Echoed back purely so tests can assert on what
+                # WorkerHandle.spawn() actually put in the CONFIG frame
+                # (see tests/test_session.py's use_gpu dispatch test) --
+                # not read by any real worker's own CONFIG contract.
+                "use_gpu_received": config.get("use_gpu", False),
+            }
         ).encode(),
     )
 

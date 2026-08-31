@@ -20,6 +20,7 @@
 #include "framing.hpp"
 #include "json_util.hpp"
 #include "pcm.hpp"
+#include "rss.hpp"
 #include "session.hpp"
 
 extern "C" {
@@ -49,38 +50,10 @@ namespace {
 
 constexpr int kIpcFd = 3;
 
-std::string read_rss_kb() {
-    // Linux-only (/proc), which is fine: this worker only ever runs inside
-    // the service's Linux container. Used on every RESULT/FINAL frame so the
-    // front door's RSS watchdog (the primary defense against the upstream
-    // per-audio-second leak, parakeet.cpp#63) has a fresh sample without a
-    // separate IPC round trip.
-    std::FILE* f = std::fopen("/proc/self/status", "r");
-    if (!f) return "0";
-    char line[256];
-    std::string result = "0";
-    while (std::fgets(line, sizeof(line), f)) {
-        if (std::strncmp(line, "VmRSS:", 6) == 0) {
-            long kb = 0;
-            std::sscanf(line + 6, "%ld", &kb);
-            result = std::to_string(kb);
-            break;
-        }
-    }
-    std::fclose(f);
-    return result;
-}
-
-// Splices the worker's own rss_kb/fed_samples fields into the library's
-// feed_json/finalize_json document by string surgery rather than parsing and
-// re-serialising it, so the library's own JSON is passed through
-// byte-for-byte (matching CLAUDE.md's IPC design). Relies on the documented
-// shape in parakeet_capi.h always starting with '{'.
-std::string wrap_result_json(const std::string& lib_json, uint64_t fed_samples) {
-    std::string prefix =
-        "{\"rss_kb\":" + read_rss_kb() + ",\"fed_samples\":" + std::to_string(fed_samples) + ",";
-    return prefix + lib_json.substr(1);
-}
+// read_rss_kb()/wrap_result_json() moved to rss.hpp -- shared with
+// main_whisper.cpp once a second worker binary needed the identical logic.
+// wrap_result_json here relies on the documented shape in parakeet_capi.h
+// always starting with '{'.
 
 std::string ggml_feature_string() {
     std::string features;
@@ -174,7 +147,7 @@ int main() {
                 break;
             }
             if (!live_stt::write_frame(kIpcFd, live_stt::FrameType::kResult,
-                                        wrap_result_json(json_out, fed_samples))) {
+                                        live_stt::wrap_result_json(json_out, fed_samples))) {
                 break;
             }
         } else if (type == live_stt::FrameType::kFinalize) {
@@ -184,7 +157,7 @@ int main() {
                 break;
             }
             live_stt::write_frame(kIpcFd, live_stt::FrameType::kFinal,
-                                   wrap_result_json(json_out, fed_samples));
+                                   live_stt::wrap_result_json(json_out, fed_samples));
             // Deliberately no exit here. See the file header comment: the
             // front door owns this process's lifetime via SIGKILL, on both
             // the clean-half-close and the rotation paths alike.

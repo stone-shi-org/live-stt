@@ -1,5 +1,10 @@
 data/
 models/*.gguf
+# whisper.cpp's own legacy ggml model format (NOT gguf -- see live_stt/models.py's docstring and
+# CLAUDE.md's "Second engine: whisper.cpp"), fetched by scripts/fetch_model.sh same as the .gguf
+# files above. Found missing here the hard way: models/ showed up as a whole untracked directory
+# (multi-hundred-MB .bin files included) the first time a whisper model was fetched into it.
+models/*.bin
 .env
 docker-compose.override.yml
 venv/

@@ -157,6 +157,33 @@ async def test_transcribe_rejects_unknown_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_transcribe_rejects_batch_only_whisper_model() -> None:
+    # streaming_capable=False models (the whisper family) must be rejected
+    # here, before any worker is ever spawned -- settings() deliberately
+    # does NOT point worker_bin_whisper at a real binary, so if the
+    # rejection didn't happen before CallSession.start() tried to spawn
+    # one, this would surface as UNAVAILABLE (engine failed to start), not
+    # INVALID_ARGUMENT -- the assertion below distinguishes the two.
+    async def whisper_config() -> AsyncIterator[asr_pb2.TranscriptionRequest]:
+        yield asr_pb2.TranscriptionRequest(
+            config=asr_pb2.StreamConfig(
+                encoding=asr_pb2.AUDIO_ENCODING_LINEAR16,
+                sample_rate_hz=16000,
+                model="whisper-large-v3-turbo-q8_0",
+            )
+        )
+
+    async with _Server(_settings()) as server:
+        async with server.channel() as channel:
+            stub = asr_pb2_grpc.StreamingASRStub(channel)
+            with pytest.raises(grpc.aio.AioRpcError) as exc_info:
+                async for _ in stub.Transcribe(whisper_config()):
+                    pass
+    assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "batch-only" in exc_info.value.details()
+
+
+@pytest.mark.asyncio
 async def test_transcribe_rejects_second_config_message() -> None:
     async def two_configs() -> AsyncIterator[asr_pb2.TranscriptionRequest]:
         cfg = asr_pb2.StreamConfig(encoding=asr_pb2.AUDIO_ENCODING_LINEAR16, sample_rate_hz=16000)

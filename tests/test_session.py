@@ -151,3 +151,89 @@ async def test_close_is_idempotent() -> None:
     await session.start()
     await session.close()
     await session.close()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_whisper_engine_spawns_the_whisper_binary_not_the_parakeet_one() -> None:
+    # worker_bin (parakeet's default) is deliberately left pointing at a
+    # nonexistent path here -- only worker_bin_whisper points at the real
+    # fake. If _spawn_worker's engine dispatch (live_stt/session.py) picked
+    # the wrong binary for a whisper-engine ModelSpec, start() would fail
+    # with a WorkerError (spawning a nonexistent executable), not succeed.
+    settings = Settings(
+        _env_file=None,
+        worker_bin="/nonexistent/live_stt_worker",
+        worker_bin_whisper=str(FAKE_WORKER),
+        models_dir="/fake",
+    )
+    session = _session(settings=settings, model_key="whisper-base.en-q8_0")
+    try:
+        ready_event = await session.start()
+    finally:
+        await session.close()
+
+    assert ready_event.WhichOneof("event") == "ready"
+    assert ready_event.ready.model == "whisper-base.en-q8_0"
+
+
+@pytest.mark.asyncio
+async def test_use_gpu_is_derived_from_backend_setting_not_hardcoded() -> None:
+    # Settings.backend == "cuda" -- CallSession._spawn_worker (session.py)
+    # must derive use_gpu=True from this and thread it through
+    # WorkerHandle.spawn()'s CONFIG frame (see worker/main_whisper.cpp's
+    # "use_gpu" field). Checked via the fake worker's use_gpu_received echo
+    # (tests/fakes/fake_worker_main.py) rather than mocking spawn() directly,
+    # so this exercises the real CONFIG JSON that actually goes out over the
+    # real IPC socket, not just the Python call arguments.
+    cuda_settings = Settings(
+        _env_file=None, worker_bin=str(FAKE_WORKER), models_dir="/fake", backend="cuda"
+    )
+    session = _session(settings=cuda_settings)
+    try:
+        ready_event = await session.start()
+    finally:
+        await session.close()
+    assert ready_event.ready is not None  # sanity: start() actually completed
+    assert session._worker.ready.get("use_gpu_received") is True  # noqa: SLF001
+
+    cpu_settings = Settings(
+        _env_file=None, worker_bin=str(FAKE_WORKER), models_dir="/fake", backend="cpu"
+    )
+    session = _session(settings=cpu_settings)
+    try:
+        await session.start()
+    finally:
+        await session.close()
+    assert session._worker.ready.get("use_gpu_received") is False  # noqa: SLF001
+
+
+def test_rotation_never_triggers_for_a_batch_only_model_even_past_every_threshold() -> None:
+    # The correctness fix this whisper addition surfaced: a rotation
+    # SIGKILLs the active worker mid-call, which is safe for a streaming
+    # engine (words already emitted progressively survive) but would
+    # silently drop unfinalized audio for a batch-only one (nothing has
+    # been transcribed yet at that point -- see live_stt/models.py's
+    # docstring). Call _should_start_rotation directly with every threshold
+    # blown way past, on a streaming_capable=False spec, and confirm it
+    # still refuses to rotate.
+    settings = _settings(worker_rss_soft_kb=1, rotate_after_sec=0.0)
+    session = _session(settings=settings, model_key="whisper-base.en-q8_0")
+    session._last_rss_kb = 10_000_000  # noqa: SLF001 -- test white-box access, way past worker_rss_soft_kb
+    session._active_generation_start_sec = 0.0  # noqa: SLF001
+    session._fed_samples = 16000 * 100_000  # noqa: SLF001 -- huge audio_offset_sec, way past rotate_after_sec
+
+    reason = session._should_start_rotation({"eou": True})  # noqa: SLF001
+    assert reason is None
+
+
+def test_rotation_still_triggers_normally_for_a_streaming_model_with_the_same_thresholds() -> None:
+    # Contrast case for the test above -- proves the gate is specific to
+    # streaming_capable, not a change in the underlying threshold logic
+    # itself (which existing tests/test_rotation.py already covers in more
+    # depth via the full dual-feed machinery).
+    settings = _settings(worker_rss_soft_kb=1, rotate_after_sec=0.0)
+    session = _session(settings=settings, model_key="realtime_eou_120m-v1")
+    session._last_rss_kb = 10_000_000  # noqa: SLF001
+
+    reason = session._should_start_rotation({})  # noqa: SLF001
+    assert reason is not None

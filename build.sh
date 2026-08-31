@@ -70,12 +70,15 @@ fi
 # version.txt is baked into the image and surfaced at GetServerInfo (and
 # /api/version), so a running container can always be traced back to a
 # commit. git status --porcelain, not a two-way diff --quiet check, so an
-# untracked file counts as dirty too. parakeet_ref is the upstream submodule
-# SHA -- PARAKEET_VERSION is frozen at "0.0.1" upstream, so the SHA is the
-# only real version identifier for the vendored engine.
+# untracked file counts as dirty too. parakeet_ref/whisper_ref are the
+# upstream submodule SHAs -- PARAKEET_VERSION is frozen at "0.0.1" upstream
+# (whisper.cpp does carry a real version, 1.9.3-dev as of this pin, but the
+# SHA is still recorded for the same reason: it is the only thing that
+# identifies the EXACT vendored commit, not just a release line).
 FULL_HASH="$(git rev-parse HEAD 2>/dev/null || true)"
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 PARAKEET_REF="$(git -C worker/third_party/parakeet.cpp rev-parse HEAD 2>/dev/null || echo unknown)"
+WHISPER_REF="$(git -C worker/third_party/whisper.cpp rev-parse HEAD 2>/dev/null || echo unknown)"
 
 if [ -z "$FULL_HASH" ]; then
     HASH="dev"
@@ -90,9 +93,10 @@ fi
     echo "hash=${HASH}"
     echo "timestamp=${TIMESTAMP}"
     echo "parakeet_ref=${PARAKEET_REF}"
+    echo "whisper_ref=${WHISPER_REF}"
 } > version.txt
 
-log "Version: ${HASH} (${TIMESTAMP}), parakeet.cpp @ ${PARAKEET_REF:0:7}"
+log "Version: ${HASH} (${TIMESTAMP}), parakeet.cpp @ ${PARAKEET_REF:0:7}, whisper.cpp @ ${WHISPER_REF:0:7}"
 
 log "Building ${REPO}:latest${SUFFIX} (target ${TARGET})"
 docker build --target "$TARGET" \

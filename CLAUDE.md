@@ -1,7 +1,11 @@
 # CLAUDE.md
 
 Streaming ASR service wrapping [parakeet.cpp](https://github.com/mudler/parakeet.cpp)'s streaming
-C API, exposed over bidirectional gRPC to a Python telephony application:
+C API, exposed over bidirectional gRPC to a Python telephony application. A second engine,
+[whisper.cpp](https://github.com/ggerganov/whisper.cpp), was added later for batch-only
+transcription (`POST /v1/audio/transcriptions` only, never the streaming RPC below — see "Second
+engine: whisper.cpp") — the invariant right below is still the accurate description of the gRPC
+path, which whisper never participates in:
 
 ```
 one phone call = one gRPC Transcribe stream = one logical ASR session
@@ -676,6 +680,21 @@ in `configure()` and there is no loop anywhere near it.
   no-hint fake model never receiving `num_speakers=` even when `diarization_num_speakers` is
   configured. **What's NOT proven:** not yet redeployed to 10.100.0.50 — same status as the
   VRAM-gate/dashboard/release-fix work above, all still sitting in throwaway test containers.
+- **whisper.cpp, a second batch-only transcription engine (`live_stt_worker_whisper`,
+  `worker/session_whisper.{hpp,cpp}`, `worker/main_whisper.cpp`) — built, linked, and verified for
+  real on BOTH CPU and CUDA (the real RTX 3090), against real models and real speech; not yet
+  deployed anywhere.** See this file's "Second engine: whisper.cpp" section (right after "Model
+  choice") and its "GPU (CUDA) follow-up" subsection for the full writeup: why this needed a whole
+  second worker binary rather than a registry entry, the real CMake/link gotchas found building both
+  the CPU and CUDA variants (six total: three each), the model table, the `use_gpu` wiring, the
+  ~72MB image-bloat mistake caught and fixed by actually inspecting the built image, the real
+  RTX 3090 log lines confirming genuine GPU execution (not a silent CPU fallback), and the
+  pre-existing HTTP-endpoint VRAM-admission gap closed as a direct consequence. What's proven: two
+  real CPU models plus one real GPU-executed model transcribing real audio through the real
+  binaries, the gRPC-reject/HTTP-accept gate, the rotation-disable correctness fix, the VRAM gate
+  fix, all existing unit tests unaffected. What's not: a thread-count sweep, the three
+  unregistered-for-real-testing smaller sizes (on either backend), GPU-specific VRAM measurement for
+  this engine, and any actual deployment.
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and
@@ -753,6 +772,203 @@ Ships both, default `realtime_eou_120m-v1`:
 The EOU model is the default because its real `<EOU>` makes the worker-rotation cut point exact
 (cut at the boundary, no fuzzy text alignment) and it's ~5x cheaper per stream. `StreamConfig.model`
 / `.language` select nemotron for multilingual calls.
+
+## Second engine: whisper.cpp (batch-only, `POST /v1/audio/transcriptions` only)
+
+Added to support `whisper-large-v3-turbo-q8_0` and the wider whisper family. **Not a
+model-registry addition** — whisper.cpp (`worker/third_party/whisper.cpp`, a real git submodule,
+pinned SHA `c4ac0012`) is architecturally incompatible with parakeet.cpp's streaming C API: a
+different, legacy model file format (its own `ggml-*.bin`, confirmed live against the real
+`ggerganov/whisper.cpp` HF repo listing — **not GGUF**, despite `ModelSpec.gguf_filename`'s name;
+that field is kept as one string for both engines since it's only ever used as "the model
+filename to join onto `models_dir`", which doesn't care about the actual format) and no genuine
+incremental encoder/decoder state (`examples/stream/stream.cpp` in the real upstream source just
+re-runs `whisper_full()` over a manually reconstructed sliding window every iteration, not a real
+carried state — confirmed by reading it, not assumed).
+
+Given that, whisper is exposed as **batch-only**, via a **second, statically-linked worker
+binary** (`live_stt_worker_whisper`, built from `worker/main_whisper.cpp` +
+`worker/session_whisper.{hpp,cpp}`, a new target in the same `worker/CMakeLists.txt` project) —
+never through the streaming gRPC `Transcribe` RPC. `live_stt/servicer.py` aborts any whisper-family
+model with `INVALID_ARGUMENT` immediately after `models.resolve()`, before a worker is ever
+spawned; `live_stt/transcribe_http.py` needed **zero changes** since it was already engine-agnostic.
+`ModelSpec` gained two additive fields (`engine: str = "parakeet"`, `streaming_capable: bool =
+True` — both defaults preserve the two pre-existing entries unchanged): `engine` picks which
+`WorkerHandle.spawn()` binary/lib-dir/thread-count triple `live_stt/session.py::_spawn_worker`
+uses (`Settings.worker_bin_whisper`/`worker_ggml_lib_dir_whisper`/`n_threads_whisper`, parallel to
+the existing parakeet fields), and `streaming_capable=False` is checked in two places: the gRPC
+gate above, and `CallSession._should_start_rotation`, which now short-circuits to "never rotate"
+for these models — **a real correctness hazard this addition surfaced**: whisper's worker only
+emits a transcript at `finalize()` (its `Session::feed()` just buffers PCM, no inference — see
+`worker/session_whisper.hpp`'s header comment), so a rotation SIGKILLing the active worker
+mid-buffer would silently drop everything fed so far, unlike parakeet's streaming engine where
+every word up to that point was already captured progressively. Long HTTP uploads for whisper
+rely on `max_call_sec`/`finalize_timeout_sec` as the outer bound instead.
+
+Model registry (`live_stt/models.py`), files verified live against the real HF repo (sha256 from
+`x-linked-etag`, same methodology `scripts/fetch_model.sh` already used for parakeet's entries;
+`q8_0` does not exist for every size upstream — confirmed `ggml-large-v3-q8_0.bin` 404s there, so
+that entry uses `q5_0` instead of the ~3GB unquantized file):
+
+| key | file | quant | multilingual |
+|---|---|---|---|
+| `whisper-base.en-q8_0` | `ggml-base.en-q8_0.bin` (82MB) | q8_0 | no |
+| `whisper-small-q8_0` | `ggml-small-q8_0.bin` | q8_0 | yes |
+| `whisper-medium-q8_0` | `ggml-medium-q8_0.bin` | q8_0 | yes |
+| `whisper-large-v3-q5_0` | `ggml-large-v3-q5_0.bin` | q5_0 | yes |
+| `whisper-large-v3-turbo-q8_0` (`DEFAULT_WHISPER_MODEL_KEY`) | `ggml-large-v3-turbo-q8_0.bin` | q8_0 | yes |
+
+**Real build/link gotchas found while vendoring this (three, none would have been caught by
+reading either project's docs):**
+- **`whisper.h` itself `#include`s `ggml.h`** — its public struct fields (`whisper_context_params`
+  etc) reference ggml types directly, so `whisper_lib`'s `INTERFACE_INCLUDE_DIRECTORIES` in
+  `worker/CMakeLists.txt` needs whisper.cpp's vendored `ggml/include` on the path too, not just
+  whisper's own `include/`. Found by actually compiling `session_whisper.cpp` — the header alone
+  didn't make this obvious.
+- **whisper.cpp's vendored ggml links fully STATIC (`.a`, no `.so` at all) given
+  `-DBUILD_SHARED_LIBS=OFF`, unlike parakeet.cpp's own vendored ggml copy**, which (per this file's
+  parakeet build notes) builds shared `.so`s "regardless" of `PARAKEET_SHARED`. Verified by
+  actually building both side by side, same host, same day — a genuine difference between the two
+  projects' ggml pins/CMake wiring, not a parameter this repo forgot to pass. Consequence:
+  `live_stt_worker_whisper` is a single self-contained static executable with no `$ORIGIN`-resolved
+  `.so`s to co-locate at all — the "two identically-named `.so`s from different builds silently
+  clobbering each other if copied into the same runtime directory" landmine this two-engine design
+  originally guarded against (separate `/app/worker/whisper/` subdirectory in the Dockerfile) does
+  not actually apply to whisper's artifacts; the subdirectory is kept for clarity, not because it's
+  load-bearing.
+- **Static-linking surfaces OpenMP as the final executable's own link problem.** whisper's vendored
+  ggml-cpu is compiled with `-fopenmp` (its CMake found and enabled OpenMP; parakeet's ggml-cpu
+  build here does not need this) — `GOMP_barrier`/`GOMP_parallel`/`omp_get_thread_num` etc only
+  resolve at link time via the OpenMP runtime, invisible when ggml is a `.so` (resolved at `dlopen`
+  time instead) but a hard `undefined reference` when everything is static, as here. Fixed with
+  `find_package(OpenMP REQUIRED)` + linking `OpenMP::OpenMP_CXX` into `live_stt_worker_whisper`.
+  `libgomp.so.1` (the one real shared runtime dependency this leaves) is already installed in the
+  Dockerfile's `runtime` stage for the parakeet worker's benefit, so no new apt package was needed.
+
+Word-level timestamps: whisper.cpp's public API exposes per-token data
+(`whisper_full_get_token_data`, `t0`/`t1` in centiseconds, `p` = probability) but not per-word —
+`worker/session_whisper.cpp` groups BPE token pieces into words on the upstream convention (a piece
+starting with a leading space begins a new word), skipping tokens with `id >=
+whisper_token_eot(ctx)` (special/timestamp control tokens). Confidence is the mean token
+probability within each word. This is the same grouping heuristic whisper.cpp's own
+`examples/main.cpp` uses for word-level output, not an invented one.
+
+**What's proven, for real, not simulated:** the whole build chain — submodule vendored, standalone
+CMake build (`scripts/build_worker.sh`, extended for this), the new `live_stt_worker_whisper`
+target, and a full `docker build --target runtime` — all actually run, not just written; the
+resulting container's `ldd` on both worker binaries shows every dependency resolving with no
+collision between the two engines' libraries. **Two real models**, both fetched and
+sha256-verified for real against the live HF repo — `whisper-base.en-q8_0` (82MB) and
+`whisper-large-v3-turbo-q8_0` (874MB, the exact model originally requested) — were each fed the
+same real 20s speech window (`~/src/transcript/output.wav` @ 18.0s) this file's own "Serious open
+risk" entry already uses as its reference fixture, through the real compiled binary, via
+`tests/test_capi_smoke_whisper.py` (the whisper analogue of `test_capi_smoke.py`, same
+real-subprocess-over-real-IPC pattern, `worker_harness.py` now parameterized to drive either
+binary, both runs 6/6 green). `base.en` produced a correct, properly punctuated transcript ("Yes,
+absolutely. Okay, perfect. Well, yeah, I'm happy to kind of dive straight in then...") with sane,
+monotonic per-word timestamps; `large-v3-turbo` was verified the same way (word-count/monotonicity/
+expected-substring assertions all passed) but its exact transcript text wasn't separately
+eyeballed the way base.en's was. The `streaming_capable` gate (gRPC rejects, HTTP accepts) and the
+rotation-disable fix are both covered by real tests (`tests/test_servicer.py`,
+`tests/test_session.py`, `tests/test_transcribe_http.py`), and the full existing unit suite passes
+unmodified inside the real `test-unit` Docker image, confirming nothing about the parakeet path
+regressed.
+
+### GPU (CUDA) follow-up, done for real on the actual RTX 3090
+
+Whisper's CPU-only scope above was a deliberate first cut, not a limitation of the engine — CUDA
+support was added right after as a real follow-up, mirroring parakeet's own CPU-first-then-GPU
+phase split. `worker/session_whisper.cpp` now threads a real `use_gpu` flag into
+`whisper_context_params` (`cparams.use_gpu`, `cparams.gpu_device = 0`), sent through the CONFIG
+frame's `"use_gpu"` field (harmless no-op for the parakeet engine's `main.cpp`, which never reads
+it) and derived in `live_stt/session.py::_spawn_worker` from `Settings.backend == "cuda"` — the
+same one image-wide CPU/CUDA choice already used for parakeet's metrics label, not a second knob.
+
+**Three real, sequential link errors found building `worker/CMakeLists.txt`'s whisper-CUDA block
+(each one hid behind the last, the same pattern this file's parakeet CUDA notes already
+describe)** — all root-caused by the SAME underlying gap: whisper's `libggml-cuda.a` is imported
+via a plain `find_library()` + `target_link_libraries()`, which (unlike a real CMake package
+config) carries none of ggml's OWN internal link relationships forward, so every library ggml-cuda
+itself needed becomes this executable's own unresolved-symbol problem the moment it's linked
+statically instead of as a `.so` (a `.so`'s own transitive needs are resolved by the dynamic loader
+at load time instead — this is also *why* parakeet's own CUDA worker never needed any of the three
+fixes below: its ggml-cuda is shared, not static):
+1. **`cudaLaunchKernel`/`__cudaPushCallConfiguration`/`cudaStreamCreateWithFlags` undefined** — the
+   CUDA Runtime API's triple-chevron kernel-launch ABI, a different API surface than the Driver API
+   (`CUDA::cuda_driver`) parakeet's block already links. Fixed with `CUDA::cudart_static`.
+2. **`cublasCreate_v2`/`cublasSgemm_v2`/`cublasGemmStridedBatchedEx` undefined** — ggml's matmul
+   kernels dispatch to cuBLAS for GEMM rather than reimplementing it, a wholly separate CUDA-toolkit
+   library. Fixed with `CUDA::cublas_static` + `CUDA::cublasLt_static` (cuBLAS's static build splits
+   its lightweight-template-GEMM backend out separately) + `CUDA::culibos` (a small helper static lib
+   `cublas_static` itself needs).
+3. **`ncclCommInitAll`/`ncclAllReduce`/`ncclGetErrorString` undefined** — ggml's CMake defaults
+   `GGML_CUDA_NCCL=ON` whenever it finds NCCL (multi-GPU tensor-parallel collective comms), which the
+   CUDA devel image does. 10.100.0.50 is a single-GPU box (one RTX 3090, see "Ops notes"), so this is
+   dead weight, not a missing link target — fixed by disabling it at configure time
+   (`-DGGML_CUDA_NCCL=OFF`, both in `scripts/build_worker.sh` and the Dockerfile) rather than also
+   linking NCCL for a feature nothing here will ever use.
+
+**A real, caught-before-shipping image-bloat mistake**: an earlier version of the `runtime-cuda`
+stage defensively copied whisper's *whole* `build-whisper/ggml/src/` directory alongside the binary
+"in case" it needed co-located `.so`s (mirroring parakeet's own CUDA `.so`-copying necessity) — but
+once actually built and `ldd`-inspected, `live_stt_worker_whisper` turned out to need **none** of
+it: with `_static` linked throughout, its only real runtime dependencies are `libgomp.so.1` and the
+driver's `libcuda.so.1`, both resolved via the ordinary system path. That "just in case" copy was
+adding ~72MB of dead static archives (`libggml-cuda.a` alone is ~70MB) to the image for nothing —
+removed once the real `ldd` output made the mistake visible, not left in as defensive padding.
+
+**One real, unavoidable cost of the static-linking choice, worth knowing before deploying this**:
+`live_stt_worker_whisper`'s CUDA build is **~812MB**, roughly 350x its CPU-only sibling (~2.3MB) —
+`cudart_static`/`cublas_static`/`cublasLt_static` bundle a large number of precompiled GEMM kernel
+variants directly into the executable. Not a bug, but a real image-size tradeoff of "static
+everything" that a `.so`-based approach (like parakeet's own CUDA path) would not pay; not revisited
+in this pass since the resulting image still built and ran correctly, but worth remembering if image
+pull time/registry storage on a repeatedly-redeployed host ever becomes a concern.
+
+**Verified for real on the actual RTX 3090 (10.100.0.50), not assumed from a clean compile**: the
+compiled CUDA binary was extracted from the built image (`docker cp`), copied to 10.100.0.50 via
+`scp` along with the `base.en-q8_0` model and a short real-speech clip, and run inside a real
+`--gpus all` container there (reusing the already-resident, already-vetted production
+`live-stt:latest-cuda-diarize` image as the execution environment — no new base image pull needed,
+and the live compose stack/deployed container was never touched). Real log lines confirm actual GPU
+execution, not a silent CPU fallback: `ggml_cuda_init: found 1 CUDA devices (Total VRAM: 24123
+MiB): Device 0: NVIDIA GeForce RTX 3090, compute capability 8.6` and `whisper_backend_init_gpu:
+using CUDA0 backend`; the READY frame's `gpu_requested: true` confirms the Python-to-C++ wiring
+carried the flag through correctly; and the resulting transcript was byte-for-byte the same correct
+text the CPU path already produced for the same clip. Test artifacts were cleaned up from
+10.100.0.50 afterward (`rm -rf` the scratch dir) rather than left on a disk-constrained shared box.
+
+**What's NOT proven / explicitly out of scope even after this follow-up:** `n_threads_whisper=4` is
+still an unmeasured default (unrelated to CPU vs GPU). `whisper-small-q8_0`, `whisper-medium-q8_0`,
+and `whisper-large-v3-q5_0` still weren't independently fetched/smoke-tested on either backend — same
+code path as the two models that were, not itself proof. **The CUDA verification above used only
+`base.en` (82MB) for practicality (scp/bandwidth), not `large-v3-turbo` — same code path, same
+`use_gpu` wiring, not independently re-run on GPU.** VRAM behavior for the whisper engine
+specifically (peak usage, whether it fits alongside a concurrent parakeet worker and LocalAI on the
+same shared card) was not measured — the pre-existing `vram_per_worker_mb=3000`/`vram_reserve_mb=2000`
+budget (already flagged elsewhere in this file as uncalibrated guesses for parakeet) is reused
+as-is via the VRAM-admission-gap fix below, not re-tuned for whisper's actual footprint. A real
+`docker compose up`/redeploy of either the CPU or GPU whisper path to any actual host has still not
+been done — only local `docker build`/`docker run`/`ldd` checks plus the one-off manual GPU
+verification described above.
+
+### A pre-existing admission gap, closed as part of this GPU work
+
+While wiring `use_gpu` through, found that `live_stt/transcribe_http.py` — the batch HTTP endpoint,
+and (per the "batch-only" design above) whisper's **only** entry point — never checked free VRAM
+before admitting a call on a `cuda` backend, unlike `live_stt/servicer.py`'s gRPC `Transcribe`,
+which has always gated on `gpu.free_vram_mb()` before admission (a CUDA allocation failure is an
+`abort()`, not a catchable exception). This gap pre-dates whisper entirely — any HTTP-uploaded
+parakeet transcription on a CUDA backend could already bypass it — but was low-consequence while
+every registered model was parakeet-family (gRPC being the primary path). Now that whisper is
+reachable *exclusively* through this endpoint, 100% of a whisper-on-GPU deployment's traffic would
+otherwise skip the gate entirely. Fixed by adding the identical check (same `gpu.free_vram_mb()`
+call, same `vram_per_worker_mb + vram_reserve_mb` threshold, same ordering before the cheaper
+call-slot check) to `handle_transcribe_request`, covered by two new real tests
+(`tests/test_transcribe_http.py`: the reject path with VRAM patched low, and a `cpu`-backend test
+pinning that the check is skipped entirely, not merely tolerant of a `None` reading). The gRPC
+side's own reject branch remains unexercised under real contention, same documented caveat as
+before — this fix makes the two paths consistent, not the untested branch itself newly verified.
 
 ## parakeet.cpp: verified API facts and build gotchas found while building this
 
@@ -908,7 +1124,13 @@ only `[tool.pytest.ini_options]`, stdlib `logging` + `dictConfig` under a namesp
 non-propagating root logger (`stt`, not `mmn`), Python-urllib `HEALTHCHECK` (no curl in the image),
 `build.sh`/`test.sh` with the same flag shapes, `version.txt` baked at build time (`hash`,
 `timestamp`, plus `parakeet_ref` — the upstream SHA, since `PARAKEET_VERSION` is frozen at `0.0.1`
-upstream and the SHA is the only real version signal for the vendored engine).
+upstream and the SHA is the only real version signal for the vendored engine — and, since the
+whisper.cpp addition, `whisper_ref` alongside it, same reasoning. `whisper_ref` is only readable
+via `version.txt`/`live_stt/__about__.py::info()` today, unlike `parakeet_ref` — it is **not**
+threaded through `GetServerInfo`/the admin dashboard/Prometheus labels, all three of which are
+baked into the `ServerInfoResponse` proto message and would need regenerating to add a fourth
+field; extend those the same way `parakeet_ref` is wired in if this ever needs to be visible at
+runtime, not just baked into the image).
 
 Protobuf stubs are **generated, not checked in** (`live_stt/pb/`, gitignored;
 `scripts/gen_proto.sh` regenerates, invoked by `test.sh`/`build.sh`/the Dockerfile). The generated
@@ -925,6 +1147,11 @@ fixture enforces this by pointing model-ish env vars at nonexistent paths, and t
 "unit" test fails the build loudly instead of silently passing against the real thing.
 `tests/worker_harness.py` / `scripts/smoke_worker.py` are the reusable pieces for driving the real
 binary from Python in integration tests — see the fd-passing gotcha above before touching either.
+`worker_harness.py`'s `WorkerHandle` is now parameterized (`worker_bin`/`ggml_lib_dir`, both
+optional, defaulting to the original parakeet binary/lib-dir for backward compatibility) so
+`tests/test_capi_smoke_whisper.py` can drive `live_stt_worker_whisper` the same way
+`test_capi_smoke.py` drives the parakeet binary — needs `LSTT_WHISPER_MODEL_PATH`/a fetched whisper
+`.bin` the same way the parakeet test needs `LSTT_MODEL_PATH`/a fetched GGUF.
 
 ## Ops notes
 
@@ -1046,3 +1273,19 @@ binary from Python in integration tests — see the fd-passing gotcha above befo
    re-run is owed before trusting long CUDA calls without rotation; (c) CUDA graph capture appears
    to re-warm per ~160ms chunk (cost unmeasured) and the `LSTT_CUDA_GRAPHS=0` escape hatch is not
    implemented. Not started at all: a VAD to synthesize turn boundaries for the no-`<EOU>` model.
+6. **whisper.cpp, a second batch-only engine — CPU AND CUDA, both built and verified for real
+   (CUDA on the actual RTX 3090), not yet deployed anywhere.** See "Second engine: whisper.cpp" and
+   its "GPU (CUDA) follow-up" subsection above for the full writeup: real submodule, real second
+   worker binary, real `docker build --target runtime`/`runtime-cuda`, real models transcribing real
+   speech correctly through the real compiled binaries on both backends (CUDA confirmed via actual
+   `ggml_cuda_init`/`whisper_backend_init_gpu: using CUDA0 backend` log lines on 10.100.0.50, not
+   assumed from a clean compile), the `streaming_capable` gRPC-reject/HTTP-accept gate and the
+   rotation-disable correctness fix both covered by real tests, a pre-existing HTTP-endpoint
+   VRAM-admission gap found and fixed along the way, full existing unit suite unaffected. Not done:
+   a Gate-B-style thread sweep for `n_threads_whisper`, independent verification of the three
+   whisper sizes that weren't directly smoke-tested on either backend (`small`/`medium`/
+   `large-v3-q5_0` — same code path as the ones that were, not itself proof), GPU verification of
+   `large-v3-turbo` specifically (only `base.en` was run on the real GPU, for scp/bandwidth
+   practicality), whisper-specific VRAM measurement/calibration, and any actual deployment (built
+   and verified locally/via a one-off manual GPU check; nothing pushed to a registry, added to
+   `docker-compose.yml`, or run as part of the real compose stack on a real host).

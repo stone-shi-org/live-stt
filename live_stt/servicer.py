@@ -151,6 +151,24 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
                 await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
                 return
 
+            # Batch-only engines (whisper) have no genuine incremental
+            # streaming state -- see live_stt/models.py's docstring -- so
+            # they are rejected here, before any worker is ever spawned,
+            # rather than being allowed to silently degrade into a
+            # half-working "streams, but only ever emits one big delta at
+            # the end" experience over this RPC. They remain reachable via
+            # POST /v1/audio/transcriptions (live_stt/transcribe_http.py),
+            # which is already engine-agnostic.
+            if not spec.streaming_capable:
+                metrics.stream_init_failures_total.labels(reason="bad_config").inc()
+                outcome = "invalid_argument"
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"model {spec.key!r} is batch-only (no incremental streaming support); "
+                    "use POST /v1/audio/transcriptions instead of the Transcribe RPC",
+                )
+                return
+
             session = CallSession(self._settings, spec, config, self._budget)
             try:
                 ready_event = await session.start()

@@ -95,6 +95,7 @@ class WorkerHandle:
         language: str,
         n_threads: int,
         ggml_lib_dir: Path | None = None,
+        use_gpu: bool = False,
     ) -> "WorkerHandle":
         parent_sock, child_sock = socket.socketpair()
         child_fd = child_sock.fileno()
@@ -119,8 +120,21 @@ class WorkerHandle:
         reader, writer = await asyncio.open_connection(sock=parent_sock)
 
         handle = cls(proc, reader, writer)
+        # use_gpu is only meaningful to the whisper engine's main_whisper.cpp
+        # (see session_whisper.hpp's comment on why parakeet's CPU-vs-CUDA
+        # choice is a build-time/binary one, not a per-load flag) -- sent
+        # unconditionally anyway, since it's a harmless extra key the
+        # parakeet engine's main.cpp simply never reads. Keeps this spawn()
+        # call engine-agnostic; the caller (live_stt/session.py) decides the
+        # value from Settings.backend regardless of which binary it's about
+        # to exec.
         config = json.dumps(
-            {"gguf_path": gguf_path, "language": language, "n_threads": n_threads}
+            {
+                "gguf_path": gguf_path,
+                "language": language,
+                "n_threads": n_threads,
+                "use_gpu": use_gpu,
+            }
         )
         try:
             # The write+drain must be in the SAME try as the read: a worker

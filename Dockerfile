@@ -45,6 +45,91 @@ RUN --mount=type=cache,target=/build,id=live-stt-parakeet-build-cpu \
     # stages later, discovered by actually building this.
     && cp -a /build/parakeet/third_party/ggml/src/libggml*.so* /out/lib/
 
+# ---- stage: whisper.cpp, built STANDALONE (batch-only second engine) ------
+# Same two-step reasoning as parakeet.cpp above -- kept symmetric even
+# though whisper.cpp's own CMakeLists.txt is actually safe to nest (it
+# correctly guards its CMAKE_SOURCE_DIR-relative paths, unlike parakeet.cpp's
+# unguarded ones -- see worker/CMakeLists.txt's comment on this block).
+# CPU only, no CUDA variant of this stage -- see CLAUDE.md, whisper on CUDA
+# is a later phase.
+#
+# -DBUILD_SHARED_LIBS=OFF here produces something DIFFERENT from parakeet's
+# stage above, verified by actually building it: whisper.cpp's vendored ggml
+# (a different pin from parakeet.cpp's own vendored copy) goes fully STATIC
+# (.a, no .so at all), where parakeet's ggml builds shared regardless of
+# PARAKEET_SHARED. So there is no /out/lib .so-copying dance needed here --
+# just the two static archives worker/CMakeLists.txt expects at
+# build-whisper/src/libwhisper.a and build-whisper/ggml/src/libggml*.a.
+FROM python:3.12-slim AS whisper-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git bash ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src/live-stt-worker
+COPY worker/third_party/whisper.cpp/ third_party/whisper.cpp/
+RUN --mount=type=cache,target=/build,id=live-stt-whisper-build-cpu \
+    cmake -S third_party/whisper.cpp -B /build/whisper \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DWHISPER_BUILD_EXAMPLES=OFF \
+        -DWHISPER_BUILD_SERVER=OFF \
+        -DWHISPER_BUILD_TESTS=OFF \
+        -DGGML_NATIVE=OFF \
+        -DGGML_AVX2=ON \
+        -DGGML_FMA=ON \
+        -DGGML_F16C=ON \
+    && cmake --build /build/whisper -j"$(nproc)" \
+    && mkdir -p /out/lib \
+    && cp /build/whisper/src/libwhisper.a /out/ \
+    && cp /build/whisper/ggml/src/libggml*.a /out/lib/
+
+# ---- stage: whisper.cpp, CUDA build (Phase 6) ------------------------------
+# Same sm_86 target as parakeet's CUDA stage below -- see that stage's
+# comment for the real (not speculated) GPU identity this targets.
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS whisper-build-cuda
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git bash ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src/live-stt-worker
+COPY worker/third_party/whisper.cpp/ third_party/whisper.cpp/
+RUN --mount=type=cache,target=/build,id=live-stt-whisper-build-cuda \
+    cmake -S third_party/whisper.cpp -B /build/whisper \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DWHISPER_BUILD_EXAMPLES=OFF \
+        -DWHISPER_BUILD_SERVER=OFF \
+        -DWHISPER_BUILD_TESTS=OFF \
+        -DGGML_NATIVE=OFF \
+        -DGGML_AVX2=ON \
+        -DGGML_FMA=ON \
+        -DGGML_F16C=ON \
+        -DGGML_CUDA=ON \
+        "-DCMAKE_CUDA_ARCHITECTURES=86" \
+        # NCCL (multi-GPU tensor-parallel comm) is ON by default whenever
+        # ggml's CMake finds it, which this devel image does -- linked into
+        # ggml-cuda via ITS OWN internal target_link_libraries call, which
+        # (like cudart/cublas below) doesn't transfer through
+        # worker/CMakeLists.txt's plain find_library()-based import, so the
+        # final executable's link fails on "undefined reference to
+        # `ncclCommInitAll'" without this. 10.100.0.50 is single-GPU (see
+        # CLAUDE.md) -- disabled rather than also linking NCCL for a
+        # feature this never needs. Found by actually linking it.
+        -DGGML_CUDA_NCCL=OFF \
+    && cmake --build /build/whisper -j"$(nproc)" \
+    && mkdir -p /out/lib \
+    && cp /build/whisper/src/libwhisper.a /out/ \
+    && cp /build/whisper/ggml/src/libggml*.a /out/lib/ \
+    # ggml-cuda may land one directory deeper (ggml/src/ggml-cuda/), exactly
+    # like parakeet's CUDA backend below -- and, unlike the CPU-only whisper
+    # build, may not be a plain .a here (nvcc-compiled CUDA code doesn't
+    # always follow BUILD_SHARED_LIBS=OFF as cleanly as pure C/C++ -- see
+    # worker/CMakeLists.txt's comment on this). Copy whatever actually
+    # exists in both plausible locations, .a or .so*, rather than assuming
+    # one shape -- find handles "doesn't exist" gracefully where a bare cp
+    # with a non-matching glob would just silently no-op (the exact failure
+    # mode parakeet's own CUDA stage hit and documented below).
+    && find /build/whisper/ggml/src -maxdepth 2 \( -name 'libggml-cuda.a' -o -name 'libggml-cuda.so*' \) \
+        -exec cp -a {} /out/lib/ \;
+
 # ---- stage: parakeet.cpp, CUDA build (Phase 5) -----------------------------
 # sm_86 -- Ampere, the VERIFIED GPU on 10.100.0.50 (an RTX 3090, confirmed via
 # nvidia-smi over SSH; NOT the RTX 5090/Blackwell an earlier draft of this
@@ -87,26 +172,38 @@ RUN --mount=type=cache,target=/build,id=live-stt-parakeet-build-cuda \
     && cp -a /build/parakeet/third_party/ggml/src/ggml-cuda/libggml-cuda.so* /out/lib/
 
 # ---- stage: the C++ worker, linked against the artifacts above ------------
+# Builds BOTH live_stt_worker (parakeet) and live_stt_worker_whisper
+# (whisper) in one `cmake --build` -- they are two targets of the same
+# worker/CMakeLists.txt project. libgomp1 is needed here too (not just in
+# runtime) because CMake's find_package(OpenMP) probes for a working
+# compiler+runtime pair at CONFIGURE time, not just link time.
 FROM python:3.12-slim AS worker-build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake \
+        build-essential cmake libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src/live-stt-worker
 COPY worker/ ./worker/
 COPY --from=parakeet-build /out/libparakeet.a worker/build-parakeet/libparakeet.a
 COPY --from=parakeet-build /out/lib/ worker/build-parakeet/third_party/ggml/src/
+COPY --from=whisper-build /out/libwhisper.a worker/build-whisper/src/libwhisper.a
+COPY --from=whisper-build /out/lib/ worker/build-whisper/ggml/src/
 RUN cd worker && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build -j"$(nproc)"
 
 # ---- stage: the C++ worker, CUDA build -------------------------------------
+# Builds BOTH CUDA binaries now (Phase 6 added the whisper half) -- libgomp1
+# added for the same find_package(OpenMP) configure-time probe reason as the
+# CPU worker-build stage above.
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS worker-build-cuda
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake \
+        build-essential cmake libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src/live-stt-worker
 COPY worker/ ./worker/
 COPY --from=parakeet-build-cuda /out/libparakeet.a worker/build-parakeet/libparakeet.a
 COPY --from=parakeet-build-cuda /out/lib/ worker/build-parakeet/third_party/ggml/src/
+COPY --from=whisper-build-cuda /out/libwhisper.a worker/build-whisper/src/libwhisper.a
+COPY --from=whisper-build-cuda /out/lib/ worker/build-whisper/ggml/src/
 RUN cd worker && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build -j"$(nproc)"
 
@@ -146,11 +243,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=worker-build /src/live-stt-worker/worker/build/live_stt_worker /app/worker/live_stt_worker
 COPY --from=worker-build /src/live-stt-worker/worker/build-parakeet/third_party/ggml/src/*.so* /app/worker/
+# live_stt_worker_whisper is a single self-contained static executable (see
+# worker/CMakeLists.txt's whisper block -- its vendored ggml links fully
+# static, unlike parakeet's) -- no .so's to copy alongside it. Placed in its
+# own subdirectory for clarity/symmetry with the parakeet layout above, not
+# because collision avoidance is load-bearing here (there is nothing to
+# collide with). libgomp1 (its one real shared dependency, OpenMP) is
+# already installed just below for the parakeet worker's benefit.
+COPY --from=worker-build /src/live-stt-worker/worker/build/live_stt_worker_whisper /app/worker/whisper/live_stt_worker_whisper
 COPY --from=proto-build /app/live_stt/pb/ /app/live_stt/pb/
 COPY live_stt/ ./live_stt/
 COPY run.py version.txt* ./
 
 ENV LSTT_WORKER_BIN=/app/worker/live_stt_worker \
+    LSTT_WORKER_BIN_WHISPER=/app/worker/whisper/live_stt_worker_whisper \
     LSTT_BACKEND=cpu \
     LSTT_GRPC_HOST=0.0.0.0 \
     LSTT_GRPC_PORT=50051 \
@@ -194,6 +300,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # despite the file sitting right next to the binary, until this was set.
     # Not needed on the CPU image: CPU-only libggml.so has no CUDA backend to
     # need, so this class of transitive lookup never arises there.
+    #
+    # /app/worker/whisper is NOT needed here, unlike the comment above might
+    # suggest before this was actually built -- confirmed by ldd against the
+    # real compiled artifact: live_stt_worker_whisper links `_static` CUDA
+    # toolkit libraries (cudart_static/cublas_static/cublasLt_static, see
+    # worker/CMakeLists.txt) and its own ggml-cuda.a fully statically, so its
+    # ONLY runtime dependencies are libgomp.so.1 and the real driver's
+    # libcuda.so.1 -- neither co-located, both resolved via the system
+    # library path already. Left out of LD_LIBRARY_PATH rather than added
+    # defensively, now that this is known rather than assumed.
     LD_LIBRARY_PATH=/app/worker
 WORKDIR /app
 COPY requirements.txt .
@@ -202,11 +318,20 @@ RUN pip install --no-cache-dir --break-system-packages -r requirements.txt \
 
 COPY --from=worker-build-cuda /src/live-stt-worker/worker/build/live_stt_worker /app/worker/live_stt_worker
 COPY --from=worker-build-cuda /src/live-stt-worker/worker/build-parakeet/third_party/ggml/src/*.so* /app/worker/
+# live_stt_worker_whisper (Phase 6, CUDA): confirmed via ldd (see the
+# LD_LIBRARY_PATH comment above) to be fully self-contained -- no .a/.so
+# from build-whisper/ggml/src/ needs to ship alongside it at all. An
+# earlier version of this copied that whole directory "just in case",
+# which turned out to add ~72MB of genuinely unused static archives
+# (libggml-cuda.a alone is ~70MB) to the image for nothing -- caught by
+# actually inspecting the built image's contents, not assumed safe to skip.
+COPY --from=worker-build-cuda /src/live-stt-worker/worker/build/live_stt_worker_whisper /app/worker/whisper/live_stt_worker_whisper
 COPY --from=proto-build /app/live_stt/pb/ /app/live_stt/pb/
 COPY live_stt/ ./live_stt/
 COPY run.py version.txt* ./
 
 ENV LSTT_WORKER_BIN=/app/worker/live_stt_worker \
+    LSTT_WORKER_BIN_WHISPER=/app/worker/whisper/live_stt_worker_whisper \
     LSTT_BACKEND=cuda \
     LSTT_GRPC_HOST=0.0.0.0 \
     LSTT_GRPC_PORT=50051 \

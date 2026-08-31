@@ -32,6 +32,11 @@ def _offline_safety(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LSTT_MODELS_DIR", "/nonexistent-lstt-model-dir")
     monkeypatch.setenv("LSTT_ALLOW_PII", "false")
     monkeypatch.delenv("LSTT_MODEL_PATH", raising=False)
+    # Same reasoning as LSTT_MODEL_PATH above, for the whisper engine's own
+    # binary path (live_stt/config.py's worker_bin_whisper) -- a dev host
+    # that happens to have a real one built at the default path must not
+    # let a "unit" test accidentally exercise it.
+    monkeypatch.delenv("LSTT_WORKER_BIN_WHISPER", raising=False)
     # A real HF token lives in this dev host's shell env (~/.secrets/huggingface.env,
     # sourced from .zshenv -- see CLAUDE.md) so ad-hoc diarization runs don't need
     # it typed in. Settings(_env_file=None) only skips the .env FILE, not real

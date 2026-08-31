@@ -60,7 +60,7 @@ import uuid
 import wave
 from typing import Any
 
-from live_stt import models
+from live_stt import gpu, metrics, models
 from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
 from live_stt.logging_config import get_logger
@@ -210,6 +210,30 @@ async def handle_transcribe_request(
     stream = fields.get("stream", b"false").decode("utf-8", "replace").strip().lower() == "true"
     language_field = fields.get("language")
     language = language_field.decode("utf-8", "replace") if language_field else None
+
+    # A pre-existing gap, closed here: live_stt/servicer.py's gRPC Transcribe
+    # has always checked free VRAM before admitting a call on a cuda
+    # backend (a CUDA allocation failure is an abort(), not a catchable
+    # exception -- see CLAUDE.md), but this HTTP endpoint never did, even
+    # though it spawns the exact same kind of worker process through the
+    # exact same CallSession/WorkerHandle path. Harmless while every
+    # registered model was parakeet-family and CPU-heavy HTTP traffic was
+    # presumably rare, but now that the whisper family (Phase 6's CUDA
+    # addition) is reachable ONLY through this endpoint, 100% of a
+    # whisper-on-GPU deployment's traffic would otherwise bypass this gate
+    # entirely. Mirrors servicer.py's check exactly, including running it
+    # before the cheaper call-slot check below.
+    if settings.backend == "cuda":
+        free = gpu.free_vram_mb()
+        if free is not None:
+            metrics.gpu_free_vram_mb.set(free)
+        required = settings.vram_per_worker_mb + settings.vram_reserve_mb
+        if free is not None and free < required:
+            return (
+                503,
+                _err(f"insufficient VRAM: {free}MB free, {required}MB required"),
+                "application/json",
+            )
 
     if not budget.try_admit_call():
         return 503, _err("at capacity, try again shortly"), "application/json"

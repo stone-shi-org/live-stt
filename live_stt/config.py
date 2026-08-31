@@ -37,6 +37,17 @@ class Settings(BaseSettings):
     worker_bin: str = "/app/worker/live_stt_worker"
     worker_ggml_lib_dir: str | None = None
 
+    # The whisper engine's own binary/lib-dir pair, parallel to the two
+    # fields above -- see live_stt/session.py's _spawn_worker, which picks
+    # between this pair and the one above by ModelSpec.engine.
+    # live_stt_worker_whisper is a self-contained static executable (its
+    # vendored ggml links fully static, unlike parakeet's -- verified by
+    # actually building it, see worker/CMakeLists.txt), so
+    # worker_ggml_lib_dir_whisper is expected to stay None even in
+    # native/dev use, unlike worker_ggml_lib_dir above.
+    worker_bin_whisper: str = "/app/worker/whisper/live_stt_worker_whisper"
+    worker_ggml_lib_dir_whisper: str | None = None
+
     # tools/thread_sweep.py (Phase 1 Gate B), measured on THIS repo's 6-core
     # dev host, single-stream-at-a-time (not concurrent -- see CLAUDE.md's
     # caveat about contention): n_threads=1 gave rtfx=2.48 and, because
@@ -46,6 +57,14 @@ class Settings(BaseSettings):
     # multi-threaded ones. Re-run the sweep on the actual deployment box --
     # these numbers are dev-host-only and not a production capacity signal.
     n_threads_per_worker: int = 1
+    # UNMEASURED -- no Gate-B-style sweep has been run for whisper. The
+    # reasoning above (favor many single-threaded workers) was specific to
+    # Parakeet's persistent per-call STREAM; whisper's worker is a one-shot
+    # batch job per HTTP request, where per-call latency (favoring more
+    # threads on the one job) plausibly matters more than aggregate
+    # multi-stream throughput -- but that's a hypothesis, not a measurement.
+    # Revisit with a real sweep before trusting this default under load.
+    n_threads_whisper: int = 4
     max_concurrent_calls: int = 3
     # Admission always reserves this many slots so a mid-call rotation has
     # somewhere to put its overlap shadow. Never hand the reserve to a call.
