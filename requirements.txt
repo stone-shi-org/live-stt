@@ -1,11 +1,25 @@
-grpcio>=1.76.0
-# grpcio ships a large C++ extension; cp314 wheel coverage is thin as of this
-# writing (host python is 3.14) and building it from source takes 15-25 min on
-# 6 cores. The runtime/test-unit Docker images pin python:3.12-slim precisely
-# to avoid this -- see build.sh's setup_venv() for the native-venv fallback.
-grpcio-tools>=1.76.0
-grpcio-health-checking>=1.76.0
-grpcio-reflection>=1.76.0
+# Pinned to the SAME exact version across all four grpc packages below --
+# NOT independent >=1.76.0 floors, which is what this repo shipped with
+# until it broke a real deployment. Root cause, confirmed on 10.100.0.50's
+# runtime-cuda container: scripts/gen_proto.sh's grpc_tools.protoc bakes a
+# version floor into every generated *_pb2_grpc.py, checked against the
+# INSTALLED grpcio runtime at import time -- "RuntimeError: The grpc package
+# installed is at version 1.83.0, but the generated code ... depends on
+# grpcio>=1.83.1". grpcio and grpcio-tools are sibling packages from the
+# same grpc project but are NOT always published to PyPI in the same
+# instant, so an unpinned `pip install` can resolve grpcio-tools to a
+# version whose generated-code floor the SAME install's grpcio doesn't
+# satisfy -- a real, live-reproduced version-skew, not a hypothetical one.
+# Bump all four together when upgrading; never let grpcio-tools drift ahead
+# of grpcio again. grpcio ships a large C++ extension; cp314 wheel coverage
+# is thin as of this writing (host python is 3.14) and building it from
+# source takes 15-25 min on 6 cores. The runtime/test-unit Docker images pin
+# python:3.12-slim precisely to avoid this -- see build.sh's setup_venv()
+# for the native-venv fallback.
+grpcio==1.83.1
+grpcio-tools==1.83.1
+grpcio-health-checking==1.83.1
+grpcio-reflection==1.83.1
 protobuf>=5.28.0
 pydantic-settings>=2.0.0
 # mu-law/A-law LUT decode + 8k resample + RMS-for-backpressure. Deliberately
