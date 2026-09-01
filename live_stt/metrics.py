@@ -76,6 +76,15 @@ diarization_requests_total = Counter(
     "Completed diarization HTTP requests",
     ["outcome"],  # ok|failed|rejected_vram
 )
+transcribe_sessions_active = Gauge(
+    "live_stt_transcribe_sessions_active",
+    "Batch transcription HTTP requests (POST /v1/audio/transcriptions) currently running",
+)
+transcribe_requests_total = Counter(
+    "live_stt_transcribe_requests_total",
+    "Completed batch transcription HTTP requests",
+    ["outcome"],  # ok|failed|rejected_vram|rejected_capacity
+)
 
 
 def set_build_info(

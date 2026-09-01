@@ -31,6 +31,8 @@ EXPECTED_METRICS = {
     "live_stt_gpu_free_vram_mb",
     "live_stt_diarization_sessions_active",
     "live_stt_diarization_requests_total",
+    "live_stt_transcribe_sessions_active",
+    "live_stt_transcribe_requests_total",
 }
 
 
@@ -157,6 +159,16 @@ async def test_stats_web_page_endpoint() -> None:
                 assert 'id="cfgDiarizationModel"' in html_body
                 # Live "what's running right now" table for diarization.
                 assert 'id="diarizeActiveTbody"' in html_body
+                # Batch transcript (POST /v1/audio/transcriptions) cards +
+                # live table -- the direct analogue of the diarization ones.
+                assert 'id="valTranscribeActive"' in html_body
+                assert 'id="valTranscribeTotals"' in html_body
+                assert 'id="transcribeActiveTbody"' in html_body
+                # Supported Models by Service section (Live Call / Batch
+                # Transcript / Diarization), driven by /v1/models.
+                assert 'id="svcLiveCallTbody"' in html_body
+                assert 'id="svcTranscriptTbody"' in html_body
+                assert 'id="svcDiarizationTbody"' in html_body
     finally:
         server.shutdown()
 
@@ -214,6 +226,45 @@ async def test_stats_json_endpoint_includes_gpu_and_diarization() -> None:
             "rejected_vram_total": 0,
             "active_requests": [],
         }
+        # transcribe_sessions (live_stt/transcribe_sessions.py) -- same
+        # fresh-zero-state shape, plus rejected_capacity_total (this path
+        # has a WorkerBudget capacity gate diarization doesn't).
+        assert doc["transcribe"] == {
+            "active": 0,
+            "completed_total": 0,
+            "failed_total": 0,
+            "rejected_vram_total": 0,
+            "rejected_capacity_total": 0,
+            "active_requests": [],
+        }
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stats_json_endpoint_reflects_an_in_flight_transcribe_request() -> None:
+    import json
+
+    settings = Settings(_env_file=None)
+    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+
+        request_id = state.transcribe_sessions.start(model="whisper-base.en-q8_0")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=5) as resp:
+            doc = json.loads(resp.read().decode())
+        active_requests = doc["transcribe"]["active_requests"]
+        assert len(active_requests) == 1
+        assert active_requests[0]["id"] == request_id
+        assert active_requests[0]["model"] == "whisper-base.en-q8_0"
+        assert active_requests[0]["elapsed_sec"] >= 0
+
+        state.transcribe_sessions.finish(request_id, ok=True)
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=5) as resp:
+            doc = json.loads(resp.read().decode())
+        assert doc["transcribe"]["active_requests"] == []
+        assert doc["transcribe"]["completed_total"] == 1
     finally:
         server.shutdown()
 
@@ -272,7 +323,17 @@ async def test_v1_models_endpoint_lists_asr_and_diarization_models() -> None:
             assert entry["model_chunk_ms"] == spec.model_chunk_ms
             assert entry["has_eou"] == spec.has_eou
             assert entry["default"] == (key == settings.default_model)
+            # engine/streaming_capable -- added for the whisper.cpp support
+            # matrix on the admin dashboard (Supported Models by Service).
+            assert entry["engine"] == spec.engine
+            assert entry["streaming_capable"] == spec.streaming_capable
         assert sum(e["default"] for e in by_id.values() if e["type"] == "asr") == 1
+        # At least one streaming-capable (parakeet family) and one
+        # batch-only (whisper family) model registered -- pins that the
+        # split this dashboard section relies on is real, not vacuous.
+        asr_entries = [e for e in by_id.values() if e["type"] == "asr"]
+        assert any(e["streaming_capable"] is True for e in asr_entries)
+        assert any(e["streaming_capable"] is False for e in asr_entries)
 
         # Every diarization model in the registry is present too, typed
         # correctly, with exactly one marked default.

@@ -680,6 +680,41 @@ in `configure()` and there is no loop anywhere near it.
   no-hint fake model never receiving `num_speakers=` even when `diarization_num_speakers` is
   configured. **What's NOT proven:** not yet redeployed to 10.100.0.50 — same status as the
   VRAM-gate/dashboard/release-fix work above, all still sitting in throwaway test containers.
+- **Batch transcript request visibility on the admin dashboard (`live_stt/transcribe_sessions.py`,
+  `TranscribeSessionTracker`) + a per-service supported-models matrix — unit-tested and verified
+  against a real running admin server, not yet redeployed.** Closes a real visibility gap: batch
+  transcription (`POST /v1/audio/transcriptions`) spawns a worker through the same `WorkerBudget`
+  every gRPC `Transcribe` call uses, so `active_calls` on its own could never distinguish "a live
+  call" from "a batch HTTP request" — exactly the problem `DiarizationSessionTracker`
+  (`live_stt/diarize_sessions.py`) already solved for diarization, mirrored here almost exactly:
+  same aggregate-counters-plus-small-live-list shape, same "deliberate, narrow exception to no
+  session registry" contract, wired into `transcribe_http.py` at the same points
+  `diarize_http.py` already uses (`start()`/`finish()` around the real work, plus two rejection
+  counters this path has and diarization doesn't — `rejected_vram_total` AND
+  `rejected_capacity_total`, since batch transcription has both a VRAM gate and a `WorkerBudget`
+  capacity gate, where diarization only has the former). New Prometheus metrics
+  (`live_stt_transcribe_sessions_active`, `live_stt_transcribe_requests_total{outcome}`), a new
+  `/api/stats["transcribe"]` key, and matching dashboard cards + an "Active Transcript Requests"
+  table (ID/elapsed/model), all direct analogues of the existing diarization ones. Separately,
+  `/v1/models`' ASR entries gained `engine`/`streaming_capable` fields (already real fields on
+  `ModelSpec`, just not previously exposed over HTTP), feeding a new "Supported Models by Service"
+  dashboard section that answers, per service, which models it actually accepts: **Live Call
+  (gRPC `Transcribe`)** — only `streaming_capable=True` models (parakeet family; the RPC rejects
+  the rest with `INVALID_ARGUMENT`, see `live_stt/servicer.py`); **Batch Transcript (HTTP)** — every
+  registered ASR model, parakeet and whisper alike, since that endpoint is engine-agnostic;
+  **Diarization (HTTP)** — the separate `diarization_models` registry. Derived from real `/v1/models`
+  data client-side, not a second hardcoded list that could drift from the actual registries.
+  **What's proven:** a new `tests/test_transcribe_sessions.py` (mirrors
+  `tests/test_diarize_sessions.py`'s coverage, including thread-safety under concurrent
+  start/finish), extended `tests/test_transcribe_http.py` cases asserting the tracker's
+  active/completed/failed/rejected counts move correctly around the real `CallSession` path, and
+  extended `tests/test_metrics.py` covering the new `/api/stats` shape, an in-flight
+  transcribe-request snapshot, the two new HTML element-id markers, and the new `/v1/models`
+  fields — plus a real manual run against a live `serve_admin_http()` instance (not just the test
+  suite) confirming `/api/stats`, `/v1/models`, and the dashboard HTML all wire together correctly
+  end to end. **What's NOT proven:** the dashboard's actual rendering in a real browser (same
+  long-standing caveat the original diarization dashboard cards carry); not yet redeployed
+  anywhere.
 - **whisper.cpp, a second batch-only transcription engine (`live_stt_worker_whisper`,
   `worker/session_whisper.{hpp,cpp}`, `worker/main_whisper.cpp`) — built, linked, and verified for
   real on BOTH CPU and CUDA (the real RTX 3090), against real models and real speech; not yet

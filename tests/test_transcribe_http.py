@@ -25,6 +25,7 @@ from live_stt import transcribe_http
 from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
 from live_stt.pb.livestt.v1 import asr_pb2
+from live_stt.transcribe_sessions import TranscribeSessionTracker
 
 FAKE_WORKER = Path(__file__).resolve().parent / "fakes" / "fake_worker_main.py"
 
@@ -68,6 +69,10 @@ def _settings(**overrides) -> Settings:
 
 def _budget(max_concurrent_calls: int = 3, reserve_slots: int = 1) -> WorkerBudget:
     return WorkerBudget(max_concurrent_calls, reserve_slots)
+
+
+def _tracker() -> TranscribeSessionTracker:
+    return TranscribeSessionTracker()
 
 
 class TestPcm16MonoFromWav:
@@ -129,7 +134,7 @@ class TestHandleTranscribeRequestValidation:
     @pytest.mark.asyncio
     async def test_draining_is_503(self):
         status, body, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=b"", settings=_settings(), budget=_budget(), draining=True
+            content_type=CONTENT_TYPE, body=b"", settings=_settings(), budget=_budget(), draining=True, tracker=_tracker()
         )
         assert status == 503
         assert "draining" in json.loads(body)["error"]["message"]
@@ -138,7 +143,7 @@ class TestHandleTranscribeRequestValidation:
     async def test_missing_file_is_400(self):
         body = _multipart_body({"model": "realtime_eou_120m-v1"})
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False, tracker=_tracker()
         )
         assert status == 400
         assert "file" in json.loads(resp)["error"]["message"]
@@ -147,7 +152,7 @@ class TestHandleTranscribeRequestValidation:
     async def test_bad_wav_is_400(self):
         body = _multipart_body({}, file_field="file", file_bytes=b"not a wav")
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False, tracker=_tracker()
         )
         assert status == 400
 
@@ -155,7 +160,7 @@ class TestHandleTranscribeRequestValidation:
     async def test_unknown_model_is_400(self):
         body = _multipart_body({"model": "not-a-real-model"}, file_field="file", file_bytes=_wav_bytes())
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False, tracker=_tracker()
         )
         assert status == 400
         assert "not-a-real-model" in json.loads(resp)["error"]["message"]
@@ -166,7 +171,7 @@ class TestHandleTranscribeRequestValidation:
             {"response_format": "srt"}, file_field="file", file_bytes=_wav_bytes()
         )
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False, tracker=_tracker()
         )
         assert status == 400
         assert "response_format" in json.loads(resp)["error"]["message"]
@@ -175,11 +180,14 @@ class TestHandleTranscribeRequestValidation:
     async def test_at_capacity_is_503(self):
         body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes())
         exhausted = _budget(max_concurrent_calls=0, reserve_slots=0)
+        tracker = _tracker()
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=exhausted, draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=exhausted, draining=False, tracker=tracker
         )
         assert status == 503
         assert "capacity" in json.loads(resp)["error"]["message"]
+        assert tracker.rejected_capacity_total == 1
+        assert tracker.active == 0
 
     @pytest.mark.asyncio
     async def test_insufficient_vram_on_cuda_backend_is_503(self, monkeypatch: pytest.MonkeyPatch):
@@ -189,15 +197,19 @@ class TestHandleTranscribeRequestValidation:
         # CallSession/WorkerHandle path, and is whisper's ONLY entry point.
         monkeypatch.setattr(transcribe_http.gpu, "free_vram_mb", lambda: 100)
         body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes())
+        tracker = _tracker()
         status, resp, ct = await transcribe_http.handle_transcribe_request(
             content_type=CONTENT_TYPE,
             body=body,
             settings=_settings(backend="cuda", vram_per_worker_mb=3000, vram_reserve_mb=2000),
             budget=_budget(),
             draining=False,
+            tracker=tracker,
         )
         assert status == 503
         assert "VRAM" in json.loads(resp)["error"]["message"]
+        assert tracker.rejected_vram_total == 1
+        assert tracker.active == 0
 
     @pytest.mark.asyncio
     async def test_vram_check_is_a_noop_on_cpu_backend(self, monkeypatch: pytest.MonkeyPatch):
@@ -216,7 +228,7 @@ class TestHandleTranscribeRequestValidation:
         monkeypatch.setattr(self_patch_module, "_run_transcription", fake_run)
         body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes())
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(backend="cpu"), budget=_budget(), draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(backend="cpu"), budget=_budget(), draining=False, tracker=_tracker()
         )
         assert status == 200
 
@@ -237,7 +249,7 @@ class TestHandleTranscribeRequestResponses:
         self._patch(monkeypatch)
         body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes())
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False, tracker=_tracker()
         )
         assert status == 200
         assert ct == "application/json"
@@ -250,7 +262,7 @@ class TestHandleTranscribeRequestResponses:
             {"response_format": "verbose_json", "language": "en-US"}, file_field="file", file_bytes=_wav_bytes()
         )
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False, tracker=_tracker()
         )
         doc = json.loads(resp)
         assert status == 200
@@ -267,7 +279,7 @@ class TestHandleTranscribeRequestResponses:
         self._patch(monkeypatch, text="a full transcript")
         body = _multipart_body({"stream": "true"}, file_field="file", file_bytes=_wav_bytes())
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False, tracker=_tracker()
         )
         assert status == 200
         assert ct == "text/event-stream"
@@ -287,7 +299,7 @@ class TestHandleTranscribeRequestResponses:
         monkeypatch.setattr(transcribe_http, "_run_transcription", fake_run)
         body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes())
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False, tracker=_tracker()
         )
         assert status == 503
 
@@ -299,7 +311,7 @@ class TestHandleTranscribeRequestResponses:
         monkeypatch.setattr(transcribe_http, "_run_transcription", fake_run)
         body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes())
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False, tracker=_tracker()
         )
         assert status == 500
 
@@ -309,7 +321,7 @@ class TestHandleTranscribeRequestResponses:
         budget = _budget(max_concurrent_calls=1, reserve_slots=0)
         body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes())
         await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=budget, draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=budget, draining=False, tracker=_tracker()
         )
         assert budget.active_calls == 0
 
@@ -318,7 +330,7 @@ class TestHandleTranscribeRequestResponses:
 
         monkeypatch.setattr(transcribe_http, "_run_transcription", fake_run_raises)
         await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=budget, draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=budget, draining=False, tracker=_tracker()
         )
         assert budget.active_calls == 0
 
@@ -336,12 +348,14 @@ class TestRealCallSessionIntegration:
         os.environ["FAKE_WORDS_PER_SEC"] = "50"
         try:
             body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes(n_frames=2560))
+            tracker = _tracker()
             status, resp, ct = await transcribe_http.handle_transcribe_request(
                 content_type=CONTENT_TYPE,
                 body=body,
                 settings=_settings(),
                 budget=_budget(),
                 draining=False,
+                tracker=tracker,
             )
         finally:
             os.environ.pop("FAKE_WORDS_PER_SEC", None)
@@ -349,6 +363,9 @@ class TestRealCallSessionIntegration:
         assert status == 200
         doc = json.loads(resp)
         assert doc["text"]  # the fake worker emitted synthetic words
+        assert tracker.active == 0  # finished, not leaked
+        assert tracker.completed_total == 1
+        assert tracker.failed_total == 0
 
     @pytest.mark.asyncio
     async def test_unknown_model_never_spawns_a_worker(self):
@@ -357,7 +374,7 @@ class TestRealCallSessionIntegration:
         # the 400 path doesn't touch the real worker machinery at all.
         body = _multipart_body({"model": "nope"}, file_field="file", file_bytes=_wav_bytes())
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False
+            content_type=CONTENT_TYPE, body=body, settings=_settings(), budget=_budget(), draining=False, tracker=_tracker()
         )
         assert status == 400
 
@@ -386,6 +403,7 @@ class TestRealCallSessionIntegration:
                 settings=_settings(worker_bin_whisper=str(FAKE_WORKER)),
                 budget=_budget(),
                 draining=False,
+                tracker=_tracker(),
             )
         finally:
             os.environ.pop("FAKE_WORDS_PER_SEC", None)

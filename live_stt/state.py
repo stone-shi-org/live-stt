@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
 from live_stt.diarize_sessions import DiarizationSessionTracker
+from live_stt.transcribe_sessions import TranscribeSessionTracker
 
 
 @dataclass
@@ -25,6 +26,15 @@ class ServerState:
     # separate counter rather than reusing `budget` -- still just an
     # aggregate count, not a session registry, same as `budget` itself.
     diarization_sessions: DiarizationSessionTracker = field(default_factory=DiarizationSessionTracker)
+
+    # Batch transcription (POST /v1/audio/transcriptions) DOES spawn a real
+    # worker process through the same WorkerBudget every gRPC Transcribe
+    # call uses, so it can't reuse budget.active_calls alone to show
+    # "batch transcription activity" on the dashboard -- that number is
+    # shared with live streaming calls and can't tell the two apart. This
+    # tracker is the transcribe-side analogue of diarization_sessions above,
+    # same aggregate-counters-plus-small-live-list shape.
+    transcribe_sessions: TranscribeSessionTracker = field(default_factory=TranscribeSessionTracker)
 
     # Set once, immediately, on SIGTERM -- before grpc.aio's own drain grace
     # period even starts. New calls are rejected from this instant.

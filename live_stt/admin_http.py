@@ -384,6 +384,20 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- Transcript (batch HTTP) Cards -->
+        <div class="grid-cards">
+            <div class="card">
+                <div class="card-label">Transcript Requests</div>
+                <div class="card-value" id="valTranscribeActive">0</div>
+                <div class="card-subtext">Currently running (POST /v1/audio/transcriptions)</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Transcript Totals</div>
+                <div class="card-value" id="valTranscribeTotals" style="font-size:1.1rem;">0 / 0 / 0 / 0</div>
+                <div class="card-subtext">ok / failed / VRAM-rejected / capacity-rejected</div>
+            </div>
+        </div>
+
         <!-- Connection & Capacity Progress -->
         <div class="section-card">
             <div class="section-title">📊 Capacity & Resource Usage</div>
@@ -433,6 +447,54 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     <tr><td colspan="3" class="card-subtext">No active diarization requests</td></tr>
                 </tbody>
             </table>
+        </div>
+
+        <!-- Active Transcript Requests -->
+        <div class="section-card">
+            <div class="section-title">📝 Active Transcript Requests</div>
+            <table class="kv-table" id="transcribeActiveTable">
+                <thead>
+                    <tr>
+                        <td class="kv-key">ID</td>
+                        <td class="kv-key">Elapsed</td>
+                        <td class="kv-key">Model</td>
+                    </tr>
+                </thead>
+                <tbody id="transcribeActiveTbody">
+                    <tr><td colspan="3" class="card-subtext">No active transcript requests</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Supported Models by Service -->
+        <div class="section-card">
+            <div class="section-title">🧩 Supported Models by Service</div>
+            <div class="config-grid">
+                <div class="config-group">
+                    <div class="config-group-header">📞 Live Call &mdash; gRPC <code>Transcribe</code> (streaming)</div>
+                    <table class="kv-table" id="svcLiveCallTable">
+                        <tbody id="svcLiveCallTbody">
+                            <tr><td class="card-subtext">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="config-group">
+                    <div class="config-group-header">📝 Batch Transcript &mdash; <code>POST /v1/audio/transcriptions</code></div>
+                    <table class="kv-table" id="svcTranscriptTable">
+                        <tbody id="svcTranscriptTbody">
+                            <tr><td class="card-subtext">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="config-group">
+                    <div class="config-group-header">🎤 Diarization &mdash; <code>POST /v1/audio/diarization</code></div>
+                    <table class="kv-table" id="svcDiarizationTable">
+                        <tbody id="svcDiarizationTbody">
+                            <tr><td class="card-subtext">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </div>
 
         <!-- Server Configuration -->
@@ -509,11 +571,12 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         }
 
         async function updateDashboard() {
-            const [health, stats, config, version] = await Promise.all([
+            const [health, stats, config, version, modelsResp] = await Promise.all([
                 fetchJSON('/api/health'),
                 fetchJSON('/api/stats'),
                 fetchJSON('/api/config'),
-                fetchJSON('/api/version')
+                fetchJSON('/api/version'),
+                fetchJSON('/v1/models')
             ]);
 
             // Status Pill
@@ -599,6 +662,26 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                         `<tr><td class="kv-val">#${r.id}</td><td class="kv-val">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val">${r.device}</td></tr>`
                     ).join('');
                 }
+
+                // Batch transcription requests -- see live_stt/transcribe_sessions.py.
+                // Same shape as diarization above (aggregate counters +
+                // small live list), plus a capacity-rejected count this
+                // path has and diarization doesn't (diarization has no
+                // WorkerBudget capacity gate, only VRAM).
+                const xscribe = stats.transcribe || {};
+                document.getElementById('valTranscribeActive').innerText = xscribe.active ?? 0;
+                document.getElementById('valTranscribeTotals').innerText =
+                    `${xscribe.completed_total ?? 0} / ${xscribe.failed_total ?? 0} / ${xscribe.rejected_vram_total ?? 0} / ${xscribe.rejected_capacity_total ?? 0}`;
+
+                const activeTranscribeRequests = xscribe.active_requests || [];
+                const transcribeTbody = document.getElementById('transcribeActiveTbody');
+                if (activeTranscribeRequests.length === 0) {
+                    transcribeTbody.innerHTML = '<tr><td colspan="3" class="card-subtext">No active transcript requests</td></tr>';
+                } else {
+                    transcribeTbody.innerHTML = activeTranscribeRequests.map(r =>
+                        `<tr><td class="kv-val">#${r.id}</td><td class="kv-val">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val">${r.model}</td></tr>`
+                    ).join('');
+                }
             }
 
             // Config
@@ -634,6 +717,57 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             if (version) {
                 document.getElementById('verHash').innerText = version.hash || 'dev';
                 document.getElementById('verParakeet').innerText = version.parakeet_ref || 'dev';
+            }
+
+            // Supported Models by Service -- derived from /v1/models
+            // (live_stt/models.py + live_stt/diarization_models.py, see
+            // admin_http.py's /v1/models handler), not a second hardcoded
+            // list: "Live Call" is ASR models with streaming_capable=true
+            // only (the gRPC Transcribe RPC rejects the rest -- see
+            // live_stt/servicer.py), "Batch Transcript" is EVERY ASR model
+            // (that endpoint is engine-agnostic, per-model capability
+            // doesn't matter there), "Diarization" is the separate
+            // diarization_models registry entirely.
+            const modelRow = (spec, badges) =>
+                `<tr><td class="kv-key">${spec.id}</td><td class="kv-val">${badges.filter(Boolean).join(', ') || '&mdash;'}</td></tr>`;
+            const noModelsRow = '<tr><td class="card-subtext">No models registered</td></tr>';
+
+            if (modelsResp && modelsResp.data) {
+                const asrModels = modelsResp.data.filter(m => m.type === 'asr');
+                const diarizationModels = modelsResp.data.filter(m => m.type === 'diarization');
+
+                const liveCallModels = asrModels.filter(m => m.streaming_capable !== false);
+                document.getElementById('svcLiveCallTbody').innerHTML =
+                    liveCallModels.length
+                        ? liveCallModels.map(m => modelRow(m, [
+                              m.default && 'default',
+                              m.has_eou && 'EOU',
+                              m.multilingual && 'multilingual',
+                          ])).join('')
+                        : noModelsRow;
+
+                document.getElementById('svcTranscriptTbody').innerHTML =
+                    asrModels.length
+                        ? asrModels.map(m => modelRow(m, [
+                              m.default && 'default',
+                              m.streaming_capable === false && 'batch-only',
+                              m.multilingual && 'multilingual',
+                          ])).join('')
+                        : noModelsRow;
+
+                document.getElementById('svcDiarizationTbody').innerHTML =
+                    diarizationModels.length
+                        ? diarizationModels.map(m => modelRow(m, [
+                              m.default && 'default',
+                              m.gated && 'gated',
+                              m.supports_num_speakers_hint && 'num_speakers hint',
+                          ])).join('')
+                        : noModelsRow;
+            } else {
+                const failedRow = '<tr><td class="card-subtext">Failed to load /v1/models</td></tr>';
+                document.getElementById('svcLiveCallTbody').innerHTML = failedRow;
+                document.getElementById('svcTranscriptTbody').innerHTML = failedRow;
+                document.getElementById('svcDiarizationTbody').innerHTML = failedRow;
             }
         }
 
@@ -682,6 +816,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                 self._write_json(200, __about__.info())
             elif self.path == "/api/stats":
                 diar = state.diarization_sessions
+                xscribe = state.transcribe_sessions
                 self._write_json(
                     200,
                     {
@@ -708,6 +843,24 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                             # what's currently active.
                             "active_requests": diar.snapshot_active(),
                         },
+                        # Batch transcription (POST /v1/audio/transcriptions)
+                        # -- see live_stt/transcribe_sessions.py. Same shape
+                        # as "diarization" above, plus rejected_capacity_total
+                        # since this path (unlike diarization) also has a
+                        # WorkerBudget capacity gate, not just VRAM.
+                        # Deliberately separate from active_calls above,
+                        # which conflates this with live gRPC streaming
+                        # calls (both share the one WorkerBudget) -- this is
+                        # the number that answers "how much of that is
+                        # batch transcription specifically."
+                        "transcribe": {
+                            "active": xscribe.active,
+                            "completed_total": xscribe.completed_total,
+                            "failed_total": xscribe.failed_total,
+                            "rejected_vram_total": xscribe.rejected_vram_total,
+                            "rejected_capacity_total": xscribe.rejected_capacity_total,
+                            "active_requests": xscribe.snapshot_active(),
+                        },
                     },
                 )
             elif self.path == "/api/config":
@@ -732,6 +885,18 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         "has_eou": spec.has_eou,
                         "has_punctuation": spec.has_punctuation,
                         "multilingual": spec.multilingual,
+                        # engine/streaming_capable (live_stt/models.py, added
+                        # for the whisper.cpp addition) is what actually
+                        # determines which SERVICE can serve this model --
+                        # streaming_capable=False models are batch-only
+                        # (POST /v1/audio/transcriptions), rejected with
+                        # INVALID_ARGUMENT on the gRPC Transcribe RPC (see
+                        # live_stt/servicer.py) -- surfaced here so the admin
+                        # dashboard's "supported models by service" section
+                        # can derive the split from real data instead of a
+                        # second hardcoded list.
+                        "engine": spec.engine,
+                        "streaming_capable": spec.streaming_capable,
                     }
                     for spec in models.MODELS.values()
                 ]
@@ -782,6 +947,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         settings=state.settings,
                         budget=state.budget,
                         draining=state.draining,
+                        tracker=state.transcribe_sessions,
                     )
                 )
                 self._write(status, response_body, content_type)

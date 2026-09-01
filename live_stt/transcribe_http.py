@@ -67,6 +67,7 @@ from live_stt.logging_config import get_logger
 from live_stt.multipart import MultipartError, parse_multipart_form
 from live_stt.pb.livestt.v1 import asr_pb2
 from live_stt.session import CallSession
+from live_stt.transcribe_sessions import TranscribeSessionTracker
 from live_stt.worker import WorkerError
 
 logger = get_logger("transcribe_http")
@@ -170,7 +171,13 @@ def _err(message: str) -> bytes:
 
 
 async def handle_transcribe_request(
-    *, content_type: str, body: bytes, settings: Settings, budget: WorkerBudget, draining: bool
+    *,
+    content_type: str,
+    body: bytes,
+    settings: Settings,
+    budget: WorkerBudget,
+    draining: bool,
+    tracker: TranscribeSessionTracker,
 ) -> tuple[int, bytes, str]:
     """Pure(ish) request handler -- no socket coupling beyond what's already
     unavoidable (spawning a real worker process). Returns
@@ -229,6 +236,8 @@ async def handle_transcribe_request(
             metrics.gpu_free_vram_mb.set(free)
         required = settings.vram_per_worker_mb + settings.vram_reserve_mb
         if free is not None and free < required:
+            tracker.record_rejected_vram()
+            metrics.transcribe_requests_total.labels(outcome="rejected_vram").inc()
             return (
                 503,
                 _err(f"insufficient VRAM: {free}MB free, {required}MB required"),
@@ -236,20 +245,40 @@ async def handle_transcribe_request(
             )
 
     if not budget.try_admit_call():
+        tracker.record_rejected_capacity()
+        metrics.transcribe_requests_total.labels(outcome="rejected_capacity").inc()
         return 503, _err("at capacity, try again shortly"), "application/json"
 
+    # Dashboard/metrics visibility only (see live_stt/transcribe_sessions.py) --
+    # separate from budget's own admission slot, which this request already
+    # holds regardless of this tracker's bookkeeping.
+    request_id = tracker.start(model=spec.key)
+    metrics.transcribe_sessions_active.inc()
     try:
         text, words, total_audio_sec, worker_generations = await _run_transcription(
             pcm, settings=settings, spec=spec, language=language, budget=budget
         )
     except TranscribeUnavailableError as exc:
+        tracker.finish(request_id, ok=False)
+        metrics.transcribe_sessions_active.dec()
+        metrics.transcribe_requests_total.labels(outcome="failed").inc()
         return 503, _err(str(exc)), "application/json"
     except TranscribeError as exc:
+        tracker.finish(request_id, ok=False)
+        metrics.transcribe_sessions_active.dec()
+        metrics.transcribe_requests_total.labels(outcome="failed").inc()
         logger.exception("transcription failed")
         return 500, _err(str(exc)), "application/json"
     except Exception as exc:  # noqa: BLE001 -- last-resort boundary; never crash the admin thread
+        tracker.finish(request_id, ok=False)
+        metrics.transcribe_sessions_active.dec()
+        metrics.transcribe_requests_total.labels(outcome="failed").inc()
         logger.exception("unexpected transcription failure")
         return 500, _err(f"internal error: {exc}"), "application/json"
+    else:
+        tracker.finish(request_id, ok=True)
+        metrics.transcribe_sessions_active.dec()
+        metrics.transcribe_requests_total.labels(outcome="ok").inc()
     finally:
         budget.release_call()
 
