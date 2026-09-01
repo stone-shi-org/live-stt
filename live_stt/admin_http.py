@@ -284,6 +284,29 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             word-break: break-all;
         }
 
+        .model-name-cell {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .copy-btn {
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 0.85rem;
+            line-height: 1;
+            padding: 0.1rem 0.2rem;
+            border-radius: 4px;
+            opacity: 0.6;
+            transition: opacity 0.15s, background 0.15s;
+        }
+
+        .copy-btn:hover {
+            opacity: 1;
+            background: var(--hover-bg);
+        }
+
         .links-row {
             display: flex;
             gap: 0.75rem;
@@ -507,8 +530,8 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                         <tr><td class="kv-key">grpc_host:port</td><td class="kv-val" id="cfgGrpc">-</td></tr>
                         <tr><td class="kv-key">admin_host:port</td><td class="kv-val" id="cfgAdmin">-</td></tr>
                         <tr><td class="kv-key">backend</td><td class="kv-val" id="cfgBackend">-</td></tr>
-                        <tr><td class="kv-key">default_model</td><td class="kv-val" id="cfgModel">-</td></tr>
-                        <tr><td class="kv-key">diarization_model</td><td class="kv-val" id="cfgDiarizationModel">-</td></tr>
+                        <tr><td class="kv-key">default_model</td><td class="kv-val"><span class="model-name-cell"><span id="cfgModel">-</span><button class="copy-btn" onclick="copyToClipboard(document.getElementById('cfgModel').innerText, this)" title="Copy model name">📋</button></span></td></tr>
+                        <tr><td class="kv-key">diarization_model</td><td class="kv-val"><span class="model-name-cell"><span id="cfgDiarizationModel">-</span><button class="copy-btn" onclick="copyToClipboard(document.getElementById('cfgDiarizationModel').innerText, this)" title="Copy model name">📋</button></span></td></tr>
                         <tr><td class="kv-key">models_dir</td><td class="kv-val" id="cfgModelsDir">-</td></tr>
                     </table>
                 </div>
@@ -560,6 +583,43 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
     </div>
 
     <script>
+        // Copy-to-clipboard for model names (Supported Models by Service,
+        // Active Transcript Requests, and the configured default_model /
+        // diarization_model values) -- so a full model key like
+        // "whisper-large-v3-turbo-q8_0" can be grabbed with one click
+        // instead of a manual select-and-copy.
+        function copyToClipboard(text, btn) {
+            const done = () => {
+                const orig = btn.innerText;
+                btn.innerText = '✅';
+                setTimeout(() => { btn.innerText = orig; }, 900);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+            } else {
+                fallbackCopy(text, done);
+            }
+        }
+
+        function fallbackCopy(text, done) {
+            // Non-secure-context / older-browser fallback -- this admin
+            // dashboard is often reached over plain http:// on a home LAN,
+            // where navigator.clipboard is unavailable (Clipboard API is
+            // restricted to secure contexts).
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); done(); } catch (e) { /* give up quietly */ }
+            document.body.removeChild(ta);
+        }
+
+        function copyBtn(name) {
+            return `<button class="copy-btn" onclick="copyToClipboard('${name}', this)" title="Copy '${name}' to clipboard">📋</button>`;
+        }
+
         async function fetchJSON(url) {
             try {
                 const r = await fetch(url);
@@ -679,7 +739,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     transcribeTbody.innerHTML = '<tr><td colspan="3" class="card-subtext">No active transcript requests</td></tr>';
                 } else {
                     transcribeTbody.innerHTML = activeTranscribeRequests.map(r =>
-                        `<tr><td class="kv-val">#${r.id}</td><td class="kv-val">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val">${r.model}</td></tr>`
+                        `<tr><td class="kv-val">#${r.id}</td><td class="kv-val">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val"><span class="model-name-cell">${r.model}${copyBtn(r.model)}</span></td></tr>`
                     ).join('');
                 }
             }
@@ -729,7 +789,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             // doesn't matter there), "Diarization" is the separate
             // diarization_models registry entirely.
             const modelRow = (spec, badges) =>
-                `<tr><td class="kv-key">${spec.id}</td><td class="kv-val">${badges.filter(Boolean).join(', ') || '&mdash;'}</td></tr>`;
+                `<tr><td class="kv-key"><span class="model-name-cell">${spec.id}${copyBtn(spec.id)}</span></td><td class="kv-val">${badges.filter(Boolean).join(', ') || '&mdash;'}</td></tr>`;
             const noModelsRow = '<tr><td class="card-subtext">No models registered</td></tr>';
 
             if (modelsResp && modelsResp.data) {

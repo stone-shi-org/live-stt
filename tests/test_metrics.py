@@ -169,6 +169,15 @@ async def test_stats_web_page_endpoint() -> None:
                 assert 'id="svcLiveCallTbody"' in html_body
                 assert 'id="svcTranscriptTbody"' in html_body
                 assert 'id="svcDiarizationTbody"' in html_body
+                # Copy-to-clipboard buttons next to model names -- the
+                # helper function, the CSS class, and the two static
+                # default_model/diarization_model config rows all get one;
+                # the Supported Models table rows and the Active Transcript
+                # Requests row get theirs via the copyBtn() JS helper at
+                # render time (not visible as static markup here).
+                assert 'function copyToClipboard(' in html_body
+                assert 'class="copy-btn"' in html_body
+                assert 'function copyBtn(' in html_body
     finally:
         server.shutdown()
 
