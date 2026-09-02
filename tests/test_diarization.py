@@ -9,13 +9,17 @@ the real pyannote pipeline is out of scope for a unit test.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from unittest.mock import MagicMock
 
 import pytest
 
 from live_stt.config import Settings
 from live_stt.diarization import (
     DiarizationError,
+    _diarize_file_direct,
+    _diarize_file_subprocess,
     annotation_to_house_json,
     assign_text,
     diarize_file,
@@ -152,14 +156,6 @@ class TestAssignText:
 
 class TestLoadPipelineErrors:
     def test_missing_dependency_raises_diarization_error(self, monkeypatch: pytest.MonkeyPatch):
-        # pyannote.audio is deliberately NOT in requirements.txt (see
-        # requirements-diarization.txt) -- but it IS installed in this dev
-        # venv now, for the real end-to-end run against NOTSOFAR-1 audio (see
-        # CLAUDE.md). This test asserts the CODE PATH, not this venv's
-        # current state, which is exactly why it broke the moment the real
-        # dependency got installed for that run: `sys.modules[name] = None`
-        # is the standard way to force `import pyannote.audio` to raise
-        # ImportError regardless of whether the package is actually present.
         import sys
 
         monkeypatch.setitem(sys.modules, "pyannote.audio", None)
@@ -167,9 +163,6 @@ class TestLoadPipelineErrors:
             load_pipeline(_settings(diarization_hf_token="fake-token"))
 
     def test_missing_token_is_checked_before_importing_torch(self, monkeypatch: pytest.MonkeyPatch):
-        # Even if pyannote.audio somehow were importable, a missing token
-        # should fail fast with a clear message rather than a deep pyannote
-        # traceback -- verified by making the import succeed with a stub.
         import sys
         import types
 
@@ -184,10 +177,6 @@ class TestLoadPipelineErrors:
             load_pipeline(_settings(diarization_hf_token=None))
 
     def test_unknown_model_key_is_rejected_before_importing_pyannote(self, monkeypatch: pytest.MonkeyPatch):
-        # No pyannote.audio stub at all here, deliberately -- an unknown
-        # registry key must fail on that alone, before load_pipeline ever
-        # tries the (heavy, possibly-missing) import. If this test needed a
-        # stub to pass, that would mean the ordering regressed.
         with pytest.raises(DiarizationError, match="unknown diarization model"):
             load_pipeline(_settings(diarization_hf_token="tok", diarization_model="not-a-real-model"))
 
@@ -219,19 +208,11 @@ class TestLoadPipelineErrors:
                 key="open-model", hf_repo_id="someone/open-model", gated=False, supports_num_speakers_hint=True
             ),
         )
-        # No token set at all -- must not raise, since this fake model isn't gated.
         pipeline = load_pipeline(_settings(diarization_hf_token=None, diarization_model="open-model"))
         assert pipeline is not None
 
 
 class TestLoadPipelineDevice:
-    """load_pipeline's device handling, stubbed against fake pyannote.audio
-    and fake torch modules -- so this stays hermetic regardless of whether
-    torch/pyannote.audio are actually installed (they are, in this dev venv,
-    for the real end-to-end run recorded in CLAUDE.md, but this test must not
-    depend on that, and must not require an actual CUDA GPU to run at all).
-    """
-
     def _stub_pyannote(self, monkeypatch: pytest.MonkeyPatch, fake_pipeline: object) -> None:
         import sys
         import types
@@ -264,9 +245,6 @@ class TestLoadPipelineDevice:
             load_pipeline(_settings(diarization_hf_token="tok", diarization_device="tpu"))
 
     def test_cpu_default_never_touches_torch_cuda(self, monkeypatch: pytest.MonkeyPatch):
-        # cpu is the default -- must not call .to() or even import torch's
-        # cuda check, so a plain CPU deployment never needs a CUDA-capable
-        # torch build at all.
         class FakePipeline:
             def to(self, device):
                 raise AssertionError("must not call .to() on the cpu default")
@@ -299,13 +277,6 @@ class TestLoadPipelineDevice:
 
 
 class TestDiarizeFileModelSpecAwareness:
-    """diarize_file consults the resolved DiarizationModelSpec, not just
-    Settings, for whether to pass num_speakers= at all -- a model whose spec
-    says it doesn't accept the hint must never receive it, even if the
-    operator has diarization_num_speakers configured (that setting is
-    telephony-shaped default tuning, not a promise every model supports it).
-    """
-
     def _stub_pyannote(self, monkeypatch: pytest.MonkeyPatch, capture: dict):
         import sys
         import types
@@ -334,7 +305,7 @@ class TestDiarizeFileModelSpecAwareness:
         self._stub_pyannote(monkeypatch, capture)
         wav = tmp_path / "x.wav"
         wav.write_bytes(b"fake")
-        diarize_file(
+        _diarize_file_direct(
             wav,
             settings=_settings(diarization_hf_token="tok", diarization_num_speakers=3),
         )
@@ -355,21 +326,18 @@ class TestDiarizeFileModelSpecAwareness:
         )
         wav = tmp_path / "x.wav"
         wav.write_bytes(b"fake")
-        diarize_file(
+        _diarize_file_direct(
             wav,
             settings=_settings(diarization_hf_token="tok", diarization_model="no-hint-model", diarization_num_speakers=3),
         )
         assert capture["kwargs"] == {}
 
     def test_min_max_speakers_passed_when_num_speakers_is_unset(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
-        """The default shape: no asserted-true count, so a bound is
-        forwarded instead of an exact guess -- see Settings.diarization_min_speakers's
-        docstring for the real measurement backing this as the safer default."""
         capture: dict = {}
         self._stub_pyannote(monkeypatch, capture)
         wav = tmp_path / "x.wav"
         wav.write_bytes(b"fake")
-        diarize_file(
+        _diarize_file_direct(
             wav,
             settings=_settings(
                 diarization_hf_token="tok",
@@ -383,15 +351,11 @@ class TestDiarizeFileModelSpecAwareness:
     def test_num_speakers_takes_priority_over_min_max_when_both_are_set(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ):
-        """Mirrors pyannote's own contract ('min/max has no effect when
-        num_speakers is provided') -- diarize_file doesn't even compute
-        min/max kwargs in this case, rather than passing all three and
-        relying on pyannote to ignore two of them."""
         capture: dict = {}
         self._stub_pyannote(monkeypatch, capture)
         wav = tmp_path / "x.wav"
         wav.write_bytes(b"fake")
-        diarize_file(
+        _diarize_file_direct(
             wav,
             settings=_settings(
                 diarization_hf_token="tok",
@@ -417,7 +381,7 @@ class TestDiarizeFileModelSpecAwareness:
         )
         wav = tmp_path / "x.wav"
         wav.write_bytes(b"fake")
-        diarize_file(
+        _diarize_file_direct(
             wav,
             settings=_settings(
                 diarization_hf_token="tok",
@@ -434,7 +398,7 @@ class TestDiarizeFileModelSpecAwareness:
         self._stub_pyannote(monkeypatch, capture)
         wav = tmp_path / "x.wav"
         wav.write_bytes(b"fake")
-        diarize_file(
+        _diarize_file_direct(
             wav,
             settings=_settings(
                 diarization_hf_token="tok",
@@ -447,14 +411,6 @@ class TestDiarizeFileModelSpecAwareness:
 
 
 class TestDiarizeFileCudaCleanup:
-    """diarize_file releases CUDA memory after every request on the "cuda"
-    device via _release_cuda_memory (torch.cuda.empty_cache(), after a
-    gc.collect()) -- otherwise this process permanently holds ~10-12GB on a
-    card shared with the ASR workers/LocalAI (a real measurement, see
-    CLAUDE.md), long after the request that needed it has finished. CPU must
-    never even import torch for this.
-    """
-
     def _stub_pyannote_and_torch(self, monkeypatch: pytest.MonkeyPatch, *, cuda_available: bool = True):
         import sys
         import types
@@ -494,7 +450,7 @@ class TestDiarizeFileCudaCleanup:
         calls, _ = self._stub_pyannote_and_torch(monkeypatch)
         wav = tmp_path / "x.wav"
         wav.write_bytes(b"fake")
-        result = diarize_file(wav, settings=_settings(diarization_hf_token="tok", diarization_device="cuda"))
+        result = _diarize_file_direct(wav, settings=_settings(diarization_hf_token="tok", diarization_device="cuda"))
         assert result["num_speakers"] == 1
         assert calls["empty_cache"] == 1
 
@@ -512,7 +468,7 @@ class TestDiarizeFileCudaCleanup:
         wav = tmp_path / "x.wav"
         wav.write_bytes(b"fake")
         with pytest.raises(DiarizationError):
-            diarize_file(wav, settings=_settings(diarization_hf_token="tok", diarization_device="cuda"))
+            _diarize_file_direct(wav, settings=_settings(diarization_hf_token="tok", diarization_device="cuda"))
         assert calls["empty_cache"] == 1
 
     def test_cpu_device_never_imports_torch_at_all(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
@@ -536,16 +492,42 @@ class TestDiarizeFileCudaCleanup:
         fake_pyannote.audio = fake_pyannote_audio
         monkeypatch.setitem(sys.modules, "pyannote", fake_pyannote)
         monkeypatch.setitem(sys.modules, "pyannote.audio", fake_pyannote_audio)
-        # Force any accidental `import torch` on the cpu path to raise,
-        # rather than silently succeeding against whatever's really
-        # installed in this dev venv -- proves the negative, not just
-        # assumes it.
         monkeypatch.setitem(sys.modules, "torch", None)
 
         wav = tmp_path / "x.wav"
         wav.write_bytes(b"fake")
-        result = diarize_file(wav, settings=_settings(diarization_hf_token="tok", diarization_device="cpu"))
+        result = _diarize_file_direct(wav, settings=_settings(diarization_hf_token="tok", diarization_device="cpu"))
         assert result["num_speakers"] == 1
+
+
+class TestDiarizeFileSubprocess:
+    def test_diarize_file_spawns_subprocess(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+
+        expected = {"task": "diarize", "num_speakers": 1, "segments": [{"id": 0, "speaker": "SPEAKER_00", "label": "0", "start": 0.0, "end": 1.0, "text": ""}], "speakers": []}
+
+        import live_stt.diarization as diarization_module
+        mock_sub = MagicMock(return_value=expected)
+        monkeypatch.setattr(diarization_module, "_diarize_file_subprocess", mock_sub)
+
+        res = diarize_file(wav, settings=_settings(diarization_hf_token="tok"))
+        assert res == expected
+        assert mock_sub.call_count == 1
+
+    def test_diarize_file_direct_flag(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+
+        expected = {"task": "diarize", "num_speakers": 1, "segments": [{"id": 0, "speaker": "SPEAKER_00", "label": "0", "start": 0.0, "end": 1.0, "text": ""}], "speakers": []}
+
+        import live_stt.diarization as diarization_module
+        mock_direct = MagicMock(return_value=expected)
+        monkeypatch.setattr(diarization_module, "_diarize_file_direct", mock_direct)
+
+        res = diarize_file(wav, settings=_settings(diarization_hf_token="tok", diarize_in_subprocess=False))
+        assert res == expected
+        assert mock_direct.call_count == 1
 
 
 class TestSettingsDefaults:
@@ -553,14 +535,11 @@ class TestSettingsDefaults:
         settings = _settings()
         assert settings.diarization_model == "pyannote/speaker-diarization-community-1"
         assert settings.diarization_hf_token is None
-        # NOT hardcoded to an exact count -- see the docstring on this field
-        # in live_stt/config.py for the real measurement (MTG_32063) showing
-        # a wrong exact hint (the old default, 2) is worse than no hint at
-        # all. Bounds, not a guess, are the default instead.
         assert settings.diarization_num_speakers is None
         assert settings.diarization_min_speakers == 1
         assert settings.diarization_max_speakers == 6
         assert settings.diarization_device == "cpu"
+        assert settings.diarize_in_subprocess is True
 
     def test_token_overridable_via_env(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("LSTT_DIARIZATION_HF_TOKEN", "hf_abc123")

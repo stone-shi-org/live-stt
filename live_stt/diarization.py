@@ -14,44 +14,20 @@ some out-of-band capture, since Phase 3's audio-dump ring buffer
 ``live_stt/redaction.py``. Wiring an automatic post-call dump -> diarize
 pipeline is future work, not part of this module.
 
-**Interface shape is the house standard, not pyannote's native one.** This
-house already has one diarization consumer --
-``my-meeting-notes/app/services/diarize.py`` -- built against a
-LocalAI-compatible ``/v1/audio/diarization`` endpoint returning::
-
-    {"task": "diarize", "num_speakers": 2,
-     "segments": [{"id": 0, "speaker": "SPEAKER_00", "label": "0",
-                   "start": 0.0, "end": 1.2, "text": "..."}],
-     "speakers": [{"id": "SPEAKER_00", "label": "0",
-                   "total_speech_duration": 12.3, "segment_count": 4}]}
-
-``diarize_file`` below maps pyannote's native output (a
-``pyannote.core.Annotation`` of ``(Segment, track, speaker_label)``
-triples -- see ``Annotation.itertracks(yield_label=True)``, and NIST's RTTM
-format if you ever need pyannote's own de facto serialization instead of
-this house's JSON) into exactly that shape, so a call's diarization result
-is structurally interchangeable with every other diarization result already
-handled in this house, rather than inventing a second, pyannote-flavored one.
-
-**Verified end-to-end** against a real NOTSOFAR-1 meeting recording (see
-CLAUDE.md): CPU-only on a 6-core dev host, 358s of audio took 312.8s
-(~0.87x realtime), 5/5 speakers correctly counted, 81.3% frame-level
-agreement against real ground truth. ``diarization_device`` (``"cpu"`` |
-``"cuda"``) controls whether ``load_pipeline`` moves the pipeline onto a GPU
-via ``pipeline.to(torch.device("cuda"))`` -- independent of the ASR worker's
-own ``backend`` setting, since this runs as ordinary Python/torch in this
-process, not in the C++ worker. Fails loudly at load time
-(``torch.cuda.is_available()`` checked explicitly) rather than letting a
-missing GPU surface as a confusing failure deep inside the first forward
-pass. ``diarize_file`` releases CUDA memory back to the driver
-(``_release_cuda_memory``) after every request on the ``"cuda"`` device,
-trading some re-warm cost on the next request for not permanently holding
-~10-12GB on a card shared with the ASR workers and LocalAI -- see that
-function's docstring and CLAUDE.md's real measurement.
+**Subprocess isolation**: By default (``diarize_in_subprocess=True``),
+``diarize_file`` spawns an isolated Python subprocess (``live_stt.diarize_worker``)
+to run pyannote inference. This guarantees 100% VRAM / CUDA driver context
+reclamation on process termination, preventing persistent CUDA driver context
+(~300-400MB) or memory fragmentation from occupying the card after inference ends.
 """
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
@@ -150,24 +126,7 @@ def load_pipeline(settings: Settings) -> Any:
 
 def _release_cuda_memory() -> None:
     """Return this request's CUDA memory to the driver instead of letting
-    PyTorch's caching allocator hold it for reuse -- the allocator's default
-    behavior (keep freed memory in an internal pool rather than calling
-    ``cudaFree``, to avoid the real cost of repeated malloc/free) is the
-    right tradeoff for a GPU this process owns alone, and the wrong one for
-    a GPU shared with the ASR workers and LocalAI (see CLAUDE.md: a real
-    measurement found this process holding ~10-12GB at rest between
-    diarization requests otherwise -- not a leak, just an idle reservation).
-
-    Deliberate cost accepted for this: the NEXT diarization request on this
-    process re-pays the allocator's growth work from a cold pool (measured:
-    a request against an already-warm pool was faster than the first one on
-    a fresh process -- see CLAUDE.md), in exchange for not permanently
-    squatting on a large chunk of a shared card between requests.
-    ``gc.collect()`` first so any tensors only reachable via a reference
-    cycle are actually freed before ``empty_cache()`` runs -- otherwise
-    ``empty_cache()`` only returns memory the allocator already considers
-    unused, and a lingering Python-side reference would keep it "in use".
-    """
+    PyTorch's caching allocator hold it for reuse."""
     import gc
 
     import torch
@@ -179,20 +138,12 @@ def _release_cuda_memory() -> None:
 def _itertracks(annotation: Any) -> Iterable[tuple[_SegmentLike, str]]:
     """Normalize whatever pyannote's pipeline call returns into
     ``(segment, speaker_label)`` pairs.
-
-    Handles both shapes seen in pyannote's own docs for this model: a plain
-    ``Annotation`` (iterate via ``itertracks(yield_label=True)``, which
-    yields ``(segment, track, label)`` triples) and the 4.x pipeline-output
-    wrapper exposing ``.speaker_diarization`` as that same Annotation.
     """
     source = getattr(annotation, "speaker_diarization", annotation)
     if hasattr(source, "itertracks"):
         for segment, _track, label in source.itertracks(yield_label=True):
             yield segment, label
     else:
-        # Already an iterable of (segment, label) pairs -- e.g. a test
-        # double, or a future pyannote version whose top-level object is
-        # directly iterable that way.
         for segment, label in source:
             yield segment, label
 
@@ -201,9 +152,7 @@ def annotation_to_house_json(
     annotation: Any, *, model: str
 ) -> dict[str, Any]:
     """Pure mapping from pyannote's diarization result to the house JSON
-    shape (see module docstring). No I/O, no pyannote import at call time --
-    testable against a fake ``itertracks``-shaped object with no pyannote.audio
-    installed, mirroring live_stt/events.py's "pure mapping" pattern.
+    shape.
     """
     segments: list[dict[str, Any]] = []
     speaker_stats: dict[str, dict[str, Any]] = {}
@@ -226,9 +175,6 @@ def annotation_to_house_json(
         stats["total_speech_duration"] += float(segment.end) - float(segment.start)
         stats["segment_count"] += 1
 
-    # Deterministic order (by first appearance) rather than dict/set
-    # iteration order -- matters for anything downstream that compares two
-    # runs, e.g. a regression test.
     speakers = list(speaker_stats.values())
 
     if not segments:
@@ -247,19 +193,7 @@ def annotation_to_house_json(
 
 
 def assign_text(house_json: dict[str, Any], words: list[asr_pb2.Word]) -> dict[str, Any]:
-    """Fill each segment's ``text`` from the call's own ASR word timestamps
-    (``asr_pb2.Word.start_sec``/``end_sec``, the same shape ``session.py``
-    already produces), by assigning each word to the diarization segment its
-    midpoint falls inside.
-
-    This is the equivalent of the LocalAI service's ``include_text=true`` --
-    but here diarization and transcription are two separate steps run by two
-    separate engines (pyannote for speakers, parakeet.cpp for words) rather
-    than one model doing both, so the merge has to happen on this side. A
-    word whose midpoint doesn't fall in any segment (a gap between diarized
-    turns) is dropped rather than guessed onto the nearest one -- silently
-    misattributing a word to the wrong speaker is worse than omitting it.
-    """
+    """Fill each segment's ``text`` from the call's own ASR word timestamps."""
     segments = house_json["segments"]
     buckets: list[list[str]] = [[] for _ in segments]
 
@@ -275,48 +209,23 @@ def assign_text(house_json: dict[str, Any], words: list[asr_pb2.Word]) -> dict[s
     return house_json
 
 
-def diarize_file(
+def _diarize_file_direct(
     path: str | Path,
     *,
     settings: Settings,
-    words: list[asr_pb2.Word] | None = None,
 ) -> dict[str, Any]:
-    """Run diarization on a recorded WAV and return the house JSON shape.
-
-    ``words``, if given, are merged in via ``assign_text`` -- pass the same
-    call's ASR transcript's word list (``asr_pb2.Word``) to get per-segment
-    text, the same as a LocalAI-backed diarization call would return with
-    ``include_text=true``. Omit it to get speaker turns with no text, which
-    is a valid partial result, not an error (unlike the LocalAI client, which
-    treats all-empty text as a symptom of a misconfigured request -- here an
-    empty ``words`` list is a deliberate, valid input, not a mistake).
-    """
+    """Run in-process pyannote inference directly (called by subprocess worker)."""
     path = Path(path)
     if not path.is_file():
         raise DiarizationError(f"No such audio file: {path}")
 
     pipeline = load_pipeline(settings)
-    # Already validated by load_pipeline (which raises DiarizationError on
-    # an unknown key before we'd ever get here) -- re-resolving is a cheap,
-    # pure dict lookup, not worth threading the spec through load_pipeline's
-    # return value just to avoid it.
     spec = resolve_diarization_model(settings.diarization_model)
     kwargs: dict[str, Any] = {}
     if spec.supports_num_speakers_hint:
         if settings.diarization_num_speakers is not None:
-            # Exact hint -- only forwarded when the caller asserted a true
-            # count (see Settings.diarization_num_speakers's docstring for
-            # the real measurement showing a WRONG exact hint is worse than
-            # none at all). min/max below are skipped entirely here: they
-            # have no effect once num_speakers is set anyway (pyannote's own
-            # contract), so there's no reason to compute or pass them.
             kwargs["num_speakers"] = settings.diarization_num_speakers
         else:
-            # No asserted-true count -- pass a BOUND, not a guess. Real
-            # measurement (see Settings.diarization_min_speakers's
-            # docstring): when the true count already falls inside
-            # [min, max], this is a byte-identical no-op vs passing nothing;
-            # it only kicks in to clamp a pathological auto-estimate.
             if settings.diarization_min_speakers is not None:
                 kwargs["min_speakers"] = settings.diarization_min_speakers
             if settings.diarization_max_speakers is not None:
@@ -324,13 +233,95 @@ def diarize_file(
 
     try:
         result = pipeline(str(path), **kwargs)
-    except Exception as exc:  # noqa: BLE001 -- one clear error type at this boundary
+    except Exception as exc:  # noqa: BLE001
         raise DiarizationError(f"Diarization failed on {path}: {exc}") from exc
     finally:
         if settings.diarization_device == "cuda":
             _release_cuda_memory()
 
-    house_json = annotation_to_house_json(result, model=spec.hf_repo_id)
+    return annotation_to_house_json(result, model=spec.hf_repo_id)
+
+
+def _diarize_file_subprocess(
+    path: str | Path,
+    *,
+    settings: Settings,
+) -> dict[str, Any]:
+    """Spawn isolated python subprocess to execute diarization for full CUDA VRAM reclamation."""
+    path = Path(path)
+    if not path.is_file():
+        raise DiarizationError(f"No such audio file: {path}")
+
+    with tempfile.TemporaryDirectory(prefix="diarize_worker_") as tmpdir:
+        req_file = Path(tmpdir) / "request.json"
+        res_file = Path(tmpdir) / "response.json"
+
+        req_payload = {
+            "wav_path": str(path.resolve()),
+            "settings": settings.model_dump(),
+        }
+        req_file.write_text(json.dumps(req_payload), encoding="utf-8")
+
+        cmd = [sys.executable, "-m", "live_stt.diarize_worker", str(req_file), str(res_file)]
+        env = dict(os.environ)
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        except Exception as exc:
+            raise DiarizationError(f"Failed to spawn diarization subprocess: {exc}") from exc
+
+        if not res_file.is_file():
+            stderr_snippet = proc.stderr.strip() or proc.stdout.strip()
+            raise DiarizationError(
+                f"Diarization worker crashed or exited with code {proc.returncode}: {stderr_snippet}"
+            )
+
+        try:
+            res_data = json.loads(res_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise DiarizationError(f"Failed to parse diarization worker response: {exc}") from exc
+
+        if not res_data.get("ok"):
+            err_msg = res_data.get("error", "Unknown diarization error")
+            raise DiarizationError(err_msg)
+
+        return res_data["result"]
+
+
+def diarize_file(
+    path: str | Path,
+    *,
+    settings: Settings,
+    words: list[asr_pb2.Word] | None = None,
+    diarize_in_subprocess: bool | None = None,
+) -> dict[str, Any]:
+    """Run diarization on a recorded WAV and return the house JSON shape.
+
+    By default, uses the ``settings.diarize_in_subprocess`` configuration value
+    (defaulting to True), isolating pyannote and PyTorch into a short-lived child
+    process so all CUDA / VRAM memory is 100% freed upon completion.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise DiarizationError(f"No such audio file: {path}")
+
+    use_subprocess = (
+        diarize_in_subprocess
+        if diarize_in_subprocess is not None
+        else getattr(settings, "diarize_in_subprocess", True)
+    )
+
+    if use_subprocess:
+        house_json = _diarize_file_subprocess(path, settings=settings)
+    else:
+        house_json = _diarize_file_direct(path, settings=settings)
+
     if words:
         house_json = assign_text(house_json, words)
 

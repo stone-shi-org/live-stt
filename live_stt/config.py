@@ -201,6 +201,12 @@ class Settings(BaseSettings):
     # significantly longer than ~6 minutes.
     diarization_vram_mb: int = 13000
 
+    # Subprocess worker isolation for post-call diarization.
+    # When True (default), diarization inference executes in an isolated short-lived
+    # child process so that upon completion, 100% of GPU VRAM (including CUDA driver
+    # context) is reclaimed by the operating system.
+    diarize_in_subprocess: bool = True
+
     @model_validator(mode="after")
     def _check_grace_period(self) -> "Settings":
         if self.finalize_timeout_sec > self.drain_timeout_sec:
