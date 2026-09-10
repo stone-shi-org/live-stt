@@ -730,6 +730,70 @@ in `configure()` and there is no loop anywhere near it.
   fix, all existing unit tests unaffected. What's not: a thread-count sweep, the three
   unregistered-for-real-testing smaller sizes (on either backend), GPU-specific VRAM measurement for
   this engine, and any actual deployment.
+- **NVIDIA Sortformer v2.1 as a second diarization engine — investigated for real (Jira LS-4),
+  NOT integrated.** A feasibility spike, not a feature: license terms and a reproducible install
+  path were confirmed from primary sources, and a real install + real inference run was done in a
+  throwaway venv on 10.100.0.50 (the RTX 3090 box), touching zero production code. **License is
+  not a blocker** — `nvidia/diar_streaming_sortformer_4spk-v2.1`'s HF metadata and the actual NVIDIA
+  Open Model License Agreement PDF (June 2024) confirm it's genuinely commercially usable (unlike
+  the offline `diar_sortformer_4spk-v1`, which really is CC-BY-NC-4.0/non-commercial). **A
+  reproducible pin exists** — `nemo.collections.asr.models.SortformerEncLabelModel` is present in
+  tagged `nemo_toolkit` PyPI releases back through `2.2.0` (through `3.0.0`), so `pip install
+  git+...@main` (the HF README's own instruction) is not actually necessary. Everything past that
+  point is a mix of one real blocker and several real positives, and on balance does not clear this
+  plan's own stated bar to proceed to a production integration phase:
+  - **Real, non-trivial packaging blocker**: `nemo_toolkit[asr]` (both `3.0.0` and `2.7.3`) does
+    NOT install cleanly on this repo's Python 3.14 baseline. `nv_one_logger_pytorch_lightning_
+    integration>=2.3.1` (a hard transitive dependency) only ships wheels declaring `Requires-Python
+    <3.14`, a genuine ceiling, not a resolver hiccup — worked around only by hand-building an empty
+    stub wheel, then discovering `import nemo.collections.asr.models` unconditionally
+    (non-lazily) instantiates a callback class that needs a *real* method from that same
+    incompatible package, requiring a second hand-written no-op class dropped into `site-packages`
+    before the import would even succeed. A separate, unrelated build failure
+    (`kaldialign==0.8.0` vendoring pybind11 via a CMake too new for its own `CMakeLists.txt`) needed
+    `cmake<4` pinned in the venv on top of that. None of this is something to ship in a Dockerfile
+    as-is — a real fix would need either a dedicated older-Python venv/image just for this engine
+    (not just a second `requirements-*.txt`, which was this plan's original assumption) or an
+    upstream fix to `nv_one_logger_pytorch_lightning_integration` itself.
+  - **Dependency coexistence with pyannote.audio: genuinely fine.** `pyannote.audio>=4.0.0` +
+    `torch>=2.0.0` + `torchaudio>=2.0.0` installed into the *same* venv as nemo with zero resolver
+    conflicts, and `import pyannote.audio` / `import nemo.collections.asr.models` both succeeded in
+    one process. The risk flagged in the original plan did not materialize.
+  - **CPU inference works, and is fast** — contrary to this spike's own prior assumption ("likely
+    GPU-only in practice"): a 10s clip diarized in 0.41s, and full ~6-minute NOTSOFAR-1 meetings
+    each took ~11s wall time on a 32-core CPU host (roughly RTF 32x), no errors.
+  - **The 4-speaker cap fails silently, not loudly** — confirmed against the same `MTG_32089`
+    fixture (5 real speakers: Sarah/Donald/Ron/Beth/Rachel) the pyannote baseline already used:
+    `NUM_SPEAKERS=4` came back with `STATUS=OK`, no error, no warning. Donald's speech doesn't
+    surface as a 5th cluster or an error — it's silently absorbed into another speaker's cluster,
+    and Sarah's own cluster purity collapsed to 0.465 as a result. This is exactly the "silent wrong
+    answer" failure shape this codebase's diarization/transcription error-handling has deliberately
+    avoided everywhere else (see the `include_text`-without-`words` handling, or the "explicit
+    correctly-typed failure" language elsewhere in this file).
+  - **Accuracy, measured with the same rough 100ms-frame-purity approach `tools/diarize_call.py`
+    uses (reimplemented inline for this spike, not byte-identical to that script — a caveat, not a
+    guarantee of exact comparability): meaningfully below the existing pyannote baseline on both
+    fixtures tried.** On `MTG_32089` itself (the exact file pyannote scored 0.813 on), Sortformer —
+    degraded by the silent 4-speaker cap above — scored **0.748** overall frame agreement. On a
+    second, in-spec ≤4-speaker meeting (`MTG_32000`, true count 4), Sortformer scored **0.674**
+    (per-cluster purity 0.54–0.83) — still below pyannote's number, on a different file, so not a
+    strictly apples-to-apples comparison, but the only in-spec data point gathered and not a
+    favorable one.
+  - **GPU-path performance/VRAM: not actually measured.** The RTX 3090 was fully occupied by an
+    unrelated tenant process the entire session (~23.7GB used, confirmed via
+    `nvidia-smi --query-compute-apps`); a `.cuda()` load attempt hit a real `torch.OutOfMemoryError`.
+    Per this repo's own "shared box, don't disrupt other tenants" convention (see "Ops notes"), the
+    spike did not contend for the card — so, same caveat this file already carries for the ASR
+    VRAM-admission reject path, real GPU behavior for this specific engine remains unverified.
+
+  **Net effect of this spike**: the plan's own exit criteria for proceeding to a Phase 2 production
+  integration ("accuracy on a ≤4-speaker fixture at or above pyannote's baseline," "no unresolved
+  dependency conflict") are not met — the accuracy bar was missed on the one in-spec data point
+  gathered, and a new, unanticipated Python-3.14 packaging blocker was found that the original plan
+  did not account for. Recommendation on LS-4: do not proceed to integration at this time. The
+  genuinely good news found along the way (license, pyannote coexistence, CPU speed) would still
+  apply to a future revisit if a later Sortformer release lifts the 4-speaker cap or the
+  `nv_one_logger` Python-version ceiling is fixed upstream — this is a "not now," not a "never."
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and
