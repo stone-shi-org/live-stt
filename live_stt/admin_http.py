@@ -294,17 +294,31 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             background: none;
             border: none;
             cursor: pointer;
-            font-size: 0.85rem;
-            line-height: 1;
-            padding: 0.1rem 0.2rem;
+            padding: 0.15rem 0.25rem;
             border-radius: 4px;
             opacity: 0.6;
-            transition: opacity 0.15s, background 0.15s;
+            transition: opacity 0.15s, background 0.15s, color 0.15s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            vertical-align: middle;
+            color: var(--text-muted);
         }
 
         .copy-btn:hover {
             opacity: 1;
             background: var(--hover-bg);
+            color: var(--text-main);
+        }
+
+        .copy-btn svg {
+            width: 14px;
+            height: 14px;
+            fill: none;
+            stroke: currentColor;
+            stroke-width: 2;
+            stroke-linecap: round;
+            stroke-linejoin: round;
         }
 
         .links-row {
@@ -530,8 +544,8 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                         <tr><td class="kv-key">grpc_host:port</td><td class="kv-val" id="cfgGrpc">-</td></tr>
                         <tr><td class="kv-key">admin_host:port</td><td class="kv-val" id="cfgAdmin">-</td></tr>
                         <tr><td class="kv-key">backend</td><td class="kv-val" id="cfgBackend">-</td></tr>
-                        <tr><td class="kv-key">default_model</td><td class="kv-val"><span class="model-name-cell"><span id="cfgModel">-</span><button class="copy-btn" onclick="copyToClipboard(document.getElementById('cfgModel').innerText, this)" title="Copy model name">📋</button></span></td></tr>
-                        <tr><td class="kv-key">diarization_model</td><td class="kv-val"><span class="model-name-cell"><span id="cfgDiarizationModel">-</span><button class="copy-btn" onclick="copyToClipboard(document.getElementById('cfgDiarizationModel').innerText, this)" title="Copy model name">📋</button></span></td></tr>
+                        <tr><td class="kv-key">default_model</td><td class="kv-val" id="cfgModel">-</td></tr>
+                        <tr><td class="kv-key">diarization_model</td><td class="kv-val" id="cfgDiarizationModel">-</td></tr>
                         <tr><td class="kv-key">models_dir</td><td class="kv-val" id="cfgModelsDir">-</td></tr>
                     </table>
                 </div>
@@ -583,16 +597,15 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
     </div>
 
     <script>
-        // Copy-to-clipboard for model names (Supported Models by Service,
-        // Active Transcript Requests, and the configured default_model /
-        // diarization_model values) -- so a full model key like
-        // "whisper-large-v3-turbo-q8_0" can be grabbed with one click
-        // instead of a manual select-and-copy.
+        const COPY_ICON_SVG = `<svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
+        const CHECK_ICON_SVG = `<svg viewBox="0 0 24 24" style="stroke:var(--accent-green);"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
+
+        // Copy-to-clipboard for model names on the Supported Models by Service page
+        // so a full model key can be grabbed with one click.
         function copyToClipboard(text, btn) {
             const done = () => {
-                const orig = btn.innerText;
-                btn.innerText = '✅';
-                setTimeout(() => { btn.innerText = orig; }, 900);
+                btn.innerHTML = CHECK_ICON_SVG;
+                setTimeout(() => { btn.innerHTML = COPY_ICON_SVG; }, 900);
             };
             if (navigator.clipboard && navigator.clipboard.writeText) {
                 navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
@@ -617,7 +630,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         }
 
         function copyBtn(name) {
-            return `<button class="copy-btn" onclick="copyToClipboard('${name}', this)" title="Copy '${name}' to clipboard">📋</button>`;
+            return `<button class="copy-btn" onclick="copyToClipboard('${name}', this)" title="Copy '${name}' to clipboard">${COPY_ICON_SVG}</button>`;
         }
 
         async function fetchJSON(url) {
@@ -739,7 +752,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     transcribeTbody.innerHTML = '<tr><td colspan="3" class="card-subtext">No active transcript requests</td></tr>';
                 } else {
                     transcribeTbody.innerHTML = activeTranscribeRequests.map(r =>
-                        `<tr><td class="kv-val">#${r.id}</td><td class="kv-val">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val"><span class="model-name-cell">${r.model}${copyBtn(r.model)}</span></td></tr>`
+                        `<tr><td class="kv-val">#${r.id}</td><td class="kv-val">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val">${r.model}</td></tr>`
                     ).join('');
                 }
             }
