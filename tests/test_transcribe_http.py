@@ -411,3 +411,27 @@ class TestRealCallSessionIntegration:
         assert status == 200
         doc = json.loads(resp)
         assert doc["text"]
+
+    @pytest.mark.asyncio
+    async def test_batch_only_parakeet_tdt_model_succeeds_over_http_unlike_grpc(self):
+        os.environ["FAKE_WORDS_PER_SEC"] = "50"
+        try:
+            body = _multipart_body(
+                {"model": "parakeet-tdt-0.6b-v3"},
+                file_field="file",
+                file_bytes=_wav_bytes(n_frames=2560),
+            )
+            status, resp, ct = await transcribe_http.handle_transcribe_request(
+                content_type=CONTENT_TYPE,
+                body=body,
+                settings=_settings(worker_bin_parakeet_tdt=str(FAKE_WORKER)),
+                budget=_budget(),
+                draining=False,
+                tracker=_tracker(),
+            )
+        finally:
+            os.environ.pop("FAKE_WORDS_PER_SEC", None)
+
+        assert status == 200
+        doc = json.loads(resp)
+        assert doc["text"]

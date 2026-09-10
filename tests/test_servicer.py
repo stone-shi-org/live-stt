@@ -184,6 +184,27 @@ async def test_transcribe_rejects_batch_only_whisper_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_transcribe_rejects_batch_only_parakeet_tdt_model() -> None:
+    async def tdt_config() -> AsyncIterator[asr_pb2.TranscriptionRequest]:
+        yield asr_pb2.TranscriptionRequest(
+            config=asr_pb2.StreamConfig(
+                encoding=asr_pb2.AUDIO_ENCODING_LINEAR16,
+                sample_rate_hz=16000,
+                model="parakeet-tdt-0.6b-v3",
+            )
+        )
+
+    async with _Server(_settings()) as server:
+        async with server.channel() as channel:
+            stub = asr_pb2_grpc.StreamingASRStub(channel)
+            with pytest.raises(grpc.aio.AioRpcError) as exc_info:
+                async for _ in stub.Transcribe(tdt_config()):
+                    pass
+    assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert "batch-only" in exc_info.value.details()
+
+
+@pytest.mark.asyncio
 async def test_transcribe_rejects_second_config_message() -> None:
     async def two_configs() -> AsyncIterator[asr_pb2.TranscriptionRequest]:
         cfg = asr_pb2.StreamConfig(encoding=asr_pb2.AUDIO_ENCODING_LINEAR16, sample_rate_hz=16000)

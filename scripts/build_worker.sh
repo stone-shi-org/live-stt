@@ -87,10 +87,10 @@ cmake -S third_party/whisper.cpp -B build-whisper \
 echo "==> Building whisper.cpp"
 cmake --build build-whisper -j"$NPROC"
 
-echo "==> Configuring live_stt_worker / live_stt_worker_whisper"
+echo "==> Configuring live_stt_worker / live_stt_worker_whisper / live_stt_worker_parakeet_tdt"
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-echo "==> Building live_stt_worker / live_stt_worker_whisper"
+echo "==> Building live_stt_worker / live_stt_worker_whisper / live_stt_worker_parakeet_tdt"
 cmake --build build -j"$NPROC"
 
-echo "==> Built: worker/build/live_stt_worker, worker/build/live_stt_worker_whisper"
+echo "==> Built: worker/build/live_stt_worker, worker/build/live_stt_worker_whisper, worker/build/live_stt_worker_parakeet_tdt"

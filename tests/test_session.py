@@ -177,6 +177,25 @@ async def test_whisper_engine_spawns_the_whisper_binary_not_the_parakeet_one() -
 
 
 @pytest.mark.asyncio
+async def test_parakeet_tdt_engine_spawns_the_parakeet_tdt_binary() -> None:
+    settings = Settings(
+        _env_file=None,
+        worker_bin="/nonexistent/live_stt_worker",
+        worker_bin_whisper="/nonexistent/live_stt_worker_whisper",
+        worker_bin_parakeet_tdt=str(FAKE_WORKER),
+        models_dir="/fake",
+    )
+    session = _session(settings=settings, model_key="parakeet-tdt-0.6b-v3")
+    try:
+        ready_event = await session.start()
+    finally:
+        await session.close()
+
+    assert ready_event.WhichOneof("event") == "ready"
+    assert ready_event.ready.model == "parakeet-tdt-0.6b-v3"
+
+
+@pytest.mark.asyncio
 async def test_use_gpu_is_derived_from_backend_setting_not_hardcoded() -> None:
     # Settings.backend == "cuda" -- CallSession._spawn_worker (session.py)
     # must derive use_gpu=True from this and thread it through

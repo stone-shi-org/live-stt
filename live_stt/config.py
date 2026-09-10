@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     worker_bin_whisper: str = "/app/worker/whisper/live_stt_worker_whisper"
     worker_ggml_lib_dir_whisper: str | None = None
 
+    # Parakeet TDT batch worker binary/lib-dir pair.
+    worker_bin_parakeet_tdt: str = "/app/worker/live_stt_worker_parakeet_tdt"
+    worker_ggml_lib_dir_parakeet_tdt: str | None = None
+
     # tools/thread_sweep.py (Phase 1 Gate B), measured on THIS repo's 6-core
     # dev host, single-stream-at-a-time (not concurrent -- see CLAUDE.md's
     # caveat about contention): n_threads=1 gave rtfx=2.48 and, because
@@ -65,6 +69,7 @@ class Settings(BaseSettings):
     # multi-stream throughput -- but that's a hypothesis, not a measurement.
     # Revisit with a real sweep before trusting this default under load.
     n_threads_whisper: int = 4
+    n_threads_parakeet_tdt: int = 4
     max_concurrent_calls: int = 3
     # Admission always reserves this many slots so a mid-call rotation has
     # somewhere to put its overlap shadow. Never hand the reserve to a call.

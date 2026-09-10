@@ -31,6 +31,7 @@ GGML_LIB_DIR = REPO_ROOT / "worker" / "build-parakeet" / "third_party" / "ggml" 
 # actually building it, see worker/CMakeLists.txt), so there is no .so to
 # point at.
 WORKER_BIN_WHISPER = REPO_ROOT / "worker" / "build" / "live_stt_worker_whisper"
+WORKER_BIN_PARAKEET_TDT = REPO_ROOT / "worker" / "build" / "live_stt_worker_parakeet_tdt"
 
 
 class WorkerHandle:

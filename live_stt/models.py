@@ -104,6 +104,18 @@ MODELS: dict[str, ModelSpec] = {
         assumed_leak_mb_per_audio_sec=35.0,
         strip_language_tag=True,
     ),
+    # --- Parakeet TDT family (batch-only, see this module's docstring) ----
+    "parakeet-tdt-0.6b-v3": ModelSpec(
+        key="parakeet-tdt-0.6b-v3",
+        gguf_filename="tdt-0.6b-v3-q8_0.gguf",
+        model_chunk_ms=1000,
+        has_eou=False,
+        has_punctuation=True,
+        multilingual=True,
+        assumed_leak_mb_per_audio_sec=0.0,
+        engine="parakeet_tdt",
+        streaming_capable=False,
+    ),
     # --- whisper.cpp family (batch-only, see this module's docstring) -----
     # Files/checksums verified live against the real ggerganov/whisper.cpp
     # HF repo listing while building this (see scripts/fetch_model.sh) --
@@ -168,6 +180,8 @@ MODELS: dict[str, ModelSpec] = {
 }
 
 DEFAULT_MODEL_KEY = "realtime_eou_120m-v1"
+# Canonical key for the Parakeet TDT batch model.
+DEFAULT_PARAKEET_TDT_MODEL_KEY = "parakeet-tdt-0.6b-v3"
 # Not wired into Settings.default_model (that stays realtime_eou_120m-v1,
 # the streaming default) -- this exists purely so other code/docs/tests have
 # one canonical whisper key to point at without repeating the string. This

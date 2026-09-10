@@ -40,6 +40,7 @@ mkdir -p "$MODELS_DIR"
 declare -A MODEL_FILES=(
     ["realtime_eou_120m-v1"]="mudler/parakeet-cpp-gguf realtime_eou_120m-v1-q8_0.gguf 62616b914d6f5a683a5dea672df055b57de5c49dddf871b8b44b9c814dc3d896"
     ["nemotron-3.5-asr-streaming-0.6b"]="mudler/parakeet-cpp-gguf nemotron-3.5-asr-streaming-0.6b-q8_0.gguf ba2f13eccd4a5245be728f77e6149bd6a4fdcdd133ff2e08ac6005bcef7a99f1"
+    ["parakeet-tdt-0.6b-v3"]="mudler/parakeet-cpp-gguf tdt-0.6b-v3-q8_0.gguf 4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757"
     ["whisper-base.en-q8_0"]="ggerganov/whisper.cpp ggml-base.en-q8_0.bin a4d4a0768075e13cfd7e19df3ae2dbc4a68d37d36a7dad45e8410c9a34f8c87e"
     ["whisper-small-q8_0"]="ggerganov/whisper.cpp ggml-small-q8_0.bin 49c8fb02b65e6049d5fa6c04f81f53b867b5ec9540406812c643f177317f779f"
     ["whisper-medium-q8_0"]="ggerganov/whisper.cpp ggml-medium-q8_0.bin 42a1ffcbe4167d224232443396968db4d02d4e8e87e213d3ee2e03095dea6502"

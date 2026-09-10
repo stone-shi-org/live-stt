@@ -112,6 +112,35 @@ set_target_properties(live_stt_worker PROPERTIES
 )
 
 # --------------------------------------------------------------------------
+# Third engine: parakeet-tdt, the batch-only Parakeet TDT worker binary
+# (live_stt_worker_parakeet_tdt). Uses the same libparakeet.a and ggml
+# backend libraries as live_stt_worker, but buffers audio and drives the
+# offline TDT transcription API at finalize().
+# --------------------------------------------------------------------------
+add_executable(live_stt_worker_parakeet_tdt
+    main_parakeet_tdt.cpp
+    session_parakeet_tdt.cpp
+    framing.cpp
+    json_util.cpp
+)
+
+target_link_libraries(live_stt_worker_parakeet_tdt PRIVATE parakeet ${GGML_LIB} ${GGML_BASE_LIB} ${GGML_CPU_LIB})
+if(GGML_CUDA_LIB)
+  target_link_libraries(live_stt_worker_parakeet_tdt PRIVATE ${GGML_CUDA_LIB})
+  target_link_libraries(live_stt_worker_parakeet_tdt PRIVATE CUDA::cuda_driver)
+endif()
+
+target_include_directories(live_stt_worker_parakeet_tdt PRIVATE
+    "${PARAKEET_SRC_DIR}/src"
+    "${PARAKEET_SRC_DIR}/third_party/ggml/include"
+)
+
+set_target_properties(live_stt_worker_parakeet_tdt PROPERTIES
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "$ORIGIN"
+)
+
+# --------------------------------------------------------------------------
 # Second engine: whisper.cpp, the batch-only worker binary
 # (live_stt_worker_whisper -- see CLAUDE.md's "Model choice" section and
 # live_stt/servicer.py's streaming_capable gate for why this is a SEPARATE

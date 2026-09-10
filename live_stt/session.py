@@ -103,6 +103,18 @@ class CallSession:
                 else None
             )
             n_threads = self._settings.n_threads_whisper
+        elif self._model_spec.engine == "parakeet_tdt":
+            worker_bin = Path(self._settings.worker_bin_parakeet_tdt)
+            ggml_lib_dir = (
+                Path(self._settings.worker_ggml_lib_dir_parakeet_tdt)
+                if self._settings.worker_ggml_lib_dir_parakeet_tdt
+                else (
+                    Path(self._settings.worker_ggml_lib_dir)
+                    if self._settings.worker_ggml_lib_dir
+                    else None
+                )
+            )
+            n_threads = self._settings.n_threads_parakeet_tdt
         else:
             worker_bin = Path(self._settings.worker_bin)
             ggml_lib_dir = (

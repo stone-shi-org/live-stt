@@ -242,6 +242,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=worker-build /src/live-stt-worker/worker/build/live_stt_worker /app/worker/live_stt_worker
+COPY --from=worker-build /src/live-stt-worker/worker/build/live_stt_worker_parakeet_tdt /app/worker/live_stt_worker_parakeet_tdt
 COPY --from=worker-build /src/live-stt-worker/worker/build-parakeet/third_party/ggml/src/*.so* /app/worker/
 # live_stt_worker_whisper is a single self-contained static executable (see
 # worker/CMakeLists.txt's whisper block -- its vendored ggml links fully
@@ -256,6 +257,7 @@ COPY live_stt/ ./live_stt/
 COPY run.py version.txt* ./
 
 ENV LSTT_WORKER_BIN=/app/worker/live_stt_worker \
+    LSTT_WORKER_BIN_PARAKEET_TDT=/app/worker/live_stt_worker_parakeet_tdt \
     LSTT_WORKER_BIN_WHISPER=/app/worker/whisper/live_stt_worker_whisper \
     LSTT_BACKEND=cpu \
     LSTT_GRPC_HOST=0.0.0.0 \
@@ -317,6 +319,7 @@ RUN pip install --no-cache-dir --break-system-packages -r requirements.txt \
         --index-url https://pypi.org/simple/
 
 COPY --from=worker-build-cuda /src/live-stt-worker/worker/build/live_stt_worker /app/worker/live_stt_worker
+COPY --from=worker-build-cuda /src/live-stt-worker/worker/build/live_stt_worker_parakeet_tdt /app/worker/live_stt_worker_parakeet_tdt
 COPY --from=worker-build-cuda /src/live-stt-worker/worker/build-parakeet/third_party/ggml/src/*.so* /app/worker/
 # live_stt_worker_whisper (Phase 6, CUDA): confirmed via ldd (see the
 # LD_LIBRARY_PATH comment above) to be fully self-contained -- no .a/.so
@@ -331,6 +334,7 @@ COPY live_stt/ ./live_stt/
 COPY run.py version.txt* ./
 
 ENV LSTT_WORKER_BIN=/app/worker/live_stt_worker \
+    LSTT_WORKER_BIN_PARAKEET_TDT=/app/worker/live_stt_worker_parakeet_tdt \
     LSTT_WORKER_BIN_WHISPER=/app/worker/whisper/live_stt_worker_whisper \
     LSTT_BACKEND=cuda \
     LSTT_GRPC_HOST=0.0.0.0 \

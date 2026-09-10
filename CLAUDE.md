@@ -1005,6 +1005,25 @@ pinning that the check is skipped entirely, not merely tolerant of a `None` read
 side's own reject branch remains unexercised under real contention, same documented caveat as
 before — this fix makes the two paths consistent, not the untested branch itself newly verified.
 
+## Third engine: Parakeet TDT (batch-only, `POST /v1/audio/transcriptions` only)
+
+Added to support `parakeet-tdt-0.6b-v3` (`DEFAULT_PARAKEET_TDT_MODEL_KEY`).
+
+NVIDIA's Parakeet TDT models (FastConformer with Token-and-Duration Transducer architecture)
+are supported offline in the vendored `parakeet.cpp` submodule at tag `v0.5.0-1-ge75de9b`, but
+its streaming session (`src/streaming.cpp`) asserts `joint_.num_durations() == 0` (RNN-T only).
+
+Following the precedent established by whisper.cpp, Parakeet TDT is exposed as a **batch-only
+worker binary** (`live_stt_worker_parakeet_tdt`, built from `worker/main_parakeet_tdt.cpp` +
+`worker/session_parakeet_tdt.{hpp,cpp}`) linking against `libparakeet.a` and ggml libraries.
+Audio is buffered during `feed()` without per-chunk inference, and offline TDT transcription is
+executed at `finalize()` via `parakeet_capi_transcribe_pcm_batch_json_lang` (`decoder=2`).
+
+- Rejected on gRPC `Transcribe` stream with `INVALID_ARGUMENT` (`streaming_capable=False`).
+- Accessible via batch HTTP endpoint `POST /v1/audio/transcriptions`.
+- Mid-call worker rotation is unconditionally disabled in `CallSession._should_start_rotation`.
+- GGUF model: `mudler/parakeet-cpp-gguf` -> `tdt-0.6b-v3-q8_0.gguf` (940.7 MB, sha256 `4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757`).
+
 ## parakeet.cpp: verified API facts and build gotchas found while building this
 
 The submodule is pinned at a specific SHA (`.gitmodules` / `git -C worker/third_party/parakeet.cpp

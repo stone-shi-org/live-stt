@@ -2,6 +2,7 @@ import pytest
 
 from live_stt.models import (
     DEFAULT_MODEL_KEY,
+    DEFAULT_PARAKEET_TDT_MODEL_KEY,
     DEFAULT_WHISPER_MODEL_KEY,
     MODELS,
     resolve,
@@ -44,12 +45,21 @@ def test_nemotron_has_no_eou_and_has_punctuation() -> None:
 
 
 def test_all_parakeet_models_have_a_gguf_filename() -> None:
-    # Only the parakeet family uses real GGUF files -- whisper's use its own
-    # legacy ggml *.bin format (see live_stt/models.py's docstring), so this
-    # is scoped to engine="parakeet" rather than every registered model.
+    # Parakeet streaming and TDT models use real GGUF files
     for spec in MODELS.values():
-        if spec.engine == "parakeet":
+        if spec.engine in ("parakeet", "parakeet_tdt"):
             assert spec.gguf_filename.endswith(".gguf")
+
+
+def test_parakeet_tdt_model_spec() -> None:
+    spec = resolve("parakeet-tdt-0.6b-v3")
+    assert spec.key == DEFAULT_PARAKEET_TDT_MODEL_KEY
+    assert spec.engine == "parakeet_tdt"
+    assert spec.streaming_capable is False
+    assert spec.has_eou is False
+    assert spec.has_punctuation is True
+    assert spec.multilingual is True
+    assert spec.gguf_filename == "tdt-0.6b-v3-q8_0.gguf"
 
 
 def test_all_whisper_models_have_a_bin_filename_and_are_batch_only() -> None:
