@@ -284,6 +284,18 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             word-break: break-all;
         }
 
+        .col-id {
+            width: 100px;
+        }
+
+        .col-elapsed {
+            width: 120px;
+        }
+
+        .col-info {
+            width: auto;
+        }
+
         .model-name-cell {
             display: inline-flex;
             align-items: center;
@@ -475,9 +487,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             <table class="kv-table" id="diarizeActiveTable">
                 <thead>
                     <tr>
-                        <td class="kv-key">ID</td>
-                        <td class="kv-key">Elapsed</td>
-                        <td class="kv-key">Device</td>
+                        <td class="kv-key col-id">ID</td>
+                        <td class="kv-key col-elapsed">Elapsed</td>
+                        <td class="kv-key col-info">Device</td>
                     </tr>
                 </thead>
                 <tbody id="diarizeActiveTbody">
@@ -492,9 +504,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             <table class="kv-table" id="transcribeActiveTable">
                 <thead>
                     <tr>
-                        <td class="kv-key">ID</td>
-                        <td class="kv-key">Elapsed</td>
-                        <td class="kv-key">Model</td>
+                        <td class="kv-key col-id">ID</td>
+                        <td class="kv-key col-elapsed">Elapsed</td>
+                        <td class="kv-key col-info">Model</td>
                     </tr>
                 </thead>
                 <tbody id="transcribeActiveTbody">
@@ -732,7 +744,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     diarizeTbody.innerHTML = '<tr><td colspan="3" class="card-subtext">No active diarization requests</td></tr>';
                 } else {
                     diarizeTbody.innerHTML = activeRequests.map(r =>
-                        `<tr><td class="kv-val">#${r.id}</td><td class="kv-val">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val">${r.device}</td></tr>`
+                        `<tr><td class="kv-val col-id">#${r.id}</td><td class="kv-val col-elapsed">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val col-info">${r.device}</td></tr>`
                     ).join('');
                 }
 
@@ -752,7 +764,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     transcribeTbody.innerHTML = '<tr><td colspan="3" class="card-subtext">No active transcript requests</td></tr>';
                 } else {
                     transcribeTbody.innerHTML = activeTranscribeRequests.map(r =>
-                        `<tr><td class="kv-val">#${r.id}</td><td class="kv-val">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val">${r.model}</td></tr>`
+                        `<tr><td class="kv-val col-id">#${r.id}</td><td class="kv-val col-elapsed">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val col-info">${r.model}</td></tr>`
                     ).join('');
                 }
             }
