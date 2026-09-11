@@ -779,19 +779,53 @@ in `configure()` and there is no loop anywhere near it.
     (per-cluster purity 0.54–0.83) — still below pyannote's number, on a different file, so not a
     strictly apples-to-apples comparison, but the only in-spec data point gathered and not a
     favorable one.
-  - **GPU-path performance/VRAM: not actually measured.** The RTX 3090 was fully occupied by an
-    unrelated tenant process the entire session (~23.7GB used, confirmed via
-    `nvidia-smi --query-compute-apps`); a `.cuda()` load attempt hit a real `torch.OutOfMemoryError`.
-    Per this repo's own "shared box, don't disrupt other tenants" convention (see "Ops notes"), the
-    spike did not contend for the card — so, same caveat this file already carries for the ASR
-    VRAM-admission reject path, real GPU behavior for this specific engine remains unverified.
+  - **GPU-path performance/VRAM: since measured for real, once the shared RTX 3090 was freed up.**
+    The first attempt found the card fully occupied by an unrelated tenant (~23.7GB used); once
+    that tenant released it (confirmed via `nvidia-smi`: 24083 MiB free, zero compute-apps
+    processes, both before and after this run — no contention this time), the same two fixtures
+    were re-run on CUDA:
+
+    | fixture | true spk | detected | segments | wall | peak VRAM (this PID) | frame agreement |
+    |---|---|---|---|---|---|---|
+    | `MTG_32089` (5-spk) | 5 | 4 (capped) | 163 | 1.44s | 1402 MiB | 0.7595 |
+    | `MTG_32000` (4-spk, in-spec) | 4 | 4 | 210 | 1.06s | 1402 MiB | 0.6734 |
+
+    Model load itself (`from_pretrained` + `.cuda()`) was ~1.23s — about the same as the CPU load
+    time (~1.2s, mostly HF-cache I/O either way, not compute) — but **the actual `diarize()` call is
+    where GPU wins**: ~8-10x faster than CPU's 10.7-11s wall time on the same two fixtures, not the
+    ~19x seen for the existing pyannote engine on a longer file, but the same direction and a real,
+    substantial speedup. The silent 4-speaker cap on `MTG_32089` reproduced identically on GPU (same
+    failure shape: one real speaker's speech absorbed into another's cluster, weakest cluster
+    purity 0.488). Accuracy came out marginally *higher* on GPU than CPU on both fixtures (0.7595 vs
+    0.748; 0.6734 vs 0.674) — small, real differences, plausibly floating-point reduction-order
+    differences between backends (the same class of effect this file's parakeet.cpp CPU/CUDA notes
+    already document at length elsewhere) rather than "GPU is more accurate," and nowhere near
+    enough to change the accuracy-regression conclusion below. **VRAM caveat**: both runs completed
+    in ~1-1.4s, so a 0.5s-interval sampler only caught ~3 samples each — 1402 MiB is a real per-PID
+    reading (isolated by PID via `nvidia-smi --query-compute-apps`, not just card-wide
+    `memory.used`) but likely undersamples the true instantaneous peak during compute; treat it as
+    a rough floor, not a calibrated peak the way the existing pyannote VRAM numbers elsewhere in
+    this file are. One packaging improvement found on this second pass, worth keeping over the
+    first pass's workaround: rather than hand-writing a no-op stub class for
+    `nv_one_logger_pytorch_lightning_integration`'s unconditional-instantiation problem, repackaging
+    the real PyPI wheel with just its `Requires-Python: <3.14` constraint stripped from `METADATA`
+    (RECORD hashes regenerated to match) let the real package install and import cleanly with no
+    crash and no second workaround needed — a cleaner fix than the original stub-class approach,
+    though still not something to ship as-is (patching a third-party wheel's metadata by hand in a
+    Dockerfile is exactly the kind of fragile step this file's own conventions warn against
+    elsewhere).
 
   **Net effect of this spike**: the plan's own exit criteria for proceeding to a Phase 2 production
   integration ("accuracy on a ≤4-speaker fixture at or above pyannote's baseline," "no unresolved
   dependency conflict") are not met — the accuracy bar was missed on the one in-spec data point
   gathered, and a new, unanticipated Python-3.14 packaging blocker was found that the original plan
-  did not account for. Recommendation on LS-4: do not proceed to integration at this time. The
-  genuinely good news found along the way (license, pyannote coexistence, CPU speed) would still
+  did not account for. **GPU access being freed up and re-tested did not change this**: GPU gives a
+  real ~8-10x wall-time speedup over CPU, same direction as pyannote's own CPU/CUDA numbers
+  elsewhere in this file, but accuracy on GPU is statistically indistinguishable from CPU (both
+  still below the pyannote baseline) and the silent 4-speaker cap and the Python-3.14 packaging
+  blocker are both backend-independent. Recommendation on LS-4: do not proceed to integration at
+  this time. The genuinely good news found along the way (license, pyannote coexistence, CPU AND
+  now GPU speed) would still
   apply to a future revisit if a later Sortformer release lifts the 4-speaker cap or the
   `nv_one_logger` Python-version ceiling is fixed upstream — this is a "not now," not a "never."
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
