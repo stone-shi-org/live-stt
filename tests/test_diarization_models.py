@@ -58,4 +58,40 @@ def test_spec_dataclass_shape_has_no_surprise_fields():
         "gated",
         "supports_num_speakers_hint",
         "measured_peak_vram_mb",
+        "engine",
+        "max_speakers_supported",
     }
+
+
+def test_pyannote_entry_defaults_engine_to_pyannote_and_no_speaker_cap():
+    # The pre-existing entry's construction call never set engine=/
+    # max_speakers_supported= -- confirms both new fields' defaults
+    # preserve it unchanged, per LS-4's "additive default" design.
+    spec = DIARIZATION_MODELS[DEFAULT_DIARIZATION_MODEL_KEY]
+    assert spec.engine == "pyannote"
+    assert spec.max_speakers_supported is None
+
+
+def test_sortformer_entry_is_registered():
+    spec = resolve("nvidia/diar_streaming_sortformer_4spk-v2.1")
+    assert spec.hf_repo_id == "nvidia/diar_streaming_sortformer_4spk-v2.1"
+    assert spec.engine == "nemo_sortformer"
+    # Confirmed via the HF API during the LS-4 spike -- not gated, unlike
+    # the pyannote entry.
+    assert spec.gated is False
+    # End-to-end model, no clustering step to hand a hint to -- confirmed
+    # during the LS-4 spike, not merely "unwired".
+    assert spec.supports_num_speakers_hint is False
+    # Hard cap confirmed during the LS-4 spike (degrades/silently caps at
+    # 5+ real speakers).
+    assert spec.max_speakers_supported == 4
+    # Rough floor from the LS-4 GPU spike, not a calibrated peak -- see
+    # that field's own docstring.
+    assert spec.measured_peak_vram_mb == 1402
+
+
+def test_default_diarization_model_is_unaffected_by_the_new_entry():
+    # Sortformer is opt-in via model=, not a change to what an unqualified
+    # diarization request does.
+    assert DEFAULT_DIARIZATION_MODEL_KEY == "pyannote/speaker-diarization-community-1"
+    assert resolve(None).engine == "pyannote"

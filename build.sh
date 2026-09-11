@@ -11,6 +11,12 @@
 #                                            baked in, see requirements-diarization.txt), tags get
 #                                            a -cuda-diarize suffix -- requires --cuda, no CPU+
 #                                            diarize image target exists
+#   ./build.sh --cuda --diarize --sortformer  build runtime-cuda-diarize-sortformer (adds NVIDIA
+#                                            Sortformer v2.1, see
+#                                            requirements-diarization-sortformer.txt, LS-4), tags
+#                                            get a -cuda-diarize-sortformer suffix -- requires
+#                                            --cuda --diarize, no smaller-image sortformer target
+#                                            exists
 #   LSTT_REGISTRY=registry.example.com/x ./build.sh   same, via environment
 #
 # Registry precedence: -r flag > LSTT_REGISTRY env var > unset (local image only).
@@ -27,6 +33,7 @@ PUSH=0
 EXTRA_TAG=""
 CUDA=0
 DIARIZE=0
+SORTFORMER=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -35,7 +42,8 @@ while [[ $# -gt 0 ]]; do
         -r|--registry) REGISTRY="$2"; shift 2 ;;
         --cuda)        CUDA=1; shift ;;
         --diarize)     DIARIZE=1; shift ;;
-        -h|--help)     sed -n '2,20p' "$0"; exit 0 ;;
+        --sortformer)  SORTFORMER=1; shift ;;
+        -h|--help)     sed -n '2,24p' "$0"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -52,6 +60,11 @@ if [ "$DIARIZE" -eq 1 ] && [ "$CUDA" -ne 1 ]; then
     exit 1
 fi
 
+if [ "$SORTFORMER" -eq 1 ] && [ "$DIARIZE" -ne 1 ]; then
+    echo "ERROR: --sortformer requires --diarize (and --cuda) -- it extends runtime-cuda-diarize." >&2
+    exit 1
+fi
+
 # REPO is the full tag prefix: "live-stt" locally, or
 # "registry.example.com/homestack/live-stt" once a registry is set.
 REPO="${REGISTRY:+${REGISTRY}/}${IMAGE}"
@@ -65,6 +78,10 @@ fi
 if [ "$DIARIZE" -eq 1 ]; then
     TARGET="runtime-cuda-diarize"
     SUFFIX="-cuda-diarize"
+fi
+if [ "$SORTFORMER" -eq 1 ]; then
+    TARGET="runtime-cuda-diarize-sortformer"
+    SUFFIX="-cuda-diarize-sortformer"
 fi
 
 # version.txt is baked into the image and surfaced at GetServerInfo (and

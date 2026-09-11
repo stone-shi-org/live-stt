@@ -1,0 +1,30 @@
+# NVIDIA Sortformer v2.1 diarization engine (live_stt/diarization.py's
+# "nemo_sortformer" path, live_stt/diarization_models.py's
+# nvidia/diar_streaming_sortformer_4spk-v2.1 entry) -- see CLAUDE.md's LS-4
+# entry for the full spike writeup this is built from (license, real
+# install path, CPU+GPU accuracy/VRAM measurements).
+#
+# Deliberately separate from requirements-diarization.txt, one level
+# further: nemo_toolkit's dependency tree is meaningfully heavier than
+# pyannote.audio's own (lhotse, hydra-core, omegaconf, lightning, etc. on
+# top of torch/torchaudio), and this is a second, more niche opt-in engine
+# on top of an already-opt-in feature -- bloating every diarization
+# deployment for a specific model most won't use would be the wrong
+# tradeoff, the same reasoning that keeps requirements-diarization.txt out
+# of requirements.txt one level up.
+#
+# Pinned to an exact release, not a floor, and not the HF model card's own
+# `pip install git+https://github.com/NVIDIA/NeMo.git@main#egg=nemo_toolkit[asr]`
+# instruction -- that floats on NeMo's main branch, which is a moving
+# target this repo's own "reason comment on every non-obvious pin"
+# convention doesn't tolerate elsewhere. Confirmed during the LS-4 spike
+# that nemo.collections.asr.models.SortformerEncLabelModel is present in
+# real tagged PyPI releases back through 2.2.0, and that 3.0.0 specifically
+# installs and imports cleanly under Python 3.12 -- this image's actual
+# interpreter (runtime-cuda's base is python3.12, NOT the 3.14 the
+# dev-host/GPU-box throwaway venvs used during the spike itself, which is
+# why the Python-version packaging blocker recorded in CLAUDE.md's LS-4
+# entry does not apply here; verified for real via a plain
+# `docker run python:3.12-slim` install+import check before writing this
+# file, not assumed from the version-classifier metadata alone).
+nemo_toolkit[asr]==3.0.0

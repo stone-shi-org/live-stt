@@ -20,6 +20,7 @@ from live_stt.diarization import (
     DiarizationError,
     _diarize_file_direct,
     _diarize_file_subprocess,
+    _parse_sortformer_segments,
     annotation_to_house_json,
     assign_text,
     diarize_file,
@@ -528,6 +529,242 @@ class TestDiarizeFileSubprocess:
         res = diarize_file(wav, settings=_settings(diarization_hf_token="tok", diarize_in_subprocess=False))
         assert res == expected
         assert mock_direct.call_count == 1
+
+
+def _stub_nemo(monkeypatch: pytest.MonkeyPatch, fake_model_class: object) -> None:
+    """Inject a fake ``nemo.collections.asr.models`` module tree so
+    ``from nemo.collections.asr.models import SortformerEncLabelModel``
+    resolves to ``fake_model_class`` without a real nemo_toolkit install.
+    """
+    import sys
+    import types
+
+    fake_models = types.ModuleType("nemo.collections.asr.models")
+    fake_models.SortformerEncLabelModel = fake_model_class
+    fake_asr = types.ModuleType("nemo.collections.asr")
+    fake_asr.models = fake_models
+    fake_collections = types.ModuleType("nemo.collections")
+    fake_collections.asr = fake_asr
+    fake_nemo = types.ModuleType("nemo")
+    fake_nemo.collections = fake_collections
+
+    monkeypatch.setitem(sys.modules, "nemo", fake_nemo)
+    monkeypatch.setitem(sys.modules, "nemo.collections", fake_collections)
+    monkeypatch.setitem(sys.modules, "nemo.collections.asr", fake_asr)
+    monkeypatch.setitem(sys.modules, "nemo.collections.asr.models", fake_models)
+
+
+class TestParseSortformerSegments:
+    def test_parses_start_end_label(self):
+        parsed = _parse_sortformer_segments(["6.720 8.400 speaker_0", "8.400 9.100 speaker_1"])
+        assert parsed == [(6.72, 8.4, "speaker_0"), (8.4, 9.1, "speaker_1")]
+
+    def test_malformed_line_raises_diarization_error(self):
+        with pytest.raises(DiarizationError, match="unexpected Sortformer segment format"):
+            _parse_sortformer_segments(["not-three-fields"])
+
+    def test_non_numeric_timestamp_raises_diarization_error(self):
+        with pytest.raises(DiarizationError, match="unexpected Sortformer segment format"):
+            _parse_sortformer_segments(["oops 8.400 speaker_0"])
+
+
+class TestSortformerEngine:
+    """live_stt.diarization's "nemo_sortformer" engine path (LS-4) --
+    offline against a fake SortformerEncLabelModel stand-in, same pattern
+    the pyannote tests above use for pyannote.audio.
+    """
+
+    def _sortformer_settings(self, **overrides) -> Settings:
+        return _settings(diarization_model="nvidia/diar_streaming_sortformer_4spk-v2.1", **overrides)
+
+    def test_missing_dependency_raises_diarization_error(self, monkeypatch: pytest.MonkeyPatch):
+        import sys
+
+        # Mirrors the pyannote equivalent above: a leaf entry of None in
+        # sys.modules makes Python raise ImportError immediately for that
+        # exact dotted import, regardless of whether the real package
+        # happens to be installed in whatever environment runs this test.
+        monkeypatch.setitem(sys.modules, "nemo.collections.asr.models", None)
+        with pytest.raises(DiarizationError, match="nemo_toolkit\\[asr\\] is not installed"):
+            load_pipeline(self._sortformer_settings())
+
+    def test_does_not_require_a_token_even_when_unset(self, monkeypatch: pytest.MonkeyPatch):
+        class FakeModel:
+            def eval(self):
+                return self
+
+        class FakeModelClass:
+            @staticmethod
+            def from_pretrained(repo_id):
+                return FakeModel()
+
+        _stub_nemo(monkeypatch, FakeModelClass)
+        model = load_pipeline(self._sortformer_settings(diarization_hf_token=None))
+        assert model is not None
+
+    def test_diarize_file_direct_dispatches_to_sortformer_runner(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        capture: dict = {}
+
+        class FakeModel:
+            def eval(self):
+                return self
+
+            def diarize(self, *, audio, batch_size):
+                capture["audio"] = audio
+                capture["batch_size"] = batch_size
+                return [["0.000 1.000 speaker_0", "1.000 2.000 speaker_1"]]
+
+        class FakeModelClass:
+            @staticmethod
+            def from_pretrained(repo_id):
+                capture["repo_id"] = repo_id
+                return FakeModel()
+
+        _stub_nemo(monkeypatch, FakeModelClass)
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+
+        result = _diarize_file_direct(wav, settings=self._sortformer_settings())
+
+        assert capture["repo_id"] == "nvidia/diar_streaming_sortformer_4spk-v2.1"
+        assert capture["batch_size"] == 1
+        assert capture["audio"] == [str(wav)]
+        assert result["num_speakers"] == 2
+        assert result["segments"][0]["speaker"] == "SPEAKER_speaker_0"
+        assert "warnings" not in result
+
+    def test_num_speakers_kwargs_are_never_passed_to_sortformer(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        # supports_num_speakers_hint=False for this entry -- confirms the
+        # registry-driven withholding already tested for pyannote's
+        # no-hint-model case also holds for a real engine-dispatch branch,
+        # not just the shared kwarg-building helper.
+        class FakeModel:
+            def eval(self):
+                return self
+
+            def diarize(self, *, audio, batch_size):
+                return [["0.000 1.000 speaker_0"]]
+
+        class FakeModelClass:
+            @staticmethod
+            def from_pretrained(repo_id):
+                return FakeModel()
+
+        _stub_nemo(monkeypatch, FakeModelClass)
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        # Would raise TypeError if _run_sortformer ever tried to forward
+        # num_speakers= into FakeModel.diarize's signature -- it doesn't
+        # accept one.
+        result = _diarize_file_direct(
+            wav, settings=self._sortformer_settings(diarization_num_speakers=3)
+        )
+        assert result["num_speakers"] == 1
+
+    def test_hitting_the_speaker_cap_adds_an_advisory_warning(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        class FakeModel:
+            def eval(self):
+                return self
+
+            def diarize(self, *, audio, batch_size):
+                return [
+                    [
+                        "0.000 1.000 speaker_0",
+                        "1.000 2.000 speaker_1",
+                        "2.000 3.000 speaker_2",
+                        "3.000 4.000 speaker_3",
+                    ]
+                ]
+
+        class FakeModelClass:
+            @staticmethod
+            def from_pretrained(repo_id):
+                return FakeModel()
+
+        _stub_nemo(monkeypatch, FakeModelClass)
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        result = _diarize_file_direct(wav, settings=self._sortformer_settings())
+        assert result["num_speakers"] == 4
+        assert len(result["warnings"]) == 1
+        assert "4" in result["warnings"][0]
+
+    def test_below_the_cap_adds_no_warning(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        class FakeModel:
+            def eval(self):
+                return self
+
+            def diarize(self, *, audio, batch_size):
+                return [["0.000 1.000 speaker_0", "1.000 2.000 speaker_1"]]
+
+        class FakeModelClass:
+            @staticmethod
+            def from_pretrained(repo_id):
+                return FakeModel()
+
+        _stub_nemo(monkeypatch, FakeModelClass)
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        result = _diarize_file_direct(wav, settings=self._sortformer_settings())
+        assert "warnings" not in result
+
+    def test_empty_result_raises_diarization_error(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        class FakeModel:
+            def eval(self):
+                return self
+
+            def diarize(self, *, audio, batch_size):
+                return [[]]
+
+        class FakeModelClass:
+            @staticmethod
+            def from_pretrained(repo_id):
+                return FakeModel()
+
+        _stub_nemo(monkeypatch, FakeModelClass)
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        with pytest.raises(DiarizationError, match="no segments"):
+            _diarize_file_direct(wav, settings=self._sortformer_settings())
+
+    def test_cuda_moves_model_and_releases_memory(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
+        import sys
+        import types
+
+        moved = {}
+
+        class FakeModel:
+            def eval(self):
+                return self
+
+            def cuda(self):
+                moved["called"] = True
+                return self
+
+            def diarize(self, *, audio, batch_size):
+                return [["0.000 1.000 speaker_0"]]
+
+        class FakeModelClass:
+            @staticmethod
+            def from_pretrained(repo_id):
+                return FakeModel()
+
+        _stub_nemo(monkeypatch, FakeModelClass)
+
+        calls = {"empty_cache": 0}
+        fake_torch = types.ModuleType("torch")
+        fake_torch.cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            empty_cache=lambda: calls.__setitem__("empty_cache", calls["empty_cache"] + 1),
+        )
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+        wav = tmp_path / "x.wav"
+        wav.write_bytes(b"fake")
+        result = _diarize_file_direct(wav, settings=self._sortformer_settings(diarization_device="cuda"))
+        assert result["num_speakers"] == 1
+        assert moved.get("called") is True
+        assert calls["empty_cache"] == 1
 
 
 class TestSettingsDefaults:

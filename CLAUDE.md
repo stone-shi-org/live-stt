@@ -730,8 +730,65 @@ in `configure()` and there is no loop anywhere near it.
   fix, all existing unit tests unaffected. What's not: a thread-count sweep, the three
   unregistered-for-real-testing smaller sizes (on either backend), GPU-specific VRAM measurement for
   this engine, and any actual deployment.
-- **NVIDIA Sortformer v2.1 as a second diarization engine — investigated for real (Jira LS-4),
-  NOT integrated.** A feasibility spike, not a feature: license terms and a reproducible install
+- **NVIDIA Sortformer v2.1 as a second diarization engine (Jira LS-4) — spiked, then integrated
+  for real on the reporter's explicit instruction despite the spike's own recommendation.** The
+  Phase 1 spike below found real accuracy/packaging concerns and its own writeup recommended NOT
+  integrating; the ticket's reporter, after reviewing those findings, explicitly asked to proceed
+  to Phase 2 anyway ("Let's do phase 2!!") — a legitimate call for the stakeholder to make once
+  informed, not a reversal of the measurements themselves. **What Phase 2 actually shipped**:
+  `DiarizationModelSpec` gained two additive fields, `engine: str = "pyannote"` (default preserves
+  the one pre-existing entry unchanged, same trick ASR's `ModelSpec.engine` used for
+  whisper/parakeet-tdt) and `max_speakers_supported: int | None = None`; a new registry entry,
+  `"nvidia/diar_streaming_sortformer_4spk-v2.1"` (`engine="nemo_sortformer"`, `gated=False`,
+  `supports_num_speakers_hint=False`, `measured_peak_vram_mb=1402`, `max_speakers_supported=4`) --
+  opt-in via `model=`, the default stays pyannote. `live_stt/diarization.py`'s `load_pipeline`/
+  `_diarize_file_direct` now dispatch on `spec.engine`: `_load_pyannote_pipeline`/`_run_pyannote`
+  (the pre-existing logic, unchanged in behavior, just extracted) alongside new
+  `_load_sortformer_model`/`_run_sortformer`, both normalizing into a new shared
+  `_segments_to_house_json` helper (`annotation_to_house_json` now a thin adapter over it) so the
+  `{task, model, num_speakers, segments, speakers}` wire contract
+  `my-meeting-notes/app/services/diarize.py` depends on stays byte-identical regardless of engine.
+  `_run_sortformer` parses Sortformer's confirmed `"start_sec end_sec speaker_label"` string output
+  (`_parse_sortformer_segments`) and, per the spike's own recommendation, attaches an advisory
+  `"warnings"` list entry to the house JSON when `num_speakers >= max_speakers_supported` --
+  the closest thing to a typed signal achievable for the silent-cap failure mode found in Phase 1
+  (a heuristic, not proof: a legitimate call with exactly 4 real speakers looks identical, but an
+  honest "might be capped" beats the engine's own total silence). New
+  `requirements-diarization-sortformer.txt` (`nemo_toolkit[asr]==3.0.0`, pinned to a real tagged
+  release, not the HF README's floating `@main`), kept separate from
+  `requirements-diarization.txt` one level further given nemo's heavier dependency tree. New
+  Dockerfile stage `runtime-cuda-diarize-sortformer` (extends `runtime-cuda-diarize`), `build.sh
+  --cuda --diarize --sortformer`. **A real, load-bearing correction found while implementing
+  this**: the Phase 1 spike's "Python 3.14 packaging blocker" (`nv_one_logger_pytorch_lightning_
+  integration`'s hard `Requires-Python <3.14` ceiling) turned out to be an artifact of the
+  dev-host/GPU-box throwaway venvs used for the spike, which happen to run system Python 3.14 --
+  it does NOT apply to `runtime-cuda`/`runtime-cuda-diarize`'s actual Python 3.12 base. Verified for
+  real via a plain `docker run python:3.12-slim` install+import check (not assumed from the PyPI
+  `Requires-Python: <3.14,>=3.9` classifier alone): `pip install nemo_toolkit[asr]==3.0.0` and
+  `from nemo.collections.asr.models import SortformerEncLabelModel` both succeed cleanly under
+  Python 3.12 with zero workarounds -- the packaging blocker was real for the spike's own venvs,
+  but was never actually going to block a real container build. **What's proven**: 231 pre-existing
+  unit tests unaffected, plus new tests (`tests/test_diarization_models.py`: the new fields'
+  defaults preserve the pyannote entry, the new entry's real values, the default model is
+  unaffected; `tests/test_diarization.py`'s new `TestParseSortformerSegments`/`TestSortformerEngine`
+  classes: missing-dependency error, no-token-required, engine dispatch, the num_speakers-hint
+  withholding, the cap-warning logic both firing and not firing, empty-result rejection, CUDA
+  move+cleanup) against a fake `SortformerEncLabelModel` stand-in, same offline pattern the
+  pyannote tests already use -- 245 total, 0 failed, via the canonical `./test.sh --docker` path.
+  `docker build --check` confirms the new Dockerfile stage's syntax/ordering is clean. **What's NOT
+  proven**: the new Dockerfile stage has NOT been built end-to-end for real (the full CUDA build
+  chain underneath it is expensive and wasn't rebuilt from scratch for this change -- only the new
+  pip-install layer was independently verified, in isolation, via the plain `python:3.12-slim`
+  check above); no real GPU/production run of this integrated code path against a real model
+  (the spike's own GPU numbers were gathered against a hand-rolled script, not this registry/
+  dispatch code); the advisory `"warnings"` field has not been exercised against real >4-speaker
+  audio through this actual code path (only via the fake-model unit tests); not deployed anywhere.
+  The underlying accuracy gap and hard speaker cap found in Phase 1 are unchanged by this work --
+  Phase 2 makes the engine selectable and gives callers an honest signal when the cap is likely
+  hit, it does not fix either limitation.
+
+- **NVIDIA Sortformer v2.1 diarization Phase 1 spike (Jira LS-4) — the investigation Phase 2 above
+  was built on.** License terms and a reproducible install
   path were confirmed from primary sources, and a real install + real inference run was done in a
   throwaway venv on 10.100.0.50 (the RTX 3090 box), touching zero production code. **License is
   not a blocker** — `nvidia/diar_streaming_sortformer_4spk-v2.1`'s HF metadata and the actual NVIDIA

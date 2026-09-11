@@ -394,6 +394,24 @@ RUN pip install --no-cache-dir --break-system-packages -r requirements-diarizati
 
 CMD ["python", "run.py"]
 
+# ---- stage: adds NVIDIA Sortformer v2.1 (live_stt/diarization.py's
+# "nemo_sortformer" engine, LS-4) on top of runtime-cuda-diarize's
+# pyannote.audio install. A separate stage/tag, not a change to what
+# runtime-cuda-diarize means -- see requirements-diarization-sortformer.txt's
+# own comment: nemo_toolkit's dependency tree is heavier, and this is a
+# second, more niche opt-in engine on an already-opt-in feature. Confirmed
+# during the LS-4 spike that nemo_toolkit[asr]==3.0.0 installs and imports
+# cleanly under this image's actual Python 3.12 -- unlike the dev-host/
+# GPU-box throwaway venvs used for the spike itself, which hit a real
+# Python-3.14 packaging blocker (see CLAUDE.md's LS-4 entry for the full
+# story; it does not apply to this stage's interpreter).
+FROM runtime-cuda-diarize AS runtime-cuda-diarize-sortformer
+COPY requirements-diarization-sortformer.txt .
+RUN pip install --no-cache-dir --break-system-packages -r requirements-diarization-sortformer.txt \
+        --index-url https://pypi.org/simple/
+
+CMD ["python", "run.py"]
+
 # ---- stage: unit tests -- deliberately ships NO worker binary and NO model.
 # Offline-safety-by-construction: an accidental integration-shaped "unit"
 # test fails the build here (ModuleNotFoundError / FileNotFoundError)

@@ -1,4 +1,6 @@
-"""Post-call speaker diarization via pyannote.audio.
+"""Post-call speaker diarization -- pyannote.audio (default) or, since
+LS-4, NVIDIA Sortformer v2.1, selected per-request via the
+``diarization_model`` registry key (``live_stt/diarization_models.py``).
 
 **Batch only, by design, not by current limitation.** Confirmed against the
 ``pyannote/speaker-diarization-community-1`` model card: the pipeline is
@@ -12,11 +14,26 @@ runs afterward, against a recorded WAV -- which today means one produced by
 some out-of-band capture, since Phase 3's audio-dump ring buffer
 (``LSTT_AUDIO_DUMP``) is validated but "has nothing to act on" per
 ``live_stt/redaction.py``. Wiring an automatic post-call dump -> diarize
-pipeline is future work, not part of this module.
+pipeline is future work, not part of this module. Sortformer's own engine
+IS internally streaming-capable, but is run here the same fully-batched way
+(one ``diarize()`` call over the whole file) for consistency -- wiring true
+inline diarization into a live call is a bigger, separate change, deferred
+per the LS-4 plan.
+
+**Two engines, one house JSON shape.** ``load_pipeline``/``_diarize_file_direct``
+dispatch on ``DiarizationModelSpec.engine`` (``"pyannote"`` or
+``"nemo_sortformer"``); each engine's own loader/runner
+(``_load_pyannote_pipeline``/``_run_pyannote`` vs.
+``_load_sortformer_model``/``_run_sortformer``) normalizes its native output
+into the same flat ``(start, end, speaker_label)`` shape before
+``_segments_to_house_json`` builds the wire contract both share -- see that
+function's docstring. This keeps ``my-meeting-notes/app/services/diarize.py``'s
+``{task, model, num_speakers, segments, speakers}`` contract byte-identical
+regardless of which engine actually ran.
 
 **Subprocess isolation**: By default (``diarize_in_subprocess=True``),
 ``diarize_file`` spawns an isolated Python subprocess (``live_stt.diarize_worker``)
-to run pyannote inference. This guarantees 100% VRAM / CUDA driver context
+to run inference. This guarantees 100% VRAM / CUDA driver context
 reclamation on process termination, preventing persistent CUDA driver context
 (~300-400MB) or memory fragmentation from occupying the card after inference ends.
 """
@@ -52,23 +69,33 @@ class _SegmentLike(Protocol):
 
 
 def load_pipeline(settings: Settings) -> Any:
-    """Load the pyannote.audio pipeline. Imports lazily -- pyannote.audio
-    pulls in torch/torchaudio (see requirements-diarization.txt), which is
-    deliberately NOT a dependency of the always-on grpc.aio server process,
-    only of this opt-in, offline tool.
+    """Load the configured diarization engine's model object -- a pyannote
+    ``Pipeline`` or a nemo ``SortformerEncLabelModel``, dispatched on
+    ``DiarizationModelSpec.engine``.
 
     ``settings.diarization_model`` is a registry key
     (``live_stt/diarization_models.py``), resolved and validated FIRST --
-    before even attempting the pyannote.audio import -- so an unknown model
-    name fails fast and cheap regardless of whether the heavy dependency is
-    installed, the same "validate before touching the engine" order ASR's
-    ``models.resolve()`` already uses.
+    before either engine's heavy import is even attempted -- so an unknown
+    model name fails fast and cheap regardless of whether either dependency
+    is installed, the same "validate before touching the engine" order
+    ASR's ``models.resolve()`` already uses.
     """
     try:
         spec = resolve_diarization_model(settings.diarization_model)
     except KeyError as exc:
         raise DiarizationError(str(exc)) from exc
 
+    if spec.engine == "nemo_sortformer":
+        return _load_sortformer_model(spec, settings)
+    return _load_pyannote_pipeline(spec, settings)
+
+
+def _load_pyannote_pipeline(spec: Any, settings: Settings) -> Any:
+    """Load the pyannote.audio pipeline. Imports lazily -- pyannote.audio
+    pulls in torch/torchaudio (see requirements-diarization.txt), which is
+    deliberately NOT a dependency of the always-on grpc.aio server process,
+    only of this opt-in, offline tool.
+    """
     try:
         from pyannote.audio import Pipeline
     except ImportError as exc:
@@ -102,6 +129,65 @@ def load_pipeline(settings: Settings) -> Any:
             "accepted this model's user conditions on huggingface.co."
         )
 
+    device = _check_device(settings)
+    if device == "cuda":
+        import torch
+
+        pipeline.to(torch.device("cuda"))
+        logger.info("diarization pipeline moved to cuda")
+
+    return pipeline
+
+
+def _load_sortformer_model(spec: Any, settings: Settings) -> Any:
+    """Load NVIDIA Sortformer v2.1 (or a future nemo-engine entry) via
+    ``nemo.collections.asr.models.SortformerEncLabelModel``. Imports
+    lazily -- ``nemo_toolkit[asr]`` is deliberately excluded from both
+    requirements.txt and requirements-diarization.txt (see
+    requirements-diarization-sortformer.txt's own comment: its dependency
+    tree is meaningfully heavier than pyannote.audio's own, and this is a
+    second, more niche opt-in engine on an already opt-in feature).
+
+    Not gated (confirmed via the HF API during the LS-4 spike), so unlike
+    ``_load_pyannote_pipeline`` there is no token check here -- if a future
+    nemo-engine entry ever IS gated, this will need one.
+    """
+    try:
+        from nemo.collections.asr.models import SortformerEncLabelModel
+    except ImportError as exc:
+        raise DiarizationError(
+            "nemo_toolkit[asr] is not installed. It is deliberately excluded "
+            "from requirements.txt and requirements-diarization.txt (an even "
+            "heavier dependency tree than pyannote.audio's own, for a "
+            "second, opt-in engine) -- install "
+            "requirements-diarization-sortformer.txt to use "
+            f"{spec.hf_repo_id!r}."
+        ) from exc
+
+    device = _check_device(settings)
+
+    try:
+        model = SortformerEncLabelModel.from_pretrained(spec.hf_repo_id)
+    except Exception as exc:  # noqa: BLE001 -- surfaced as one clear error type
+        raise DiarizationError(f"Failed to load {spec.hf_repo_id!r}: {exc}") from exc
+
+    model.eval()
+
+    if device == "cuda":
+        model = model.cuda()
+        logger.info("sortformer diarization model moved to cuda")
+
+    return model
+
+
+def _check_device(settings: Settings) -> str:
+    """Validate ``settings.diarization_device`` and, for "cuda", confirm a
+    GPU is actually visible before either engine's loader touches torch
+    any further. Shared by both engines -- same "loud failure over silent
+    wrong behavior" reasoning either way: ``torch.device("cuda")`` with no
+    GPU raises deep inside the first forward pass, not at load/``.to()``
+    time, with a much less useful traceback.
+    """
     device = settings.diarization_device
     if device not in ("cpu", "cuda"):
         raise DiarizationError(f"unknown LSTT_DIARIZATION_DEVICE {device!r}; expected 'cpu' or 'cuda'")
@@ -109,19 +195,11 @@ def load_pipeline(settings: Settings) -> Any:
         import torch
 
         if not torch.cuda.is_available():
-            # Fail loudly here rather than let pyannote silently run on CPU
-            # anyway (torch.device("cuda") with no GPU raises deep inside the
-            # first forward pass, not at .to() time, with a much less useful
-            # traceback) -- same "loud failure over silent wrong behavior"
-            # standard as the rest of this module.
             raise DiarizationError(
                 "LSTT_DIARIZATION_DEVICE=cuda but torch.cuda.is_available() is "
                 "False -- no CUDA-capable GPU/driver visible to this process."
             )
-        pipeline.to(torch.device("cuda"))
-        logger.info("diarization pipeline moved to cuda")
-
-    return pipeline
+    return device
 
 
 def _release_cuda_memory() -> None:
@@ -148,31 +226,38 @@ def _itertracks(annotation: Any) -> Iterable[tuple[_SegmentLike, str]]:
             yield segment, label
 
 
-def annotation_to_house_json(
-    annotation: Any, *, model: str
+def _segments_to_house_json(
+    segments_in: Iterable[tuple[float, float, str]], *, model: str
 ) -> dict[str, Any]:
-    """Pure mapping from pyannote's diarization result to the house JSON
-    shape.
+    """Pure mapping from a flat ``(start, end, speaker_label)`` sequence to
+    the house JSON shape -- shared by every diarization engine.
+    ``annotation_to_house_json`` normalizes pyannote's ``Annotation``-shaped
+    output into this via ``_itertracks`` first; ``_run_sortformer`` parses
+    Sortformer's plain ``"start end speaker_label"`` strings straight into
+    it. Both land here so the wire contract
+    (``my-meeting-notes/app/services/diarize.py``'s ``{task, model,
+    num_speakers, segments, speakers}`` shape) stays identical regardless
+    of which engine actually produced the segments.
     """
     segments: list[dict[str, Any]] = []
     speaker_stats: dict[str, dict[str, Any]] = {}
 
-    for i, (segment, label) in enumerate(_itertracks(annotation)):
+    for i, (start, end, label) in enumerate(segments_in):
         speaker_id = f"SPEAKER_{label}" if not str(label).startswith("SPEAKER_") else str(label)
         segments.append(
             {
                 "id": i,
                 "speaker": speaker_id,
                 "label": str(label),
-                "start": float(segment.start),
-                "end": float(segment.end),
+                "start": float(start),
+                "end": float(end),
                 "text": "",
             }
         )
         stats = speaker_stats.setdefault(
             speaker_id, {"id": speaker_id, "label": str(label), "total_speech_duration": 0.0, "segment_count": 0}
         )
-        stats["total_speech_duration"] += float(segment.end) - float(segment.start)
+        stats["total_speech_duration"] += float(end) - float(start)
         stats["segment_count"] += 1
 
     speakers = list(speaker_stats.values())
@@ -192,6 +277,21 @@ def annotation_to_house_json(
     }
 
 
+def annotation_to_house_json(
+    annotation: Any, *, model: str
+) -> dict[str, Any]:
+    """Pure mapping from pyannote's diarization result to the house JSON
+    shape.
+    """
+    return _segments_to_house_json(
+        (
+            (float(segment.start), float(segment.end), label)
+            for segment, label in _itertracks(annotation)
+        ),
+        model=model,
+    )
+
+
 def assign_text(house_json: dict[str, Any], words: list[asr_pb2.Word]) -> dict[str, Any]:
     """Fill each segment's ``text`` from the call's own ASR word timestamps."""
     segments = house_json["segments"]
@@ -209,18 +309,7 @@ def assign_text(house_json: dict[str, Any], words: list[asr_pb2.Word]) -> dict[s
     return house_json
 
 
-def _diarize_file_direct(
-    path: str | Path,
-    *,
-    settings: Settings,
-) -> dict[str, Any]:
-    """Run in-process pyannote inference directly (called by subprocess worker)."""
-    path = Path(path)
-    if not path.is_file():
-        raise DiarizationError(f"No such audio file: {path}")
-
-    pipeline = load_pipeline(settings)
-    spec = resolve_diarization_model(settings.diarization_model)
+def _run_pyannote(pipeline: Any, path: Path, *, settings: Settings, spec: Any) -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     if spec.supports_num_speakers_hint:
         if settings.diarization_num_speakers is not None:
@@ -235,11 +324,88 @@ def _diarize_file_direct(
         result = pipeline(str(path), **kwargs)
     except Exception as exc:  # noqa: BLE001
         raise DiarizationError(f"Diarization failed on {path}: {exc}") from exc
+
+    return annotation_to_house_json(result, model=spec.hf_repo_id)
+
+
+def _parse_sortformer_segments(raw_segments: list[str]) -> list[tuple[float, float, str]]:
+    """Parse Sortformer's ``"start_sec end_sec speaker_label"`` string
+    format -- e.g. ``"6.720 8.400 speaker_0"``, confirmed against a real
+    run of ``nvidia/diar_streaming_sortformer_4spk-v2.1`` during the LS-4
+    spike. ``diarize()``'s public API returns ``List[List[str]]``, one
+    inner list per input audio file -- callers pass a single-file batch
+    and index ``result[0]``.
+    """
+    parsed: list[tuple[float, float, str]] = []
+    for line in raw_segments:
+        parts = line.split()
+        if len(parts) != 3:
+            raise DiarizationError(f"unexpected Sortformer segment format: {line!r}")
+        start_str, end_str, label = parts
+        try:
+            parsed.append((float(start_str), float(end_str), label))
+        except ValueError as exc:
+            raise DiarizationError(f"unexpected Sortformer segment format: {line!r}") from exc
+    return parsed
+
+
+def _run_sortformer(model: Any, path: Path, *, spec: Any) -> dict[str, Any]:
+    try:
+        result = model.diarize(audio=[str(path)], batch_size=1)
+    except Exception as exc:  # noqa: BLE001
+        raise DiarizationError(f"Diarization failed on {path}: {exc}") from exc
+
+    if not result or not result[0]:
+        raise DiarizationError(
+            "Diarization returned no segments -- is the audio silent, or "
+            "shorter than the model's minimum window?"
+        )
+
+    segments = _parse_sortformer_segments(result[0])
+    house_json = _segments_to_house_json(segments, model=spec.hf_repo_id)
+
+    # Sortformer hard-caps at spec.max_speakers_supported and fails
+    # SILENTLY when the real audio has more speakers than that -- no error,
+    # no warning of its own (confirmed during the LS-4 spike: one real
+    # speaker's speech gets absorbed into another's cluster instead of
+    # surfacing as a 5th cluster or an exception). detected_count >= cap is
+    # only a heuristic -- a legitimate call with exactly `cap` speakers
+    # looks identical -- but it's the best signal available without
+    # engine-level ground truth, and an honest "might be capped" warning
+    # beats silence.
+    if spec.max_speakers_supported is not None and house_json["num_speakers"] >= spec.max_speakers_supported:
+        house_json.setdefault("warnings", []).append(
+            f"detected speaker count ({house_json['num_speakers']}) is at or above this "
+            f"model's supported maximum ({spec.max_speakers_supported}); if the real audio "
+            "has more speakers, some may have been silently merged into another speaker's "
+            "segments rather than reported separately -- see CLAUDE.md's LS-4 Sortformer entry"
+        )
+
+    return house_json
+
+
+def _diarize_file_direct(
+    path: str | Path,
+    *,
+    settings: Settings,
+) -> dict[str, Any]:
+    """Run in-process diarization inference directly (called by the
+    subprocess worker), dispatching to the configured engine's runner.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise DiarizationError(f"No such audio file: {path}")
+
+    engine_obj = load_pipeline(settings)
+    spec = resolve_diarization_model(settings.diarization_model)
+
+    try:
+        if spec.engine == "nemo_sortformer":
+            return _run_sortformer(engine_obj, path, spec=spec)
+        return _run_pyannote(engine_obj, path, settings=settings, spec=spec)
     finally:
         if settings.diarization_device == "cuda":
             _release_cuda_memory()
-
-    return annotation_to_house_json(result, model=spec.hf_repo_id)
 
 
 def _diarize_file_subprocess(
