@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
 from live_stt.diarize_sessions import DiarizationSessionTracker
+from live_stt.settings_store import SettingsStore
 from live_stt.transcribe_sessions import TranscribeSessionTracker
 from live_stt.tts_sessions import TTSSessionTracker
 
@@ -21,6 +22,15 @@ from live_stt.tts_sessions import TTSSessionTracker
 class ServerState:
     settings: Settings
     budget: WorkerBudget
+
+    # SQLite-backed runtime settings store (LS-5, live_stt/settings_store.py).
+    # None when nothing set it up -- every existing test constructing
+    # ServerState(settings=..., budget=...) directly (the vast majority)
+    # keeps working completely unchanged; live_stt/server.py's real
+    # entrypoint is the only thing that populates this. admin_http.py's
+    # /api/settings endpoints treat None as "no store configured" (503, not
+    # a crash) rather than assuming it's always present.
+    settings_store: SettingsStore | None = None
 
     # Diarization has no worker PROCESS the way ASR does (see
     # DiarizationSessionTracker's own docstring), so it needed its own,

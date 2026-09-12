@@ -43,7 +43,15 @@ services:
     # in production, don't just trust the arithmetic above.
     mem_limit: 20g
     environment:
-      - LSTT_BACKEND=cuda
+      # LS-5: independent per-engine backend choice, replacing the old
+      # single LSTT_BACKEND switch -- all three default to cuda here since
+      # this whole override file is "run everything on the RTX 3090," but
+      # each is independently overridable (e.g. set
+      # LSTT_WHISPER_BACKEND=cpu alongside these to keep whisper off the
+      # shared card while parakeet stays on it).
+      - LSTT_PARAKEET_BACKEND=cuda
+      - LSTT_WHISPER_BACKEND=cuda
+      - LSTT_PARAKEET_TDT_BACKEND=cuda
       - LSTT_MAX_CONCURRENT_CALLS=2
       - LSTT_RESERVE_SLOTS=1
       - LSTT_VRAM_PER_WORKER_MB=3000

@@ -126,8 +126,9 @@ class WorkerHandle:
         # unconditionally anyway, since it's a harmless extra key the
         # parakeet engine's main.cpp simply never reads. Keeps this spawn()
         # call engine-agnostic; the caller (live_stt/session.py) decides the
-        # value from Settings.backend regardless of which binary it's about
-        # to exec.
+        # value from the per-engine backend setting (parakeet_backend/
+        # whisper_backend/parakeet_tdt_backend, LS-5) matching whichever
+        # binary it's about to exec.
         config = json.dumps(
             {
                 "gguf_path": gguf_path,

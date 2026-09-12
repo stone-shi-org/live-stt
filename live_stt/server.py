@@ -11,21 +11,34 @@ from grpc_reflection.v1alpha import reflection
 
 from live_stt.admin_http import serve_admin_http
 from live_stt.admission import WorkerBudget
-from live_stt.config import Settings, get_settings
+from live_stt.config import Settings
 from live_stt.logging_config import configure_logging, get_logger
 from live_stt.pb.livestt.v1 import asr_pb2, asr_pb2_grpc
 from live_stt.redaction import validate as validate_redaction_config
 from live_stt.servicer import StreamingASRServicer
+from live_stt.settings_store import SettingsStore, load_effective_settings
 from live_stt.state import ServerState
 
 logger = get_logger("server")
 
 
 async def serve(settings: Settings | None = None) -> None:
-    settings = settings or get_settings()
+    # settings is only ever passed explicitly by a caller that wants pure,
+    # deterministic env-based behavior with no SQLite involved (a one-off
+    # script, or a future test) -- the real default path (settings=None)
+    # goes through the SQLite-backed store (LS-5), which fully replaces env
+    # vars as the ongoing source of truth after a one-time migration; see
+    # live_stt/settings_store.py's docstring.
+    settings_store: SettingsStore | None = None
+    if settings is None:
+        settings, settings_store = load_effective_settings()
     validate_redaction_config(settings)  # fail fast, not silently downgrade
 
-    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+    state = ServerState(
+        settings=settings,
+        budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots),
+        settings_store=settings_store,
+    )
 
     server = grpc.aio.server()
     asr_pb2_grpc.add_StreamingASRServicer_to_server(StreamingASRServicer(state), server)
@@ -46,11 +59,14 @@ async def serve(settings: Settings | None = None) -> None:
 
     admin_http = serve_admin_http(settings.admin_host, settings.admin_port, state)
     logger.info(
-        "starting grpc=%s admin_http=%s:%s backend=%s default_model=%s max_concurrent_calls=%s",
+        "starting grpc=%s admin_http=%s:%s parakeet_backend=%s whisper_backend=%s "
+        "parakeet_tdt_backend=%s default_model=%s max_concurrent_calls=%s",
         listen_addr,
         settings.admin_host,
         settings.admin_port,
-        settings.backend,
+        settings.parakeet_backend,
+        settings.whisper_backend,
+        settings.parakeet_tdt_backend,
         settings.default_model,
         settings.max_concurrent_calls,
     )

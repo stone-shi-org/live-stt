@@ -54,7 +54,14 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
             built_at=version["timestamp"],
             parakeet_ref=version["parakeet_ref"],
             default_model=self._settings.default_model or models.DEFAULT_MODEL_KEY,
-            backend=self._settings.backend,
+            # ServerInfoResponse.backend is a single proto field (a schema
+            # change to make it per-engine wasn't warranted for LS-5) --
+            # reports parakeet_backend specifically, since GetServerInfo is
+            # only ever meaningful to a gRPC streaming client, and Transcribe
+            # only ever spawns the parakeet engine (batch-only engines are
+            # rejected before a worker exists -- see the streaming_capable
+            # check below).
+            backend=self._settings.parakeet_backend,
             max_concurrent_calls=self._settings.max_concurrent_calls,
             active_calls=self._budget.active_calls,
             warm_spares=0,  # no PRE-warmed pool -- shadows are spawned on demand at rotation time
@@ -70,12 +77,16 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
             await context.abort(grpc.StatusCode.UNAVAILABLE, "draining")
             return
 
-        if self._settings.backend == "cuda":
+        if self._settings.parakeet_backend == "cuda":
             # A CUDA allocation failure is an abort(), not a catchable
             # exception (see CLAUDE.md) -- admitting a call this box can't
             # actually fit crashes a worker process, not just slows one
             # down. Checked before the (cheap, synchronous) call-slot check
             # below since this one is the more expensive shell-out.
+            # parakeet_backend specifically (LS-5): Transcribe only ever
+            # spawns the parakeet engine (see the streaming_capable gate
+            # further down), so that is the only per-engine backend choice
+            # relevant to this admission check.
             free = gpu.free_vram_mb()
             if free is not None:
                 metrics.gpu_free_vram_mb.set(free)
@@ -184,7 +195,7 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
                 asr_pb2.AudioEncoding.Name(config.encoding),
                 config.sample_rate_hz or 16000,
                 spec.key,
-                self._settings.backend,
+                self._settings.parakeet_backend,
             )
             yield ready_event
 

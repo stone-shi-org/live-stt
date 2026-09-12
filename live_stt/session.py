@@ -103,6 +103,7 @@ class CallSession:
                 else None
             )
             n_threads = self._settings.n_threads_whisper
+            engine_backend = self._settings.whisper_backend
         elif self._model_spec.engine == "parakeet_tdt":
             worker_bin = Path(self._settings.worker_bin_parakeet_tdt)
             ggml_lib_dir = (
@@ -115,6 +116,7 @@ class CallSession:
                 )
             )
             n_threads = self._settings.n_threads_parakeet_tdt
+            engine_backend = self._settings.parakeet_tdt_backend
         else:
             worker_bin = Path(self._settings.worker_bin)
             ggml_lib_dir = (
@@ -123,6 +125,7 @@ class CallSession:
                 else None
             )
             n_threads = self._settings.n_threads_per_worker
+            engine_backend = self._settings.parakeet_backend
         start = time.monotonic()
         handle = await WorkerHandle.spawn(
             worker_bin=worker_bin,
@@ -130,18 +133,25 @@ class CallSession:
             language=self._config.language,
             n_threads=n_threads,
             ggml_lib_dir=ggml_lib_dir,
-            # Only load-bearing for the whisper engine (see WorkerHandle.spawn's
-            # comment) -- Settings.backend is the one image-wide CPU/CUDA
-            # choice already used for the parakeet engine's metrics label
-            # below, reused here rather than inventing a second knob.
-            use_gpu=self._settings.backend == "cuda",
+            # Per-engine backend choice (LS-5) -- each of parakeet_backend/
+            # whisper_backend/parakeet_tdt_backend is independent, so one
+            # deployment can genuinely run the live stream on GPU while
+            # another engine stays on CPU (or vice versa), replacing the old
+            # single image-wide Settings.backend switch.
+            use_gpu=engine_backend == "cuda",
         )
         metrics.model_load_duration_seconds.observe(time.monotonic() - start)
         version = __about__.info()
+        # NOTE: set_build_info is one process-wide Prometheus Info metric --
+        # its "backend" label reflects whichever engine spawned (or
+        # rotated) a worker most recently, not a per-engine breakdown. That
+        # limitation pre-dates LS-5 (it was already true with a single
+        # global backend); a real per-engine metrics breakdown is a
+        # reasonable follow-up but out of scope here.
         metrics.set_build_info(
             version=version["hash"],
             parakeet_ref=version["parakeet_ref"],
-            backend=self._settings.backend,
+            backend=engine_backend,
             model=self._model_spec.key,
             n_threads=n_threads,
             ggml_features=handle.ready.get("ggml_features", ""),

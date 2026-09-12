@@ -204,7 +204,12 @@ async def test_config_http_endpoint() -> None:
             assert resp.status == 200
             doc = json.loads(resp.read().decode())
             assert "grpc_port" in doc
-            assert "backend" in doc
+            # LS-5: the single global "backend" field was replaced by
+            # independent per-engine fields (parakeet_backend/
+            # whisper_backend/parakeet_tdt_backend) -- see live_stt/config.py.
+            assert "parakeet_backend" in doc
+            assert "whisper_backend" in doc
+            assert "parakeet_tdt_backend" in doc
             assert "max_concurrent_calls" in doc
     finally:
         server.shutdown()

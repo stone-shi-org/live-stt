@@ -1,16 +1,24 @@
-"""Admin HTTP surface: /api/health, /api/version, /api/stats, /metrics. Runs
-on a daemon thread, deliberately NOT in the asyncio loop -- nothing on the
-admin path should ever be able to stall the stream pump (see CLAUDE.md).
+"""Admin HTTP surface: /api/health, /api/version, /api/stats, /metrics, and
+(LS-5) /settings + GET/PUT /api/settings. Runs on a daemon thread,
+deliberately NOT in the asyncio loop -- nothing on the admin path should
+ever be able to stall the stream pump (see CLAUDE.md).
 
 Being at capacity is 200 ok, not 503: 503 is reserved for structural failure
 (``state.degraded``) or draining (``state.draining``). Marking a busy box
 unhealthy would make a load balancer pull a perfectly healthy instance out of
 rotation at exactly the moment it's needed.
+
+Dashboard (today's /, /stats, /dashboard, /api/stats, /metrics -- all
+read-only, unchanged) and Settings (/settings, GET/PUT /api/settings) are
+kept as a deliberate split per LS-5: the former is "what is this instance
+doing right now," the latter is "what is this instance configured to do,"
+and only the latter ever mutates anything.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -26,6 +34,7 @@ from live_stt import (
     tts_http,
     tts_models,
 )
+from live_stt.settings_store import HOT_RELOAD_FIELDS, apply_update
 from live_stt.state import ServerState
 
 
@@ -596,14 +605,16 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
 
         <!-- Server Configuration -->
         <div class="section-card">
-            <div class="section-title">⚙️ Server Configuration & Settings</div>
+            <div class="section-title">⚙️ Server Configuration & Settings (<a href="/settings" style="color:inherit;">edit in Settings →</a>)</div>
             <div class="config-grid">
                 <div class="config-group">
                     <div class="config-group-header">Network & Engine</div>
                     <table class="kv-table">
                         <tr><td class="kv-key">grpc_host:port</td><td class="kv-val" id="cfgGrpc">-</td></tr>
                         <tr><td class="kv-key">admin_host:port</td><td class="kv-val" id="cfgAdmin">-</td></tr>
-                        <tr><td class="kv-key">backend</td><td class="kv-val" id="cfgBackend">-</td></tr>
+                        <tr><td class="kv-key">parakeet_backend</td><td class="kv-val" id="cfgBackendParakeet">-</td></tr>
+                        <tr><td class="kv-key">whisper_backend</td><td class="kv-val" id="cfgBackendWhisper">-</td></tr>
+                        <tr><td class="kv-key">parakeet_tdt_backend</td><td class="kv-val" id="cfgBackendParakeetTdt">-</td></tr>
                         <tr><td class="kv-key">default_model</td><td class="kv-val" id="cfgModel">-</td></tr>
                         <tr><td class="kv-key">diarization_model</td><td class="kv-val" id="cfgDiarizationModel">-</td></tr>
                         <tr><td class="kv-key">tts_model</td><td class="kv-val" id="cfgTtsModel">-</td></tr>
@@ -838,7 +849,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             if (config) {
                 document.getElementById('cfgGrpc').innerText = `${config.grpc_host}:${config.grpc_port}`;
                 document.getElementById('cfgAdmin').innerText = `${config.admin_host}:${config.admin_port}`;
-                document.getElementById('cfgBackend').innerText = config.backend || 'cpu';
+                document.getElementById('cfgBackendParakeet').innerText = config.parakeet_backend || 'cpu';
+                document.getElementById('cfgBackendWhisper').innerText = config.whisper_backend || 'cpu';
+                document.getElementById('cfgBackendParakeetTdt').innerText = config.parakeet_tdt_backend || 'cpu';
                 document.getElementById('cfgModel').innerText = config.default_model || '-';
                 document.getElementById('cfgDiarizationModel').innerText = config.diarization_model || '-';
                 document.getElementById('cfgTtsModel').innerText = config.tts_model || '-';
@@ -941,6 +954,190 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
 """
 
 
+# LS-5: a deliberately generic (field-name, current-value) form rather than
+# a hand-crafted widget per Settings field -- Settings has 60+ fields and
+# hand-authoring each one would be a maintenance trap (a new field added to
+# live_stt/config.py would silently never appear here). Input type is
+# inferred client-side from the JSON value's JS type. Every field is shown
+# and editable; the badge communicates which of them actually take effect
+# immediately (HOT_RELOAD_FIELDS, live_stt/settings_store.py) vs. only on
+# the next process restart -- the store never pretends both are the same.
+HTML_SETTINGS_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚙️ Live-STT Settings</title>
+    <style>
+        :root {
+            --bg-dark: #0f172a;
+            --panel-bg: #1e293b;
+            --panel-border: #334155;
+            --accent-blue: #38bdf8;
+            --accent-green: #10b981;
+            --accent-yellow: #f59e0b;
+            --accent-red: #ef4444;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+        }
+        body { background: var(--bg-dark); color: var(--text-main); font-family: -apple-system, sans-serif; margin: 0; padding: 24px; }
+        h1 { font-size: 1.4rem; }
+        a { color: var(--accent-blue); }
+        #banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; display: none; }
+        #banner.ok { display: block; background: rgba(16,185,129,0.15); border: 1px solid var(--accent-green); }
+        #banner.err { display: block; background: rgba(239,68,68,0.15); border: 1px solid var(--accent-red); }
+        table { width: 100%; border-collapse: collapse; background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 8px; overflow: hidden; }
+        th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--panel-border); font-size: 0.85rem; }
+        th { color: var(--text-muted); font-weight: 600; }
+        input[type=text], input[type=number] { background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--panel-border); border-radius: 4px; padding: 4px 8px; width: 100%; box-sizing: border-box; }
+        .badge { font-size: 0.7rem; padding: 2px 8px; border-radius: 999px; }
+        .badge.hot { background: rgba(16,185,129,0.2); color: var(--accent-green); }
+        .badge.restart { background: rgba(245,158,11,0.2); color: var(--accent-yellow); }
+        #saveBtn { margin-top: 16px; padding: 10px 20px; background: var(--accent-blue); color: #0f172a; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; }
+        #saveBtn:disabled { opacity: 0.5; cursor: default; }
+    </style>
+</head>
+<body>
+    <h1>⚙️ Live-STT Settings <a href="/">&larr; back to dashboard</a></h1>
+    <p style="color:var(--text-muted);">
+        Fields badged <span class="badge hot">hot</span> take effect immediately on save.
+        Fields badged <span class="badge restart">restart required</span> are persisted but
+        only take effect the next time this process starts (see live_stt/settings_store.py --
+        several fields are unsafe to change under a live worker pool).
+    </p>
+    <div id="banner"></div>
+    <table>
+        <thead><tr><th>Setting</th><th>Value</th><th>Applies</th></tr></thead>
+        <tbody id="settingsBody"><tr><td colspan="3">Loading...</td></tr></tbody>
+    </table>
+    <button id="saveBtn" disabled>Save Changes</button>
+
+    <script>
+        let original = {};
+        let hotFields = new Set();
+        const dirty = {};
+
+        function cell(key, value) {
+            const isBool = (typeof value === 'boolean');
+            const isNum = (typeof value === 'number');
+            let input;
+            if (isBool) {
+                input = `<input type="checkbox" data-key="${key}" ${value ? 'checked' : ''}>`;
+            } else if (isNum) {
+                input = `<input type="number" step="any" data-key="${key}" value="${value}">`;
+            } else {
+                input = `<input type="text" data-key="${key}" value="${value === null ? '' : value}">`;
+            }
+            const badge = hotFields.has(key)
+                ? '<span class="badge hot">hot</span>'
+                : '<span class="badge restart">restart required</span>';
+            return `<tr><td>${key}</td><td>${input}</td><td>${badge}</td></tr>`;
+        }
+
+        function markDirty(key, value) {
+            if (JSON.stringify(value) === JSON.stringify(original[key])) {
+                delete dirty[key];
+            } else {
+                dirty[key] = value;
+            }
+            document.getElementById('saveBtn').disabled = Object.keys(dirty).length === 0;
+        }
+
+        async function load() {
+            const resp = await fetch('/api/settings');
+            const doc = await resp.json();
+            original = doc.settings;
+            hotFields = new Set(doc.hot_reload_fields || []);
+            const tbody = document.getElementById('settingsBody');
+            const keys = Object.keys(original).sort();
+            tbody.innerHTML = keys.map((k) => cell(k, original[k])).join('');
+            tbody.querySelectorAll('input').forEach((el) => {
+                el.addEventListener('input', () => {
+                    const key = el.dataset.key;
+                    let value = el.value;
+                    if (el.type === 'checkbox') value = el.checked;
+                    else if (el.type === 'number') value = value === '' ? null : Number(value);
+                    markDirty(key, value);
+                });
+            });
+            if (doc.store_available === false) {
+                showBanner('err', 'No settings store configured on this process -- changes cannot be saved (see live_stt/server.py).');
+            }
+        }
+
+        function showBanner(kind, text) {
+            const b = document.getElementById('banner');
+            b.className = kind;
+            b.innerText = text;
+        }
+
+        async function save() {
+            const resp = await fetch('/api/settings', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(dirty),
+            });
+            const doc = await resp.json();
+            if (resp.ok) {
+                const hot = (doc.applied_hot || []).join(', ') || 'none';
+                const restart = (doc.pending_restart || []).join(', ') || 'none';
+                showBanner('ok', `Saved. Applied immediately: ${hot}. Needs restart: ${restart}.`);
+                for (const k of Object.keys(dirty)) delete dirty[k];
+                document.getElementById('saveBtn').disabled = true;
+                await load();
+            } else {
+                showBanner('err', doc.error || 'save failed');
+            }
+        }
+
+        document.getElementById('saveBtn').addEventListener('click', save);
+        load();
+    </script>
+</body>
+</html>
+"""
+
+
+def _settings_doc(state: ServerState) -> dict:
+    current = state.settings.model_dump()
+    return {
+        "settings": current,
+        "hot_reload_fields": sorted(HOT_RELOAD_FIELDS),
+        "restart_required_fields": sorted(set(current) - HOT_RELOAD_FIELDS),
+        "store_available": state.settings_store is not None,
+    }
+
+
+def _apply_settings_update(state: ServerState, body: bytes) -> tuple[int, dict]:
+    if state.settings_store is None:
+        return 503, {"error": "no settings store configured on this process"}
+    try:
+        payload = json.loads(body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return 400, {"error": "invalid JSON body"}
+    if not isinstance(payload, dict) or not payload:
+        return 400, {"error": "expected a non-empty JSON object of {field: value}"}
+    try:
+        validated = apply_update(state.settings_store, state.settings, payload)
+    except ValueError as exc:
+        return 400, {"error": str(exc)}
+    dumped = validated.model_dump()
+    applied_hot: list[str] = []
+    pending_restart: list[str] = []
+    for key in payload:
+        if key in HOT_RELOAD_FIELDS:
+            # Mutating the LIVE settings object here, not `validated` as a
+            # whole -- only the fields actually in HOT_RELOAD_FIELDS should
+            # ever take effect without a restart; everything else in
+            # `validated` (a full model reconstruction) is discarded except
+            # for what apply_update already persisted to the store.
+            setattr(state.settings, key, dumped[key])
+            applied_hot.append(key)
+        else:
+            pending_restart.append(key)
+    return 200, {"applied_hot": applied_hot, "pending_restart": pending_restart}
+
+
 def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def _write(self, status: int, body: bytes, content_type: str) -> None:
@@ -958,6 +1155,10 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler's naming
             if self.path in ("/", "/stats", "/dashboard"):
                 self._write(200, HTML_STATS_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            elif self.path == "/settings":
+                self._write(200, HTML_SETTINGS_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+            elif self.path == "/api/settings":
+                self._write_json(200, _settings_doc(state))
             elif self.path == "/api/health":
                 status = state.health_status()
                 http_status = 200 if status == "ok" else 503
@@ -965,7 +1166,21 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     http_status,
                     {
                         "status": status,
-                        "backend": state.settings.backend,
+                        # "backend" (singular) preserved for existing
+                        # consumers of this exact shape -- reports the
+                        # streaming (parakeet) engine's backend, the one
+                        # most relevant to "is this instance healthy for a
+                        # live call." "backends" (plural, LS-5) is the full
+                        # per-engine breakdown now that each engine's
+                        # cpu/cuda choice is independent -- see
+                        # live_stt/config.py's parakeet_backend/
+                        # whisper_backend/parakeet_tdt_backend fields.
+                        "backend": state.settings.parakeet_backend,
+                        "backends": {
+                            "parakeet": state.settings.parakeet_backend,
+                            "whisper": state.settings.whisper_backend,
+                            "parakeet_tdt": state.settings.parakeet_tdt_backend,
+                        },
                         "model": state.settings.default_model,
                         "capacity": {
                             "used": state.budget.active_calls,
@@ -1160,6 +1375,15 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         pass
                 else:
                     self._write(status, response_data, resp_content_type)
+            else:
+                self._write_json(404, {"error": "not found"})
+
+        def do_PUT(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler's naming
+            if self.path == "/api/settings":
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length) if length else b""
+                status, doc = _apply_settings_update(state, body)
+                self._write_json(status, doc)
             else:
                 self._write_json(404, {"error": "not found"})
 

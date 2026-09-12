@@ -230,7 +230,16 @@ async def handle_transcribe_request(
     # whisper-on-GPU deployment's traffic would otherwise bypass this gate
     # entirely. Mirrors servicer.py's check exactly, including running it
     # before the cheaper call-slot check below.
-    if settings.backend == "cuda":
+    #
+    # Per-engine backend (LS-5): this endpoint is engine-agnostic (unlike
+    # gRPC Transcribe, it serves parakeet, whisper, AND parakeet_tdt
+    # models), so it must check whichever engine `spec` actually resolved
+    # to -- not a single global backend flag.
+    engine_backend = {
+        "whisper": settings.whisper_backend,
+        "parakeet_tdt": settings.parakeet_tdt_backend,
+    }.get(spec.engine, settings.parakeet_backend)
+    if engine_backend == "cuda":
         free = gpu.free_vram_mb()
         if free is not None:
             metrics.gpu_free_vram_mb.set(free)

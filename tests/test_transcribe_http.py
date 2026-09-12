@@ -201,7 +201,7 @@ class TestHandleTranscribeRequestValidation:
         status, resp, ct = await transcribe_http.handle_transcribe_request(
             content_type=CONTENT_TYPE,
             body=body,
-            settings=_settings(backend="cuda", vram_per_worker_mb=3000, vram_reserve_mb=2000),
+            settings=_settings(parakeet_backend="cuda", vram_per_worker_mb=3000, vram_reserve_mb=2000),
             budget=_budget(),
             draining=False,
             tracker=tracker,
@@ -210,6 +210,37 @@ class TestHandleTranscribeRequestValidation:
         assert "VRAM" in json.loads(resp)["error"]["message"]
         assert tracker.rejected_vram_total == 1
         assert tracker.active == 0
+
+    @pytest.mark.asyncio
+    async def test_vram_gate_follows_the_requested_models_own_engine(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # LS-5: this endpoint is engine-agnostic (parakeet/whisper/
+        # parakeet_tdt models all flow through it), so the VRAM gate must
+        # key off whichever engine the REQUESTED model actually uses, not
+        # a single global backend flag. whisper_backend=cuda + a whisper
+        # model must trigger the gate even though parakeet_backend=cpu.
+        monkeypatch.setattr(transcribe_http.gpu, "free_vram_mb", lambda: 100)
+        body = _multipart_body(
+            {"model": "whisper-base.en-q8_0"}, file_field="file", file_bytes=_wav_bytes()
+        )
+        tracker = _tracker()
+        status, resp, ct = await transcribe_http.handle_transcribe_request(
+            content_type=CONTENT_TYPE,
+            body=body,
+            settings=_settings(
+                parakeet_backend="cpu",
+                whisper_backend="cuda",
+                vram_per_worker_mb=3000,
+                vram_reserve_mb=2000,
+            ),
+            budget=_budget(),
+            draining=False,
+            tracker=tracker,
+        )
+        assert status == 503
+        assert "VRAM" in json.loads(resp)["error"]["message"]
+        assert tracker.rejected_vram_total == 1
 
     @pytest.mark.asyncio
     async def test_vram_check_is_a_noop_on_cpu_backend(self, monkeypatch: pytest.MonkeyPatch):
@@ -228,7 +259,7 @@ class TestHandleTranscribeRequestValidation:
         monkeypatch.setattr(self_patch_module, "_run_transcription", fake_run)
         body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes())
         status, resp, ct = await transcribe_http.handle_transcribe_request(
-            content_type=CONTENT_TYPE, body=body, settings=_settings(backend="cpu"), budget=_budget(), draining=False, tracker=_tracker()
+            content_type=CONTENT_TYPE, body=body, settings=_settings(parakeet_backend="cpu"), budget=_budget(), draining=False, tracker=_tracker()
         )
         assert status == 200
 

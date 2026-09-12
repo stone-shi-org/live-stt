@@ -258,7 +258,9 @@ COPY run.py version.txt* ./
 ENV LSTT_WORKER_BIN=/app/worker/live_stt_worker \
     LSTT_WORKER_BIN_PARAKEET_TDT=/app/worker/live_stt_worker_parakeet_tdt \
     LSTT_WORKER_BIN_WHISPER=/app/worker/whisper/live_stt_worker_whisper \
-    LSTT_BACKEND=cpu \
+    LSTT_PARAKEET_BACKEND=cpu \
+    LSTT_WHISPER_BACKEND=cpu \
+    LSTT_PARAKEET_TDT_BACKEND=cpu \
     LSTT_GRPC_HOST=0.0.0.0 \
     LSTT_GRPC_PORT=50051 \
     LSTT_ADMIN_HOST=0.0.0.0 \
@@ -342,7 +344,9 @@ COPY run.py version.txt* ./
 ENV LSTT_WORKER_BIN=/app/worker/live_stt_worker \
     LSTT_WORKER_BIN_PARAKEET_TDT=/app/worker/live_stt_worker_parakeet_tdt \
     LSTT_WORKER_BIN_WHISPER=/app/worker/whisper/live_stt_worker_whisper \
-    LSTT_BACKEND=cuda \
+    LSTT_PARAKEET_BACKEND=cuda \
+    LSTT_WHISPER_BACKEND=cuda \
+    LSTT_PARAKEET_TDT_BACKEND=cuda \
     LSTT_GRPC_HOST=0.0.0.0 \
     LSTT_GRPC_PORT=50051 \
     LSTT_ADMIN_HOST=0.0.0.0 \

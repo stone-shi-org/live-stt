@@ -24,9 +24,48 @@ class Settings(BaseSettings):
     admin_host: str = "0.0.0.0"
     admin_port: int = 8000
 
-    backend: str = "cpu"  # "cpu" | "cuda" -- an image choice in prod, but overridable for tests
+    # Per-ENGINE backend choice (LS-5): a single global `backend` field used
+    # to force every engine onto the same cpu/cuda choice at once, which is
+    # exactly the "no need all cpu or all gpu" gap raised on that ticket --
+    # e.g. the live streaming (parakeet) engine on GPU while whisper's batch
+    # HTTP path stays on CPU (or vice versa), independently. Mirrors the
+    # precedent already set by diarization_device/tts_device below, which
+    # were ALREADY independent per-subsystem fields for the same reason
+    # (each runs as its own Python/torch process or its own worker binary,
+    # not a single shared runtime). Each of the three ASR engines gets its
+    # own field instead of reintroducing one shared switch:
+    #   - parakeet_backend: the streaming realtime engine (live_stt_worker) --
+    #     also what live_stt/servicer.py's Transcribe RPC gates VRAM
+    #     admission on, since that RPC only ever spawns this engine
+    #     (batch-only models are rejected before a worker is spawned).
+    #   - whisper_backend: the batch-only whisper.cpp worker
+    #     (live_stt_worker_whisper), reachable only via
+    #     POST /v1/audio/transcriptions.
+    #   - parakeet_tdt_backend: the batch-only Parakeet TDT worker
+    #     (live_stt_worker_parakeet_tdt), same HTTP-only reachability.
+    # "cpu" | "cuda" each -- an image/deploy choice, overridable per engine.
+    parakeet_backend: str = "cpu"
+    whisper_backend: str = "cpu"
+    parakeet_tdt_backend: str = "cpu"
     default_model: str = DEFAULT_MODEL_KEY
     models_dir: str = "/models"
+
+    # SQLite-backed runtime settings store (LS-5). Lives under the same
+    # already-mounted, already-writable ./data volume the backend-install
+    # directory (a later LS-5 phase) and audio-dump ring buffer are reserved
+    # for, so it survives `docker recreate` the same way. See
+    # live_stt/settings_store.py: on first boot with no existing DB file, the
+    # store is seeded ("migrated") from whatever this Settings instance
+    # resolved to from env vars/.env/defaults; from then on the DB is the
+    # ongoing source of truth for anything an operator has changed via the
+    # admin Settings UI, and env vars/.env only matter for a fresh install's
+    # initial values. Deliberately NOT threaded into plain `get_settings()`
+    # itself (see that function's docstring) -- only the real service
+    # entrypoint (live_stt/server.py) goes through the store, so every
+    # existing test that constructs `Settings()`/`get_settings()` directly
+    # for pure env-based behavior is completely unaffected by this field's
+    # existence.
+    db_path: str = "/app/data/live_stt.db"
 
     # Matches the Dockerfile runtime stage's layout (worker binary + its
     # ggml .so's copied into the same directory so the $ORIGIN rpath baked
@@ -229,4 +268,13 @@ class Settings(BaseSettings):
 
 
 def get_settings() -> Settings:
+    """Pure env/.env/defaults construction -- deliberately untouched by the
+    SQLite settings store (live_stt/settings_store.py). Every existing
+    caller (tests, one-off scripts, anything wanting deterministic
+    env-based behavior) keeps working exactly as before. The real service
+    entrypoint (live_stt/server.py) calls
+    live_stt.settings_store.load_effective_settings() instead, which uses
+    this function's result as both the migration seed and the fallback for
+    any field not (yet) overridden in the store.
+    """
     return Settings()

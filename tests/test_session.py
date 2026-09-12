@@ -197,15 +197,18 @@ async def test_parakeet_tdt_engine_spawns_the_parakeet_tdt_binary() -> None:
 
 @pytest.mark.asyncio
 async def test_use_gpu_is_derived_from_backend_setting_not_hardcoded() -> None:
-    # Settings.backend == "cuda" -- CallSession._spawn_worker (session.py)
+    # Settings.parakeet_backend == "cuda" (LS-5: per-engine, was a single
+    # global Settings.backend) -- CallSession._spawn_worker (session.py)
     # must derive use_gpu=True from this and thread it through
     # WorkerHandle.spawn()'s CONFIG frame (see worker/main_whisper.cpp's
-    # "use_gpu" field). Checked via the fake worker's use_gpu_received echo
+    # "use_gpu" field). _session()'s default model_key is
+    # "realtime_eou_120m-v1" (engine="parakeet"), hence parakeet_backend
+    # specifically. Checked via the fake worker's use_gpu_received echo
     # (tests/fakes/fake_worker_main.py) rather than mocking spawn() directly,
     # so this exercises the real CONFIG JSON that actually goes out over the
     # real IPC socket, not just the Python call arguments.
     cuda_settings = Settings(
-        _env_file=None, worker_bin=str(FAKE_WORKER), models_dir="/fake", backend="cuda"
+        _env_file=None, worker_bin=str(FAKE_WORKER), models_dir="/fake", parakeet_backend="cuda"
     )
     session = _session(settings=cuda_settings)
     try:
@@ -216,7 +219,7 @@ async def test_use_gpu_is_derived_from_backend_setting_not_hardcoded() -> None:
     assert session._worker.ready.get("use_gpu_received") is True  # noqa: SLF001
 
     cpu_settings = Settings(
-        _env_file=None, worker_bin=str(FAKE_WORKER), models_dir="/fake", backend="cpu"
+        _env_file=None, worker_bin=str(FAKE_WORKER), models_dir="/fake", parakeet_backend="cpu"
     )
     session = _session(settings=cpu_settings)
     try:
@@ -224,6 +227,38 @@ async def test_use_gpu_is_derived_from_backend_setting_not_hardcoded() -> None:
     finally:
         await session.close()
     assert session._worker.ready.get("use_gpu_received") is False  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_per_engine_backends_are_independent_mix_and_match() -> None:
+    # LS-5's explicit ask ("user can pickup gpu for live stream, cpu for
+    # [another engine]... no need all cpu or all gpu"): parakeet_backend and
+    # whisper_backend must be settable independently, not derived from one
+    # shared flag. Uses the same fake worker for both engines' binaries
+    # (its IPC protocol doesn't care which "engine" it's pretending to be)
+    # so this stays a fast, offline unit test.
+    mixed_settings = Settings(
+        _env_file=None,
+        worker_bin=str(FAKE_WORKER),
+        worker_bin_whisper=str(FAKE_WORKER),
+        models_dir="/fake",
+        parakeet_backend="cuda",
+        whisper_backend="cpu",
+    )
+
+    parakeet_session = _session(settings=mixed_settings, model_key="realtime_eou_120m-v1")
+    try:
+        await parakeet_session.start()
+        assert parakeet_session._worker.ready.get("use_gpu_received") is True  # noqa: SLF001
+    finally:
+        await parakeet_session.close()
+
+    whisper_session = _session(settings=mixed_settings, model_key="whisper-base.en-q8_0")
+    try:
+        await whisper_session.start()
+        assert whisper_session._worker.ready.get("use_gpu_received") is False  # noqa: SLF001
+    finally:
+        await whisper_session.close()
 
 
 def test_rotation_never_triggers_for_a_batch_only_model_even_past_every_threshold() -> None:
