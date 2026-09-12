@@ -115,6 +115,18 @@ fi
 
 log "Version: ${HASH} (${TIMESTAMP}), parakeet.cpp @ ${PARAKEET_REF:0:7}, whisper.cpp @ ${WHISPER_REF:0:7}"
 
+# Serialize docker builds on hosts where concurrent builds (e.g. Bamboo running
+# CPU, CUDA, and Diarize jobs in parallel) would otherwise contend for disk space.
+LOCKFILE="${TMPDIR:-/tmp}/live-stt-build.lock"
+log "Acquiring build lock (${LOCKFILE})..."
+exec 200>"$LOCKFILE"
+flock -w 1800 200 || { echo "ERROR: Could not acquire build lock after 30 minutes" >&2; exit 1; }
+log "Acquired build lock."
+
+# Clean up dangling images and old builder cache before building
+docker image prune -f >/dev/null 2>&1 || true
+docker builder prune -af >/dev/null 2>&1 || true
+
 log "Building ${REPO}:latest${SUFFIX} (target ${TARGET})"
 docker build --target "$TARGET" \
     -t "${REPO}:latest${SUFFIX}" \
@@ -136,3 +148,6 @@ elif [ -z "$REGISTRY" ]; then
 else
     log "Not pushed. Re-run with -p to push to ${REGISTRY}."
 fi
+
+# Clean up dangling images after push
+docker image prune -f >/dev/null 2>&1 || true

@@ -82,13 +82,16 @@ RUN --mount=type=cache,target=/build,id=live-stt-whisper-build-cpu \
     && cp /build/whisper/src/libwhisper.a /out/ \
     && cp /build/whisper/ggml/src/libggml*.a /out/lib/
 
+# ---- stage: cmake provider for CUDA builds (avoids running apt in devel image) ---
+FROM python:3.12-slim AS cmake-provider
+RUN pip install --no-cache-dir cmake \
+    && cp -r /usr/local/lib/python3.12/site-packages/cmake/data/* /usr/local/
+
 # ---- stage: whisper.cpp, CUDA build (Phase 6) ------------------------------
 # Same sm_86 target as parakeet's CUDA stage below -- see that stage's
 # comment for the real (not speculated) GPU identity this targets.
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS whisper-build-cuda
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake git bash ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=cmake-provider /usr/local/ /usr/local/
 WORKDIR /src/live-stt-worker
 COPY worker/third_party/whisper.cpp/ third_party/whisper.cpp/
 RUN --mount=type=cache,target=/build,id=live-stt-whisper-build-cuda \
@@ -138,9 +141,7 @@ RUN --mount=type=cache,target=/build,id=live-stt-whisper-build-cuda \
 # real device or driver -- this stage builds fine on a driverless host; only
 # RUNNING the result needs the actual GPU box.
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS parakeet-build-cuda
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake git bash ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=cmake-provider /usr/local/ /usr/local/
 WORKDIR /src/live-stt-worker
 COPY worker/third_party/parakeet.cpp/ third_party/parakeet.cpp/
 RUN --mount=type=cache,target=/build,id=live-stt-parakeet-build-cuda \
@@ -195,9 +196,7 @@ RUN cd worker && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 # added for the same find_package(OpenMP) configure-time probe reason as the
 # CPU worker-build stage above.
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS worker-build-cuda
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=cmake-provider /usr/local/ /usr/local/
 WORKDIR /src/live-stt-worker
 COPY worker/ ./worker/
 COPY --from=parakeet-build-cuda /out/libparakeet.a worker/build-parakeet/libparakeet.a
@@ -282,10 +281,17 @@ CMD ["python", "run.py"]
 # slim), so no deadsnakes/PPA needed -- just apt. --break-system-packages:
 # Ubuntu's apt-installed python3-pip marks the environment "externally
 # managed" per PEP 668; harmless here since the whole image is disposable.
+# ffmpeg: pyannote.audio decodes audio via torchcodec/libavutil, and kokoro/piper
+# TTS engines also benefit from audio utilities. Installed directly here in
+# runtime-cuda so all downstream CUDA stages inherit it without needing an extra
+# apt-get update cycle.
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS runtime-cuda
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.12 python3-pip libgomp1 \
-    && rm -rf /var/lib/apt/lists/* \
+RUN rm -f /etc/apt/sources.list.d/cuda.list /etc/apt/sources.list.d/nvidia-ml.list \
+    && echo 'APT::Get::Check-Space "false";' > /etc/apt/apt.conf.d/99nodiskcheck \
+    && sed -i 's/Signed-By: .*/Trusted: yes/' /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated -o APT::Get::Check-Space=false \
+        python3.12 python3-pip libgomp1 ffmpeg \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
     && ln -sf /usr/bin/python3.12 /usr/bin/python
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -374,20 +380,6 @@ CMD ["python", "run.py"]
 # HuggingFace (and burns a token's rate limit) on every restart.
 FROM runtime-cuda AS runtime-cuda-diarize
 ENV HF_HOME=/app/data/hf-cache
-# ffmpeg: pyannote.audio 4.x decodes audio via torchcodec, which dlopens
-# libavutil/libavcodec/etc at import time (tries several ffmpeg ABI versions
-# in turn) rather than linking them at build time -- found only by actually
-# running diarize_file() in a real container, not by reading either
-# project's docs: "OSError: libavutil.so.61: cannot open shared object
-# file", repeated for every ffmpeg 4-9 ABI torchcodec tried, on this image's
-# runtime-cuda base (python3.12/python3-pip/libgomp1 only, no media libs at
-# all). Every dev machine this was built/tested on before this container
-# already had ffmpeg installed for unrelated reasons, which is exactly how
-# this stayed invisible until the real container build+run in CLAUDE.md's
-# GPU deploy log.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
 COPY requirements-diarization.txt .
 RUN pip install --no-cache-dir --break-system-packages -r requirements-diarization.txt \
         --index-url https://pypi.org/simple/

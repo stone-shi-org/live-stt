@@ -37,8 +37,8 @@
 #      builds (the diarize one alone is ~9.5GB before layer dedup).
 version: 2
 plan:
-  project-key: LSTT
-  key: LSTT
+  project-key: LIV
+  key: LIV
   name: live-stt-docker
 stages:
   - Default Stage:
@@ -46,7 +46,15 @@ stages:
       final: false
       jobs:
         - Default Job
+  - CUDA Stage:
+      manual: false
+      final: false
+      jobs:
         - CUDA Build Job
+  - CUDA Diarize Stage:
+      manual: false
+      final: false
+      jobs:
         - CUDA Diarize Build Job
 Default Job:
   key: JOB1
@@ -78,7 +86,9 @@ Default Job:
         scripts:
           - |
             set -euo pipefail
+            docker builder prune -af || true
             ./build.sh -p -r registry.shifamily.com/homestack
+            docker image prune -f || true
   requirements:
     - system.docker.executable
 CUDA Build Job:
@@ -110,7 +120,9 @@ CUDA Build Job:
         scripts:
           - |
             set -euo pipefail
+            docker builder prune -af || true
             ./build.sh --cuda -p -r registry.shifamily.com/homestack
+            docker image prune -f || true
   requirements:
     - system.docker.executable
 CUDA Diarize Build Job:
@@ -138,7 +150,9 @@ CUDA Diarize Build Job:
         scripts:
           - |
             set -euo pipefail
+            docker builder prune -af || true
             ./build.sh --cuda --diarize -p -r registry.shifamily.com/homestack
+            docker image prune -f || true
   requirements:
     - system.docker.executable
 triggers:
