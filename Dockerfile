@@ -87,10 +87,11 @@ RUN --mount=type=cache,target=/build,id=live-stt-whisper-build-cpu \
 # comment for the real (not speculated) GPU identity this targets.
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS whisper-build-cuda
 RUN rm -f /etc/apt/sources.list.d/cuda.list /etc/apt/sources.list.d/nvidia-ml.list \
+    && echo 'APT::Get::Check-Disk-Space "false";' > /etc/apt/apt.conf.d/99nodiskcheck \
     && sed -i 's/Signed-By: .*/Trusted: yes/' /etc/apt/sources.list.d/ubuntu.sources \
-    && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated \
+    && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated -o APT::Get::Check-Disk-Space=false \
         build-essential cmake git bash ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 WORKDIR /src/live-stt-worker
 COPY worker/third_party/whisper.cpp/ third_party/whisper.cpp/
 RUN --mount=type=cache,target=/build,id=live-stt-whisper-build-cuda \
@@ -141,10 +142,11 @@ RUN --mount=type=cache,target=/build,id=live-stt-whisper-build-cuda \
 # RUNNING the result needs the actual GPU box.
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS parakeet-build-cuda
 RUN rm -f /etc/apt/sources.list.d/cuda.list /etc/apt/sources.list.d/nvidia-ml.list \
+    && echo 'APT::Get::Check-Disk-Space "false";' > /etc/apt/apt.conf.d/99nodiskcheck \
     && sed -i 's/Signed-By: .*/Trusted: yes/' /etc/apt/sources.list.d/ubuntu.sources \
-    && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated \
+    && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated -o APT::Get::Check-Disk-Space=false \
         build-essential cmake git bash ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 WORKDIR /src/live-stt-worker
 COPY worker/third_party/parakeet.cpp/ third_party/parakeet.cpp/
 RUN --mount=type=cache,target=/build,id=live-stt-parakeet-build-cuda \
@@ -200,10 +202,11 @@ RUN cd worker && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 # CPU worker-build stage above.
 FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS worker-build-cuda
 RUN rm -f /etc/apt/sources.list.d/cuda.list /etc/apt/sources.list.d/nvidia-ml.list \
+    && echo 'APT::Get::Check-Disk-Space "false";' > /etc/apt/apt.conf.d/99nodiskcheck \
     && sed -i 's/Signed-By: .*/Trusted: yes/' /etc/apt/sources.list.d/ubuntu.sources \
-    && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated \
+    && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated -o APT::Get::Check-Disk-Space=false \
         build-essential cmake libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 WORKDIR /src/live-stt-worker
 COPY worker/ ./worker/
 COPY --from=parakeet-build-cuda /out/libparakeet.a worker/build-parakeet/libparakeet.a
@@ -294,10 +297,11 @@ CMD ["python", "run.py"]
 # apt-get update cycle.
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS runtime-cuda
 RUN rm -f /etc/apt/sources.list.d/cuda.list /etc/apt/sources.list.d/nvidia-ml.list \
+    && echo 'APT::Get::Check-Disk-Space "false";' > /etc/apt/apt.conf.d/99nodiskcheck \
     && sed -i 's/Signed-By: .*/Trusted: yes/' /etc/apt/sources.list.d/ubuntu.sources \
-    && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated \
+    && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated -o APT::Get::Check-Disk-Space=false \
         python3.12 python3-pip libgomp1 ffmpeg \
-    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
     && ln -sf /usr/bin/python3.12 /usr/bin/python
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
