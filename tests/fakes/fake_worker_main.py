@@ -101,6 +101,13 @@ def main() -> None:
                 # (see tests/test_session.py's use_gpu dispatch test) --
                 # not read by any real worker's own CONFIG contract.
                 "use_gpu_received": config.get("use_gpu", False),
+                # LS-5 Phase 7b: echoes the LD_LIBRARY_PATH env var this
+                # process actually got, so tests can assert on
+                # CallSession._spawn_worker's ggml_lib_dir choice (active
+                # installed backend vs. the image-baked default) the same
+                # real-subprocess way use_gpu_received above already does,
+                # rather than mocking WorkerHandle.spawn directly.
+                "ld_library_path_received": os.environ.get("LD_LIBRARY_PATH"),
             }
         ).encode(),
     )

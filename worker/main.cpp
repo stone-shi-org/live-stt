@@ -27,6 +27,16 @@ extern "C" {
 #include "parakeet_capi.h"
 }
 
+#ifdef LSTT_PARAKEET_PREBUILT
+// LS-5 Phase 7b: LSTT_PARAKEET_PREBUILT links against a downloaded
+// libparakeet.so (see live_stt/backends/registry.py,
+// scripts/fetch_backend.sh) instead of building parakeet.cpp from source --
+// see worker/pk_private.hpp's docstring for why this is safe (the two
+// symbols below are confirmed exported dynamic symbols in the real release
+// artifact) and what real, unpublished-contract risk it carries that the
+// from-source path below does not.
+#include "pk_private.hpp"
+#else
 // Private header -- lives under parakeet.cpp's src/, not include/, so it is
 // NOT part of the upstream public API contract. Reached deliberately: this
 // is the ONLY way to call pk::set_num_threads / pk::shutdown_backend, which
@@ -43,8 +53,12 @@ extern "C" {
 // the loaded CPU backend's actual capabilities, not a compile-time check of
 // this translation unit's own flags (which would report "scalar" for an
 // AVX2 build, since only ggml-cpu's sources are compiled with -mavx2 etc,
-// not main.cpp).
+// not main.cpp). Not available in LSTT_PARAKEET_PREBUILT mode -- the
+// prebuilt release package ships no ggml headers at all (ggml is linked
+// statically INTO libparakeet.so with nothing exposed) -- see
+// ggml_feature_string() below for the resulting honest fallback.
 #include <ggml-cpu.h>
+#endif
 
 namespace {
 
@@ -56,12 +70,22 @@ constexpr int kIpcFd = 3;
 // always starting with '{'.
 
 std::string ggml_feature_string() {
+#ifdef LSTT_PARAKEET_PREBUILT
+    // No ggml-cpu.h available in this mode (see the include block above) --
+    // an honest "can't tell" beats fabricating a value. Ready.ggml_features
+    // exists specifically so a silently-scalar build is visible in one
+    // request (see CLAUDE.md) -- this string says exactly why that check
+    // can't run here rather than reporting something that looks like a real
+    // reading.
+    return "unknown (LSTT_PARAKEET_PREBUILT: no ggml headers in the prebuilt release package)";
+#else
     std::string features;
     if (ggml_cpu_has_avx2()) features += "AVX2 ";
     if (ggml_cpu_has_fma()) features += "FMA ";
     if (ggml_cpu_has_f16c()) features += "F16C ";
     if (features.empty()) features = "scalar";
     return features;
+#endif
 }
 
 bool send_error(const std::string& reason) {

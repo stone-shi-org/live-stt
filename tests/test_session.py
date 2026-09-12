@@ -261,6 +261,58 @@ async def test_per_engine_backends_are_independent_mix_and_match() -> None:
         await whisper_session.close()
 
 
+@pytest.mark.asyncio
+async def test_spawn_prefers_an_active_installed_backend_over_the_image_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # LS-5 Phase 7b: when live_stt.backends.installer.get_active_lib_dir()
+    # reports an active installed parakeet backend, CallSession must point
+    # ggml_lib_dir at IT, not Settings.worker_ggml_lib_dir -- this is the
+    # one place the download/install/activate mechanism actually changes
+    # what gets spawned. Checked via the real fake-worker subprocess's
+    # ld_library_path_received echo (tests/fakes/fake_worker_main.py),
+    # same real-IPC pattern the use_gpu dispatch test above uses, rather
+    # than mocking WorkerHandle.spawn directly.
+    import live_stt.session as session_module
+
+    monkeypatch.setattr(session_module, "get_active_lib_dir", lambda db_path, engine: "/active/backend/dir")
+    settings = Settings(
+        _env_file=None,
+        worker_bin=str(FAKE_WORKER),
+        models_dir="/fake",
+        worker_ggml_lib_dir="/image-default/lib-dir",
+    )
+    session = _session(settings=settings, model_key="realtime_eou_120m-v1")
+    try:
+        await session.start()
+        assert session._worker.ready.get("ld_library_path_received") == "/active/backend/dir"  # noqa: SLF001
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_spawn_falls_back_to_the_image_default_when_nothing_is_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The common case, and every deployment before this feature existed:
+    # no DB / nothing installed+activated -> unchanged behavior.
+    import live_stt.session as session_module
+
+    monkeypatch.setattr(session_module, "get_active_lib_dir", lambda db_path, engine: None)
+    settings = Settings(
+        _env_file=None,
+        worker_bin=str(FAKE_WORKER),
+        models_dir="/fake",
+        worker_ggml_lib_dir="/image-default/lib-dir",
+    )
+    session = _session(settings=settings, model_key="realtime_eou_120m-v1")
+    try:
+        await session.start()
+        assert session._worker.ready.get("ld_library_path_received") == "/image-default/lib-dir"  # noqa: SLF001
+    finally:
+        await session.close()
+
+
 def test_rotation_never_triggers_for_a_batch_only_model_even_past_every_threshold() -> None:
     # The correctness fix this whisper addition surfaced: a rotation
     # SIGKILLs the active worker mid-call, which is safe for a streaming

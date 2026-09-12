@@ -28,6 +28,7 @@ from pathlib import Path
 
 from live_stt import __about__, metrics
 from live_stt.admission import WorkerBudget
+from live_stt.backends.installer import get_active_lib_dir
 from live_stt.boundary import dedup_incoming_words
 from live_stt.config import Settings
 from live_stt.events import worker_json_to_events
@@ -119,11 +120,28 @@ class CallSession:
             engine_backend = self._settings.parakeet_tdt_backend
         else:
             worker_bin = Path(self._settings.worker_bin)
-            ggml_lib_dir = (
-                Path(self._settings.worker_ggml_lib_dir)
-                if self._settings.worker_ggml_lib_dir
-                else None
-            )
+            # LS-5 Phase 7b: prefer a backend INSTALLED+ACTIVATED via the
+            # registry/admin UI (live_stt/backends/installer.py) over the
+            # image-baked default -- this is the one place the download
+            # mechanism actually changes what the service spawns. Only
+            # meaningful for the parakeet engine today: it's the only
+            # worker binary built against a dynamically-linked
+            # libparakeet.so (worker/CMakeLists.txt's
+            # LSTT_PARAKEET_PREBUILT), so swapping which directory
+            # LD_LIBRARY_PATH points at genuinely changes which .so gets
+            # loaded. Falls back to the pre-existing behavior (None if
+            # nothing installed/activated yet, or the DB doesn't exist) --
+            # fully backward compatible for every deployment that hasn't
+            # touched this new mechanism at all.
+            active_backend_dir = get_active_lib_dir(self._settings.db_path, "parakeet")
+            if active_backend_dir is not None:
+                ggml_lib_dir = Path(active_backend_dir)
+            else:
+                ggml_lib_dir = (
+                    Path(self._settings.worker_ggml_lib_dir)
+                    if self._settings.worker_ggml_lib_dir
+                    else None
+                )
             n_threads = self._settings.n_threads_per_worker
             engine_backend = self._settings.parakeet_backend
         start = time.monotonic()

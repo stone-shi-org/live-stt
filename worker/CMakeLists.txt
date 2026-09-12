@@ -27,38 +27,86 @@ set(PARAKEET_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/parakeet.cpp" CACH
 set(PARAKEET_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build-parakeet" CACHE PATH
     "standalone parakeet.cpp build output; see scripts/build_worker.sh")
 
-if(NOT EXISTS "${PARAKEET_BUILD_DIR}/libparakeet.a")
-  message(FATAL_ERROR
-    "libparakeet.a not found at ${PARAKEET_BUILD_DIR}. Build parakeet.cpp "
-    "standalone first -- run scripts/build_worker.sh (or see that script "
-    "for the equivalent cmake invocation), then reconfigure this project.")
-endif()
-
-add_library(parakeet STATIC IMPORTED)
-set_target_properties(parakeet PROPERTIES
-    IMPORTED_LOCATION "${PARAKEET_BUILD_DIR}/libparakeet.a"
-    INTERFACE_INCLUDE_DIRECTORIES "${PARAKEET_SRC_DIR}/include"
-)
-
-set(_GGML_LIB_DIR "${PARAKEET_BUILD_DIR}/third_party/ggml/src")
-find_library(GGML_LIB ggml PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
-find_library(GGML_BASE_LIB ggml-base PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
-find_library(GGML_CPU_LIB ggml-cpu PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
-
-# Phase 5. NOT REQUIRED: absent entirely on a CPU-only build-parakeet output.
+# --------------------------------------------------------------------------
+# LS-5 Phase 7b: optional PREBUILT alternative to the from-source build
+# above. OFF by default -- the from-source path below is what's actually
+# been built/run/verified in production for a long history (see CLAUDE.md's
+# build-gotcha sections); this is a new, additive option, not a silent
+# replacement, until the prebuilt path earns the same track record.
 #
-# Correction to an earlier assumption here: this comment used to claim ggml's
-# backend-registry dlopens libggml-cuda.so at runtime by soname and is "never
-# a direct link-time symbol dependency" -- disproven by actually building
-# this. ggml-backend-reg.cpp is compiled INTO libggml.so with a direct
-# (non-weak, non-dlsym) reference to ggml_backend_cuda_reg() whenever the
-# overall ggml build had CUDA enabled, so libggml.so itself carries a genuine
-# unresolved symbol. A shared library tolerates that (a .so's own link does
-# not require every symbol resolved), but our EXECUTABLE'S link does, so
-# omitting this target_link_libraries call below produces
-# "undefined reference to `ggml_backend_cuda_reg'" -- linking it here isn't
-# just for co-location, it's required to resolve the executable at all.
-find_library(GGML_CUDA_LIB ggml-cuda PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH)
+# When ON, `parakeet` becomes a SHARED imported target pointing at a
+# DOWNLOADED libparakeet.so (live_stt/backends/registry.py +
+# scripts/fetch_backend.sh) instead of a vendored-source static build --
+# no parakeet.cpp submodule checkout, no ggml CMake, no CUDA toolchain
+# needed in THIS build at all for the CPU flavor (verified for real: the
+# real v0.5.0 linux-cpu-x64 release's libparakeet.so links ggml statically
+# INTO itself -- `ldd` shows only libgomp/libstdc++/libm/libgcc_s/libc, no
+# separate libggml*.so). worker/pk_private.hpp replaces the private
+# ggml_graph.hpp include this path can no longer reach -- see that file's
+# docstring for the real risk this carries (an unpublished, no-guarantee
+# symbol contract) and how live_stt/backends/installer.py's dlopen/dlsym
+# probe mitigates it before ever activating a downloaded version.
+option(LSTT_PARAKEET_PREBUILT
+    "Link the parakeet engine against a downloaded libparakeet.so instead of building parakeet.cpp from source (LS-5 Phase 7b)"
+    OFF)
+set(PARAKEET_PREBUILT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/prebuilt-parakeet" CACHE PATH
+    "Directory containing a fetched libparakeet.so + parakeet_capi.h -- see scripts/fetch_backend.sh")
+
+if(LSTT_PARAKEET_PREBUILT)
+  if(NOT EXISTS "${PARAKEET_PREBUILT_DIR}/libparakeet.so")
+    message(FATAL_ERROR
+      "libparakeet.so not found at ${PARAKEET_PREBUILT_DIR}. Run "
+      "scripts/fetch_backend.sh parakeet cpu (or the matching flavor) "
+      "first, then reconfigure this project.")
+  endif()
+
+  add_library(parakeet SHARED IMPORTED)
+  set_target_properties(parakeet PROPERTIES
+      IMPORTED_LOCATION "${PARAKEET_PREBUILT_DIR}/libparakeet.so"
+      INTERFACE_INCLUDE_DIRECTORIES "${PARAKEET_PREBUILT_DIR}"
+  )
+  # Deliberately unset (empty), not "not found" errors: the prebuilt release
+  # has no separate libggml*.so to import at all (see the option()'s comment
+  # above) -- every target_link_libraries(... ${GGML_LIB} ...) call below
+  # tolerates an empty variable (CMake just omits it from the link line).
+  set(GGML_LIB "")
+  set(GGML_BASE_LIB "")
+  set(GGML_CPU_LIB "")
+  set(GGML_CUDA_LIB "")
+else()
+  if(NOT EXISTS "${PARAKEET_BUILD_DIR}/libparakeet.a")
+    message(FATAL_ERROR
+      "libparakeet.a not found at ${PARAKEET_BUILD_DIR}. Build parakeet.cpp "
+      "standalone first -- run scripts/build_worker.sh (or see that script "
+      "for the equivalent cmake invocation), then reconfigure this project.")
+  endif()
+
+  add_library(parakeet STATIC IMPORTED)
+  set_target_properties(parakeet PROPERTIES
+      IMPORTED_LOCATION "${PARAKEET_BUILD_DIR}/libparakeet.a"
+      INTERFACE_INCLUDE_DIRECTORIES "${PARAKEET_SRC_DIR}/include"
+  )
+
+  set(_GGML_LIB_DIR "${PARAKEET_BUILD_DIR}/third_party/ggml/src")
+  find_library(GGML_LIB ggml PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+  find_library(GGML_BASE_LIB ggml-base PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+  find_library(GGML_CPU_LIB ggml-cpu PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+
+  # Phase 5. NOT REQUIRED: absent entirely on a CPU-only build-parakeet output.
+  #
+  # Correction to an earlier assumption here: this comment used to claim ggml's
+  # backend-registry dlopens libggml-cuda.so at runtime by soname and is "never
+  # a direct link-time symbol dependency" -- disproven by actually building
+  # this. ggml-backend-reg.cpp is compiled INTO libggml.so with a direct
+  # (non-weak, non-dlsym) reference to ggml_backend_cuda_reg() whenever the
+  # overall ggml build had CUDA enabled, so libggml.so itself carries a genuine
+  # unresolved symbol. A shared library tolerates that (a .so's own link does
+  # not require every symbol resolved), but our EXECUTABLE'S link does, so
+  # omitting this target_link_libraries call below produces
+  # "undefined reference to `ggml_backend_cuda_reg'" -- linking it here isn't
+  # just for co-location, it's required to resolve the executable at all.
+  find_library(GGML_CUDA_LIB ggml-cuda PATHS "${_GGML_LIB_DIR}" NO_DEFAULT_PATH)
+endif()
 
 add_executable(live_stt_worker
     main.cpp
@@ -96,10 +144,17 @@ endif()
 # itself was compiled, not the separately-flagged ggml-cpu sources -- a
 # mistake caught by actually running this and seeing "scalar" reported for a
 # build that was, in fact, AVX2).
-target_include_directories(live_stt_worker PRIVATE
-    "${PARAKEET_SRC_DIR}/src"
-    "${PARAKEET_SRC_DIR}/third_party/ggml/include"
-)
+if(LSTT_PARAKEET_PREBUILT)
+  # main.cpp/main_parakeet_tdt.cpp #ifdef on this same definition to swap
+  # ggml_graph.hpp -> pk_private.hpp and skip the ggml-cpu.h feature check
+  # (see those files' comments).
+  target_compile_definitions(live_stt_worker PRIVATE LSTT_PARAKEET_PREBUILT)
+else()
+  target_include_directories(live_stt_worker PRIVATE
+      "${PARAKEET_SRC_DIR}/src"
+      "${PARAKEET_SRC_DIR}/third_party/ggml/include"
+  )
+endif()
 
 # ggml is loaded as shared libs (ggml's own backend-registry design, not a
 # PARAKEET_SHARED artifact -- true even though libparakeet.a itself is
@@ -130,10 +185,14 @@ if(GGML_CUDA_LIB)
   target_link_libraries(live_stt_worker_parakeet_tdt PRIVATE CUDA::cuda_driver)
 endif()
 
-target_include_directories(live_stt_worker_parakeet_tdt PRIVATE
-    "${PARAKEET_SRC_DIR}/src"
-    "${PARAKEET_SRC_DIR}/third_party/ggml/include"
-)
+if(LSTT_PARAKEET_PREBUILT)
+  target_compile_definitions(live_stt_worker_parakeet_tdt PRIVATE LSTT_PARAKEET_PREBUILT)
+else()
+  target_include_directories(live_stt_worker_parakeet_tdt PRIVATE
+      "${PARAKEET_SRC_DIR}/src"
+      "${PARAKEET_SRC_DIR}/third_party/ggml/include"
+  )
+endif()
 
 set_target_properties(live_stt_worker_parakeet_tdt PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE

@@ -26,6 +26,7 @@ from prometheus_client import generate_latest
 
 from live_stt import (
     __about__,
+    db,
     diarization_models,
     diarize_http,
     gpu,
@@ -34,6 +35,8 @@ from live_stt import (
     tts_http,
     tts_models,
 )
+from live_stt.backends import installer
+from live_stt.backends import registry as backend_registry
 from live_stt.settings_store import HOT_RELOAD_FIELDS, apply_update
 from live_stt.state import ServerState
 
@@ -1012,6 +1015,19 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
     </table>
     <button id="saveBtn" disabled>Save Changes</button>
 
+    <h1 style="margin-top:32px;">Engine Backends</h1>
+    <p style="color:var(--text-muted);">
+        Registered upstream artifacts (live_stt/backends/registry.py) and what's
+        installed/activated on THIS process (live_stt/backends/installer.py) --
+        only "wired" engines actually change behavior when activated; see that
+        module's docstring.
+    </p>
+    <div id="backendsBanner"></div>
+    <table>
+        <thead><tr><th>Engine</th><th>Flavor</th><th>Registered tag</th><th>Wired</th><th>Installed versions</th><th>Actions</th></tr></thead>
+        <tbody id="backendsBody"><tr><td colspan="6">Loading...</td></tr></tbody>
+    </table>
+
     <script>
         let original = {};
         let hotFields = new Set();
@@ -1090,8 +1106,73 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
             }
         }
 
+        function showBackendsBanner(kind, text) {
+            const b = document.getElementById('backendsBanner');
+            b.className = kind;
+            b.innerText = text;
+        }
+
+        async function installBackend(engine, flavor) {
+            showBackendsBanner('ok', `Installing ${engine}:${flavor}... (may take a moment)`);
+            const resp = await fetch('/api/backends/install', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({engine, flavor}),
+            });
+            const doc = await resp.json();
+            if (resp.ok) {
+                showBackendsBanner('ok', `Installed ${engine}:${flavor} -> ${doc.version}. Not activated yet.`);
+            } else {
+                showBackendsBanner('err', doc.error || 'install failed');
+            }
+            await loadBackends();
+        }
+
+        async function activateBackend(engine, flavor, version) {
+            const resp = await fetch('/api/backends/activate', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({engine, flavor, version}),
+            });
+            const doc = await resp.json();
+            if (resp.ok) {
+                showBackendsBanner('ok', `Activated ${engine}:${flavor}:${version}. New worker spawns will use it.`);
+            } else {
+                showBackendsBanner('err', doc.error || 'activate failed');
+            }
+            await loadBackends();
+        }
+
+        async function loadBackends() {
+            const resp = await fetch('/api/backends');
+            const doc = await resp.json();
+            const tbody = document.getElementById('backendsBody');
+            if (doc.store_available === false) {
+                tbody.innerHTML = '<tr><td colspan="6">No settings store configured on this process.</td></tr>';
+                return;
+            }
+            const rows = doc.registered.map((spec) => {
+                const installedVersions = doc.installed.filter(
+                    (b) => b.engine === spec.engine && b.flavor === spec.flavor
+                );
+                const versionsText = installedVersions.length
+                    ? installedVersions.map((b) => `${b.version}${b.active ? ' (active)' : ''}`).join(', ')
+                    : '(none installed)';
+                const installBtn = `<button onclick="installBackend('${spec.engine}','${spec.flavor}')">Install ${spec.tag}</button>`;
+                const activateBtns = installedVersions
+                    .filter((b) => !b.active)
+                    .map((b) => `<button onclick="activateBackend('${spec.engine}','${spec.flavor}','${b.version}')">Activate ${b.version}</button>`)
+                    .join(' ');
+                return `<tr><td>${spec.engine}</td><td>${spec.flavor}</td><td>${spec.tag}</td>` +
+                    `<td>${spec.wired ? 'yes' : 'no (registered only)'}</td>` +
+                    `<td>${versionsText}</td><td>${installBtn} ${activateBtns}</td></tr>`;
+            });
+            tbody.innerHTML = rows.join('') || '<tr><td colspan="6">No backends registered.</td></tr>';
+        }
+
         document.getElementById('saveBtn').addEventListener('click', save);
         load();
+        loadBackends();
     </script>
 </body>
 </html>
@@ -1138,6 +1219,99 @@ def _apply_settings_update(state: ServerState, body: bytes) -> tuple[int, dict]:
     return 200, {"applied_hot": applied_hot, "pending_restart": pending_restart}
 
 
+def _backends_doc(state: ServerState) -> dict:
+    """GET /api/backends: the registry (live_stt/backends/registry.py --
+    what CAN be fetched) alongside what's actually been installed/activated
+    on THIS process (live_stt/backends/installer.py). Deliberately excludes
+    a live upstream-GitHub-latest-tag check (upgrade_checker.py's
+    upstream_visibility_report()) -- that's a real network call per repo,
+    which this read-only GET should not incur on every dashboard poll.
+    """
+    if state.settings_store is None:
+        return {"store_available": False, "registered": [], "installed": []}
+    conn = db.connect(state.settings.db_path)
+    try:
+        installed = installer.list_installed(conn)
+    finally:
+        conn.close()
+    return {
+        "store_available": True,
+        "registered": [
+            {
+                "engine": spec.engine,
+                "flavor": spec.flavor,
+                "repo": spec.repo,
+                "tag": spec.tag,
+                "wired": spec.wired,
+            }
+            for spec in backend_registry.BACKENDS.values()
+        ],
+        "installed": [
+            {
+                "engine": b.engine,
+                "flavor": b.flavor,
+                "version": b.version,
+                "path": b.path,
+                "installed_at": b.installed_at,
+                "active": b.active,
+            }
+            for b in installed
+        ],
+    }
+
+
+def _handle_backend_install(state: ServerState, body: bytes) -> tuple[int, dict]:
+    if state.settings_store is None:
+        return 503, {"error": "no settings store configured on this process"}
+    try:
+        payload = json.loads(body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return 400, {"error": "invalid JSON body"}
+    engine, flavor = payload.get("engine"), payload.get("flavor")
+    if not engine or not flavor:
+        return 400, {"error": "expected a JSON object: {'engine': ..., 'flavor': ...}"}
+
+    conn = db.connect(state.settings.db_path)
+    try:
+        installed = installer.install(conn, state.settings.backends_dir, engine, flavor)
+    except KeyError as exc:
+        return 400, {"error": str(exc)}
+    except installer.BackendInstallError as exc:
+        # Download/checksum/extraction/safety-probe failure -- an upstream
+        # or network problem, not a bad request; 502 (not 500) says so.
+        return 502, {"error": str(exc)}
+    finally:
+        conn.close()
+    return 200, {
+        "engine": installed.engine,
+        "flavor": installed.flavor,
+        "version": installed.version,
+        "path": installed.path,
+        "active": installed.active,
+    }
+
+
+def _handle_backend_activate(state: ServerState, body: bytes) -> tuple[int, dict]:
+    if state.settings_store is None:
+        return 503, {"error": "no settings store configured on this process"}
+    try:
+        payload = json.loads(body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return 400, {"error": "invalid JSON body"}
+    engine, flavor, version = payload.get("engine"), payload.get("flavor"), payload.get("version")
+    if not engine or not flavor or not version:
+        return 400, {"error": "expected a JSON object: {'engine': ..., 'flavor': ..., 'version': ...}"}
+
+    conn = db.connect(state.settings.db_path)
+    try:
+        installer.activate(conn, engine, flavor, version)
+    except installer.BackendInstallError as exc:
+        return 400, {"error": str(exc)}
+    finally:
+        conn.close()
+    return 200, {"activated": {"engine": engine, "flavor": flavor, "version": version}}
+
+
 def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def _write(self, status: int, body: bytes, content_type: str) -> None:
@@ -1159,6 +1333,8 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                 self._write(200, HTML_SETTINGS_PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif self.path == "/api/settings":
                 self._write_json(200, _settings_doc(state))
+            elif self.path == "/api/backends":
+                self._write_json(200, _backends_doc(state))
             elif self.path == "/api/health":
                 status = state.health_status()
                 http_status = 200 if status == "ok" else 503
@@ -1375,6 +1551,16 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         pass
                 else:
                     self._write(status, response_data, resp_content_type)
+            elif self.path == "/api/backends/install":
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length) if length else b""
+                status, doc = _handle_backend_install(state, body)
+                self._write_json(status, doc)
+            elif self.path == "/api/backends/activate":
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length) if length else b""
+                status, doc = _handle_backend_activate(state, body)
+                self._write_json(status, doc)
             else:
                 self._write_json(404, {"error": "not found"})
 

@@ -67,6 +67,23 @@ class Settings(BaseSettings):
     # existence.
     db_path: str = "/app/data/live_stt.db"
 
+    # LS-5 Phase 7b/7c: downloaded prebuilt-engine-artifact install
+    # directory (live_stt/backends/installer.py) -- under the same
+    # already-mounted ./data volume as db_path above, so an installed
+    # backend survives `docker recreate` (LS-5's own explicit requirement).
+    backends_dir: str = "/app/data/backends"
+    # When True, a periodic background check (live_stt/backends/
+    # upgrade_checker.py, wired in live_stt/server.py) auto-DOWNLOADS any
+    # backend whose registry-pinned tag (live_stt/backends/registry.py)
+    # isn't installed locally yet -- e.g. after a code/image update ships
+    # a new pin. Never auto-ACTIVATES anything (installer.activate() is a
+    # separate, explicit step) and never installs a tag this codebase
+    # hasn't itself pinned/verified -- see upgrade_checker.py's docstring
+    # for why blindly trusting upstream's own "latest" would defeat the
+    # whole point of pinning. Defaults to False: an operator opts in.
+    auto_upgrade_enabled: bool = False
+    upgrade_check_interval_sec: float = 21600.0  # 6h
+
     # Matches the Dockerfile runtime stage's layout (worker binary + its
     # ggml .so's copied into the same directory so the $ORIGIN rpath baked
     # in at link time resolves them -- see CLAUDE.md). worker_ggml_lib_dir

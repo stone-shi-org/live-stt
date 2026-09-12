@@ -1,49 +1,35 @@
 # syntax=docker/dockerfile:1
 
-# ---- stage: parakeet.cpp, built STANDALONE (not add_subdirectory'd) -------
-# parakeet.cpp's own CMakeLists.txt references ${CMAKE_SOURCE_DIR}/third_party
-# (dr_wav.h) and .../scripts/apply_ggml_patches.sh, both assuming it is the
-# top-level project. Nesting it via add_subdirectory from another project's
-# CMakeLists breaks the include path (hard failure) AND silently skips the
-# ggml-patch step (the EXISTS guard just resolves to nothing and no-ops, no
-# warning) -- discovered by actually trying it. So it is a separate build
-# here, matching scripts/build_worker.sh's native equivalent.
-FROM python:3.12-slim AS parakeet-build
+# ---- stage: parakeet engine, PREBUILT (LS-5 Phase 7b) ----------------------
+# CPU flavor only. Replaces this Dockerfile's previous from-source
+# parakeet-build stage (compile parakeet.cpp's vendored submodule + its
+# vendored ggml via CMake) with a straight download of the real, verified
+# mudler/parakeet.cpp v0.5.0 linux-cpu-x64 release artifact --
+# scripts/fetch_backend.sh, the same download/sha256-verify pattern
+# scripts/fetch_model.sh already uses for model weights, one layer down for
+# the engine library itself. See worker/CMakeLists.txt's
+# LSTT_PARAKEET_PREBUILT option and worker/pk_private.hpp's docstring for
+# the real nm -D/ldd investigation this is based on (LS-5 Jira ticket):
+# the prebuilt libparakeet.so exports the two private pk:: symbols this
+# worker needs as public dynamic symbols, and links ggml STATICALLY into
+# itself (confirmed via ldd -- no separate libggml*.so at all, unlike the
+# old from-source build). Net effect: no vendored parakeet.cpp checkout
+# needed in the image build at all for this flavor, and a build step
+# measured in seconds (a ~2MB download) instead of the several minutes a
+# from-source compile took.
+#
+# CUDA stays on the from-source path (parakeet-build-cuda below) --
+# deliberately NOT converted this pass. A real cuda prebuilt entry needs a
+# full download of a 500MB-900MB+ tarball and a real GPU to confirm it
+# actually runs, neither of which was in scope here; see
+# scripts/fetch_backend.sh's own comment on why CUDA isn't registered yet.
+FROM python:3.12-slim AS parakeet-fetch
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential cmake git bash ca-certificates \
+        ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src/live-stt-worker
-COPY worker/third_party/parakeet.cpp/ third_party/parakeet.cpp/
-# id= is required, not cosmetic: an unqualified cache mount target (the
-# default before this fix) is scoped just by its target PATH, "/build" --
-# generic enough that it collided with an unrelated Dockerfile elsewhere on
-# this host also using "/build", leaking a stale CMakeCache.txt in (from a
-# plain ubuntu:24.04 context where gcc-14 is the default) and causing a
-# baffling "No rule to make target .../14/libgomp.so" failure on THIS image,
-# which only ever has gcc-13. Found by actually diagnosing it, not guessed.
-RUN --mount=type=cache,target=/build,id=live-stt-parakeet-build-cpu \
-    cmake -S third_party/parakeet.cpp -B /build/parakeet \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DPARAKEET_SHARED=OFF \
-        -DPARAKEET_BUILD_CLI=OFF \
-        -DPARAKEET_BUILD_SERVER=OFF \
-        -DPARAKEET_BUILD_TESTS=OFF \
-        -DGGML_NATIVE=OFF \
-        -DGGML_AVX2=ON \
-        -DGGML_FMA=ON \
-        -DGGML_F16C=ON \
-    && cmake --build /build/parakeet -j"$(nproc)" \
-    && mkdir -p /out/lib \
-    && cp /build/parakeet/libparakeet.a /out/ \
-    # -a (not a plain cp) to preserve the libNAME.so -> .so.0 -> .so.0.13.0
-    # symlink chain: worker/CMakeLists.txt's find_library() needs the
-    # unversioned libggml.so name at configure time, and the worker binary's
-    # DT_NEEDED entries (its SONAME references, baked in at link time) need
-    # libggml.so.0 to resolve at runtime -- copying only the fully-versioned
-    # file (an earlier version of this Dockerfile did exactly that) satisfies
-    # neither and fails as a "could not find GGML_LIB" configure error two
-    # stages later, discovered by actually building this.
-    && cp -a /build/parakeet/third_party/ggml/src/libggml*.so* /out/lib/
+COPY scripts/fetch_backend.sh scripts/fetch_backend.sh
+RUN bash scripts/fetch_backend.sh parakeet cpu /out
 
 # ---- stage: whisper.cpp, built STANDALONE (batch-only second engine) ------
 # Same two-step reasoning as parakeet.cpp above -- kept symmetric even
@@ -184,11 +170,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src/live-stt-worker
 COPY worker/ ./worker/
-COPY --from=parakeet-build /out/libparakeet.a worker/build-parakeet/libparakeet.a
-COPY --from=parakeet-build /out/lib/ worker/build-parakeet/third_party/ggml/src/
+# LS-5 Phase 7b: parakeet comes from the prebuilt fetch above now, not a
+# from-source build -- see worker/CMakeLists.txt's LSTT_PARAKEET_PREBUILT
+# option. whisper is unchanged (still from-source, still static).
+COPY --from=parakeet-fetch /out/ worker/prebuilt-parakeet/
 COPY --from=whisper-build /out/libwhisper.a worker/build-whisper/src/libwhisper.a
 COPY --from=whisper-build /out/lib/ worker/build-whisper/ggml/src/
 RUN cd worker && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+        -DLSTT_PARAKEET_PREBUILT=ON \
+        -DPARAKEET_PREBUILT_DIR=/src/live-stt-worker/worker/prebuilt-parakeet \
     && cmake --build build -j"$(nproc)"
 
 # ---- stage: the C++ worker, CUDA build -------------------------------------
@@ -242,7 +232,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=worker-build /src/live-stt-worker/worker/build/live_stt_worker /app/worker/live_stt_worker
 COPY --from=worker-build /src/live-stt-worker/worker/build/live_stt_worker_parakeet_tdt /app/worker/live_stt_worker_parakeet_tdt
-COPY --from=worker-build /src/live-stt-worker/worker/build-parakeet/third_party/ggml/src/*.so* /app/worker/
+# LS-5 Phase 7b: libparakeet.so itself, not a separate libggml*.so set --
+# the prebuilt release links ggml STATICALLY into libparakeet.so (verified
+# via ldd: only libgomp/libstdc++/libm/libgcc_s/libc show up), unlike the
+# old from-source build where ggml was always a separate trio of shared
+# libs. $ORIGIN rpath (worker/CMakeLists.txt) resolves it from right here,
+# same mechanism as before, a different file.
+COPY --from=worker-build /src/live-stt-worker/worker/prebuilt-parakeet/libparakeet.so /app/worker/libparakeet.so
 # live_stt_worker_whisper is a single self-contained static executable (see
 # worker/CMakeLists.txt's whisper block -- its vendored ggml links fully
 # static, unlike parakeet's) -- no .so's to copy alongside it. Placed in its

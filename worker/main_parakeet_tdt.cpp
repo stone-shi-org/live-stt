@@ -20,21 +20,32 @@ extern "C" {
 #include "parakeet_capi.h"
 }
 
-// Private header for pk::set_num_threads / pk::shutdown_backend
+// Private header for pk::set_num_threads / pk::shutdown_backend -- see
+// main.cpp's comment block for the LSTT_PARAKEET_PREBUILT (LS-5 Phase 7b)
+// alternative and why it's safe; kept in sync here since this binary links
+// against the same `parakeet` CMake target.
+#ifdef LSTT_PARAKEET_PREBUILT
+#include "pk_private.hpp"
+#else
 #include "ggml_graph.hpp"
 #include <ggml-cpu.h>
+#endif
 
 namespace {
 
 constexpr int kIpcFd = 3;
 
 std::string ggml_feature_string() {
+#ifdef LSTT_PARAKEET_PREBUILT
+    return "unknown (LSTT_PARAKEET_PREBUILT: no ggml headers in the prebuilt release package)";
+#else
     std::string features;
     if (ggml_cpu_has_avx2()) features += "AVX2 ";
     if (ggml_cpu_has_fma()) features += "FMA ";
     if (ggml_cpu_has_f16c()) features += "F16C ";
     if (features.empty()) features = "scalar";
     return features;
+#endif
 }
 
 bool send_error(const std::string& reason) {

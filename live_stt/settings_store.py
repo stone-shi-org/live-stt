@@ -57,6 +57,12 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset(
         "tts_voice",
         "transcript_log",
         "audio_dump",
+        # LS-5 Phase 7c: a policy toggle for a periodic BACKGROUND check
+        # (live_stt/backends/upgrade_checker.py) -- flipping it doesn't
+        # resize a live worker pool or change anything about an in-flight
+        # call, unlike the worker_bin*/max_concurrent_calls-class fields
+        # that stay restart-required.
+        "auto_upgrade_enabled",
     }
 )
 

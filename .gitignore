@@ -26,5 +26,16 @@ live_stt/pb/
 worker/build/
 worker/build-*/
 
+# LS-5 Phase 7b: downloaded prebuilt backend artifacts (scripts/fetch_backend.sh /
+# LSTT_PARAKEET_PREBUILT's PARAKEET_PREBUILT_DIR default) -- fetched binaries,
+# not source, same reasoning as models/*.gguf below. Anchored to the repo
+# root (leading /) -- an earlier version of this rule ("backends/", no
+# leading slash) matched at ANY depth and was silently ignoring the real
+# live_stt/backends/ Python package this same phase added, caught by
+# noticing `git status` showed those new files as neither tracked nor
+# untracked.
+worker/prebuilt-*/
+/backends/
+
 # audio dumps (LSTT_AUDIO_DUMP), never committed
 data/dumps/

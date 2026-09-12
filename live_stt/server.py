@@ -11,6 +11,7 @@ from grpc_reflection.v1alpha import reflection
 
 from live_stt.admin_http import serve_admin_http
 from live_stt.admission import WorkerBudget
+from live_stt.backends.upgrade_checker import run_periodic_upgrade_check
 from live_stt.config import Settings
 from live_stt.logging_config import configure_logging, get_logger
 from live_stt.pb.livestt.v1 import asr_pb2, asr_pb2_grpc
@@ -73,6 +74,15 @@ async def serve(settings: Settings | None = None) -> None:
 
     await server.start()
 
+    # LS-5 Phase 7c: only on the real entrypoint path (settings_store is
+    # None for a caller that passed settings=... explicitly -- see the
+    # comment above) -- a background task, never awaited to completion,
+    # kept alive by this reference for serve()'s lifetime and cancelled on
+    # shutdown below like any other in-process resource.
+    upgrade_check_task: asyncio.Task | None = None
+    if settings_store is not None:
+        upgrade_check_task = asyncio.create_task(run_periodic_upgrade_check(settings))
+
     stop_event = asyncio.Event()
 
     def _handle_sigterm() -> None:
@@ -95,6 +105,8 @@ async def serve(settings: Settings | None = None) -> None:
     await stop_event.wait()
     await server.stop(grace=settings.drain_timeout_sec)
     admin_http.shutdown()
+    if upgrade_check_task is not None:
+        upgrade_check_task.cancel()
 
 
 def main() -> None:
