@@ -37,8 +37,8 @@
 #      builds (the diarize one alone is ~9.5GB before layer dedup).
 version: 2
 plan:
-  project-key: LSTT
-  key: LSTT
+  project-key: LIV
+  key: LIV
   name: live-stt-docker
 stages:
   - Default Stage:
@@ -86,6 +86,7 @@ Default Job:
         scripts:
           - |
             set -euo pipefail
+            docker builder prune -f --keep-storage 2GB || true
             ./build.sh -p -r registry.shifamily.com/homestack
             docker image prune -f || true
   requirements:
@@ -119,6 +120,7 @@ CUDA Build Job:
         scripts:
           - |
             set -euo pipefail
+            docker builder prune -f --keep-storage 2GB || true
             ./build.sh --cuda -p -r registry.shifamily.com/homestack
             docker image prune -f || true
   requirements:
@@ -148,6 +150,7 @@ CUDA Diarize Build Job:
         scripts:
           - |
             set -euo pipefail
+            docker builder prune -f --keep-storage 2GB || true
             ./build.sh --cuda --diarize -p -r registry.shifamily.com/homestack
             docker image prune -f || true
   requirements:
