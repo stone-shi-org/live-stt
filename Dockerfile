@@ -90,7 +90,7 @@ RUN rm -f /etc/apt/sources.list.d/cuda.list /etc/apt/sources.list.d/nvidia-ml.li
     && echo 'APT::Get::Check-Space "false";' > /etc/apt/apt.conf.d/99nodiskcheck \
     && sed -i 's/Signed-By: .*/Trusted: yes/' /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated -o APT::Get::Check-Space=false \
-        build-essential cmake git bash ca-certificates \
+        cmake ca-certificates \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 WORKDIR /src/live-stt-worker
 COPY worker/third_party/whisper.cpp/ third_party/whisper.cpp/
@@ -145,7 +145,7 @@ RUN rm -f /etc/apt/sources.list.d/cuda.list /etc/apt/sources.list.d/nvidia-ml.li
     && echo 'APT::Get::Check-Space "false";' > /etc/apt/apt.conf.d/99nodiskcheck \
     && sed -i 's/Signed-By: .*/Trusted: yes/' /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated -o APT::Get::Check-Space=false \
-        build-essential cmake git bash ca-certificates \
+        cmake ca-certificates \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 WORKDIR /src/live-stt-worker
 COPY worker/third_party/parakeet.cpp/ third_party/parakeet.cpp/
@@ -205,7 +205,7 @@ RUN rm -f /etc/apt/sources.list.d/cuda.list /etc/apt/sources.list.d/nvidia-ml.li
     && echo 'APT::Get::Check-Space "false";' > /etc/apt/apt.conf.d/99nodiskcheck \
     && sed -i 's/Signed-By: .*/Trusted: yes/' /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update && apt-get install -y --no-install-recommends --allow-unauthenticated -o APT::Get::Check-Space=false \
-        build-essential cmake libgomp1 \
+        cmake libgomp1 \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 WORKDIR /src/live-stt-worker
 COPY worker/ ./worker/
