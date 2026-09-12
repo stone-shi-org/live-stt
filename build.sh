@@ -125,7 +125,7 @@ log "Acquired build lock."
 
 # Clean up dangling images and old builder cache before building
 docker image prune -f >/dev/null 2>&1 || true
-docker builder prune -f --keep-storage 2GB >/dev/null 2>&1 || true
+docker builder prune -af >/dev/null 2>&1 || true
 
 log "Building ${REPO}:latest${SUFFIX} (target ${TARGET})"
 docker build --target "$TARGET" \

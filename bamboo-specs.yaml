@@ -86,7 +86,7 @@ Default Job:
         scripts:
           - |
             set -euo pipefail
-            docker builder prune -f --keep-storage 2GB || true
+            docker builder prune -af || true
             ./build.sh -p -r registry.shifamily.com/homestack
             docker image prune -f || true
   requirements:
@@ -120,7 +120,7 @@ CUDA Build Job:
         scripts:
           - |
             set -euo pipefail
-            docker builder prune -f --keep-storage 2GB || true
+            docker builder prune -af || true
             ./build.sh --cuda -p -r registry.shifamily.com/homestack
             docker image prune -f || true
   requirements:
@@ -150,7 +150,7 @@ CUDA Diarize Build Job:
         scripts:
           - |
             set -euo pipefail
-            docker builder prune -f --keep-storage 2GB || true
+            docker builder prune -af || true
             ./build.sh --cuda --diarize -p -r registry.shifamily.com/homestack
             docker image prune -f || true
   requirements:
