@@ -46,7 +46,15 @@ stages:
       final: false
       jobs:
         - Default Job
+  - CUDA Stage:
+      manual: false
+      final: false
+      jobs:
         - CUDA Build Job
+  - CUDA Diarize Stage:
+      manual: false
+      final: false
+      jobs:
         - CUDA Diarize Build Job
 Default Job:
   key: JOB1
@@ -79,6 +87,7 @@ Default Job:
           - |
             set -euo pipefail
             ./build.sh -p -r registry.shifamily.com/homestack
+            docker image prune -f || true
   requirements:
     - system.docker.executable
 CUDA Build Job:
@@ -111,6 +120,7 @@ CUDA Build Job:
           - |
             set -euo pipefail
             ./build.sh --cuda -p -r registry.shifamily.com/homestack
+            docker image prune -f || true
   requirements:
     - system.docker.executable
 CUDA Diarize Build Job:
@@ -139,6 +149,7 @@ CUDA Diarize Build Job:
           - |
             set -euo pipefail
             ./build.sh --cuda --diarize -p -r registry.shifamily.com/homestack
+            docker image prune -f || true
   requirements:
     - system.docker.executable
 triggers:
