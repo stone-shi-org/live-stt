@@ -1,0 +1,5 @@
+# Optional TTS engine dependencies (for full local python inference with Kokoro-82M and Piper)
+# Kept separate from requirements.txt to avoid bloat on STT-only deployments.
+kokoro>=0.8.4
+soundfile>=0.12.1
+numpy>=1.26.0

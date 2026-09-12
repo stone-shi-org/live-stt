@@ -11,6 +11,10 @@ def test_defaults_load_without_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.backend == "cpu"
     assert settings.default_model == "realtime_eou_120m-v1"
     assert settings.reserve_slots == 1
+    assert settings.tts_model == "kokoro-82m-v1"
+    assert settings.tts_voice == "af_heart"
+    assert settings.tts_device == "cpu"
+    assert settings.tts_vram_mb == 1500
 
 
 def test_env_override(monkeypatch: pytest.MonkeyPatch) -> None:

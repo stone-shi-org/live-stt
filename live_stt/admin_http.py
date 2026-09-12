@@ -16,7 +16,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from prometheus_client import generate_latest
 
-from live_stt import __about__, diarization_models, diarize_http, gpu, models, transcribe_http
+from live_stt import (
+    __about__,
+    diarization_models,
+    diarize_http,
+    gpu,
+    models,
+    transcribe_http,
+    tts_http,
+    tts_models,
+)
 from live_stt.state import ServerState
 
 
@@ -447,6 +456,20 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             </div>
         </div>
 
+        <!-- TTS (Speech Synthesis) Cards -->
+        <div class="grid-cards">
+            <div class="card">
+                <div class="card-label">TTS Requests</div>
+                <div class="card-value" id="valTtsActive">0</div>
+                <div class="card-subtext">Currently running (POST /v1/audio/speech)</div>
+            </div>
+            <div class="card">
+                <div class="card-label">TTS Totals</div>
+                <div class="card-value" id="valTtsTotals" style="font-size:1.1rem;">0 / 0 / 0 / 0</div>
+                <div class="card-subtext">ok / failed / VRAM-rejected / capacity-rejected</div>
+            </div>
+        </div>
+
         <!-- Connection & Capacity Progress -->
         <div class="section-card">
             <div class="section-title">📊 Capacity & Resource Usage</div>
@@ -515,6 +538,23 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             </table>
         </div>
 
+        <!-- Active TTS Requests -->
+        <div class="section-card">
+            <div class="section-title">🔊 Active Speech Synthesis Requests</div>
+            <table class="kv-table" id="ttsActiveTable">
+                <thead>
+                    <tr>
+                        <td class="kv-key col-id">ID</td>
+                        <td class="kv-key col-elapsed">Elapsed</td>
+                        <td class="kv-key col-info">Model / Voice</td>
+                    </tr>
+                </thead>
+                <tbody id="ttsActiveTbody">
+                    <tr><td colspan="3" class="card-subtext">No active TTS requests</td></tr>
+                </tbody>
+            </table>
+        </div>
+
         <!-- Supported Models by Service -->
         <div class="section-card">
             <div class="section-title">🧩 Supported Models by Service</div>
@@ -543,6 +583,14 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                         </tbody>
                     </table>
                 </div>
+                <div class="config-group">
+                    <div class="config-group-header">🔊 Text-to-Speech &mdash; <code>POST /v1/audio/speech</code></div>
+                    <table class="kv-table" id="svcTtsTable">
+                        <tbody id="svcTTSTbody">
+                            <tr><td class="card-subtext">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
 
@@ -558,6 +606,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                         <tr><td class="kv-key">backend</td><td class="kv-val" id="cfgBackend">-</td></tr>
                         <tr><td class="kv-key">default_model</td><td class="kv-val" id="cfgModel">-</td></tr>
                         <tr><td class="kv-key">diarization_model</td><td class="kv-val" id="cfgDiarizationModel">-</td></tr>
+                        <tr><td class="kv-key">tts_model</td><td class="kv-val" id="cfgTtsModel">-</td></tr>
                         <tr><td class="kv-key">models_dir</td><td class="kv-val" id="cfgModelsDir">-</td></tr>
                     </table>
                 </div>
@@ -767,6 +816,22 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                         `<tr><td class="kv-val col-id">#${r.id}</td><td class="kv-val col-elapsed">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val col-info">${r.model}</td></tr>`
                     ).join('');
                 }
+
+                // TTS synthesis requests -- see live_stt/tts_sessions.py.
+                const tts = stats.tts || {};
+                document.getElementById('valTtsActive').innerText = tts.active ?? 0;
+                document.getElementById('valTtsTotals').innerText =
+                    `${tts.completed_total ?? 0} / ${tts.failed_total ?? 0} / ${tts.rejected_vram_total ?? 0} / ${tts.rejected_capacity_total ?? 0}`;
+
+                const activeTtsRequests = tts.active_requests || [];
+                const ttsTbody = document.getElementById('ttsActiveTbody');
+                if (activeTtsRequests.length === 0) {
+                    ttsTbody.innerHTML = '<tr><td colspan="3" class="card-subtext">No active TTS requests</td></tr>';
+                } else {
+                    ttsTbody.innerHTML = activeTtsRequests.map(r =>
+                        `<tr><td class="kv-val col-id">#${r.id}</td><td class="kv-val col-elapsed">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val col-info">${r.model} (${r.voice || '-'})</td></tr>`
+                    ).join('');
+                }
             }
 
             // Config
@@ -776,6 +841,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 document.getElementById('cfgBackend').innerText = config.backend || 'cpu';
                 document.getElementById('cfgModel').innerText = config.default_model || '-';
                 document.getElementById('cfgDiarizationModel').innerText = config.diarization_model || '-';
+                document.getElementById('cfgTtsModel').innerText = config.tts_model || '-';
                 document.getElementById('cfgModelsDir').innerText = config.models_dir || '-';
 
                 document.getElementById('cfgThreads').innerText = config.n_threads_per_worker ?? '-';
@@ -820,6 +886,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             if (modelsResp && modelsResp.data) {
                 const asrModels = modelsResp.data.filter(m => m.type === 'asr');
                 const diarizationModels = modelsResp.data.filter(m => m.type === 'diarization');
+                const ttsModels = modelsResp.data.filter(m => m.type === 'tts');
 
                 const liveCallModels = asrModels.filter(m => m.streaming_capable !== false);
                 document.getElementById('svcLiveCallTbody').innerHTML =
@@ -848,11 +915,21 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                               m.supports_num_speakers_hint && 'num_speakers hint',
                           ])).join('')
                         : noModelsRow;
+
+                document.getElementById('svcTTSTbody').innerHTML =
+                    ttsModels.length
+                        ? ttsModels.map(m => modelRow(m, [
+                              m.default && 'default',
+                              m.engine,
+                              m.supports_streaming && 'streaming',
+                          ])).join('')
+                        : noModelsRow;
             } else {
                 const failedRow = '<tr><td class="card-subtext">Failed to load /v1/models</td></tr>';
                 document.getElementById('svcLiveCallTbody').innerHTML = failedRow;
                 document.getElementById('svcTranscriptTbody').innerHTML = failedRow;
                 document.getElementById('svcDiarizationTbody').innerHTML = failedRow;
+                document.getElementById('svcTTSTbody').innerHTML = failedRow;
             }
         }
 
@@ -946,20 +1023,25 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                             "rejected_capacity_total": xscribe.rejected_capacity_total,
                             "active_requests": xscribe.snapshot_active(),
                         },
+                        # Text-to-Speech (POST /v1/audio/speech)
+                        # -- see live_stt/tts_sessions.py.
+                        "tts": {
+                            "active": state.tts_sessions.active,
+                            "completed_total": state.tts_sessions.completed_total,
+                            "failed_total": state.tts_sessions.failed_total,
+                            "rejected_vram_total": state.tts_sessions.rejected_vram_total,
+                            "rejected_capacity_total": state.tts_sessions.rejected_capacity_total,
+                            "active_requests": state.tts_sessions.snapshot_active(),
+                        },
                     },
                 )
             elif self.path == "/api/config":
                 self._write_json(200, state.settings.model_dump())
             elif self.path == "/v1/models":
                 # OpenAI-style listing ({"object": "list", "data": [...]})
-                # covering BOTH model registries this service has --
-                # live_stt/models.py (ASR, fed to parakeet.cpp) and
-                # live_stt/diarization_models.py (pyannote, fed to
-                # /v1/audio/diarization) -- distinguished by "type" since
-                # OpenAI's own shape has no room for two engine kinds under
-                # one list. "default" marks whichever key this instance is
-                # currently configured with (state.settings.default_model /
-                # .diarization_model), not just "the first entry."
+                # covering ALL model registries this service has --
+                # live_stt/models.py (ASR), live_stt/diarization_models.py (diarization),
+                # and live_stt/tts_models.py (TTS).
                 asr_data = [
                     {
                         "id": spec.key,
@@ -997,7 +1079,22 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     }
                     for spec in diarization_models.DIARIZATION_MODELS.values()
                 ]
-                self._write_json(200, {"object": "list", "data": asr_data + diarization_data})
+                tts_data = [
+                    {
+                        "id": spec.key,
+                        "object": "model",
+                        "type": "tts",
+                        "default": spec.key == state.settings.tts_model,
+                        "engine": spec.engine,
+                        "sample_rate": spec.sample_rate,
+                        "default_voice": spec.default_voice,
+                        "supported_voices": list(spec.supported_voices),
+                        "supports_streaming": spec.supports_streaming,
+                        "measured_peak_vram_mb": spec.measured_peak_vram_mb,
+                    }
+                    for spec in tts_models.TTS_MODELS.values()
+                ]
+                self._write_json(200, {"object": "list", "data": asr_data + diarization_data + tts_data})
             elif self.path == "/metrics":
                 self._write(200, generate_latest(), "text/plain; version=0.0.4; charset=utf-8")
             else:
@@ -1036,6 +1133,33 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     )
                 )
                 self._write(status, response_body, content_type)
+            elif self.path == tts_http.SPEECH_PATH:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length) if length else b""
+                content_type = self.headers.get("Content-Type", "")
+                status, response_data, resp_content_type, headers = tts_http.handle_speech_request(
+                    content_type=content_type,
+                    body=body,
+                    settings=state.settings,
+                    tracker=state.tts_sessions,
+                    draining=state.draining,
+                )
+                if headers.get("Transfer-Encoding") == "chunked" and hasattr(response_data, "__iter__") and not isinstance(response_data, (bytes, bytearray)):
+                    self.send_response(status)
+                    self.send_header("Content-Type", resp_content_type)
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    try:
+                        for chunk in response_data:
+                            if chunk:
+                                self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii") + chunk + b"\r\n")
+                                self.wfile.flush()
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                else:
+                    self._write(status, response_data, resp_content_type)
             else:
                 self._write_json(404, {"error": "not found"})
 

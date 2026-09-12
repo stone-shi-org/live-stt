@@ -7,7 +7,7 @@ import pytest
 from prometheus_client import REGISTRY
 from prometheus_client.parser import text_string_to_metric_families
 
-from live_stt import diarization_models, metrics, models
+from live_stt import diarization_models, metrics, models, tts_models
 from live_stt.admin_http import serve_admin_http
 from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
@@ -33,6 +33,9 @@ EXPECTED_METRICS = {
     "live_stt_diarization_requests_total",
     "live_stt_transcribe_sessions_active",
     "live_stt_transcribe_requests_total",
+    "live_stt_tts_sessions_active",
+    "live_stt_tts_requests_total",
+    "live_stt_tts_chars_total",
 }
 
 
@@ -164,11 +167,17 @@ async def test_stats_web_page_endpoint() -> None:
                 assert 'id="valTranscribeActive"' in html_body
                 assert 'id="valTranscribeTotals"' in html_body
                 assert 'id="transcribeActiveTbody"' in html_body
+                # TTS (POST /v1/audio/speech) cards + live table + config row
+                assert 'id="valTtsActive"' in html_body
+                assert 'id="valTtsTotals"' in html_body
+                assert 'id="ttsActiveTbody"' in html_body
+                assert 'id="cfgTtsModel"' in html_body
                 # Supported Models by Service section (Live Call / Batch
-                # Transcript / Diarization), driven by /v1/models.
+                # Transcript / Diarization / TTS), driven by /v1/models.
                 assert 'id="svcLiveCallTbody"' in html_body
                 assert 'id="svcTranscriptTbody"' in html_body
                 assert 'id="svcDiarizationTbody"' in html_body
+                assert 'id="svcTTSTbody"' in html_body
                 # Copy-to-clipboard buttons next to model names -- the
                 # helper function, the CSS class, and the two static
                 # default_model/diarization_model config rows all get one;
@@ -246,6 +255,15 @@ async def test_stats_json_endpoint_includes_gpu_and_diarization() -> None:
             "rejected_capacity_total": 0,
             "active_requests": [],
         }
+        # tts_sessions (live_stt/tts_sessions.py)
+        assert doc["tts"] == {
+            "active": 0,
+            "completed_total": 0,
+            "failed_total": 0,
+            "rejected_vram_total": 0,
+            "rejected_capacity_total": 0,
+            "active_requests": [],
+        }
     finally:
         server.shutdown()
 
@@ -306,7 +324,36 @@ async def test_stats_json_endpoint_reflects_an_in_flight_diarization_request() -
 
 
 @pytest.mark.asyncio
-async def test_v1_models_endpoint_lists_asr_and_diarization_models() -> None:
+async def test_stats_json_endpoint_reflects_an_in_flight_tts_request() -> None:
+    import json
+
+    settings = Settings(_env_file=None)
+    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+
+        request_id = state.tts_sessions.start(model="kokoro-82m-v1", voice="af_heart", device="cpu")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=5) as resp:
+            doc = json.loads(resp.read().decode())
+        active_requests = doc["tts"]["active_requests"]
+        assert len(active_requests) == 1
+        assert active_requests[0]["id"] == request_id
+        assert active_requests[0]["model"] == "kokoro-82m-v1"
+        assert active_requests[0]["voice"] == "af_heart"
+        assert active_requests[0]["elapsed_sec"] >= 0
+
+        state.tts_sessions.finish(request_id, ok=True)
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=5) as resp:
+            doc = json.loads(resp.read().decode())
+        assert doc["tts"]["active_requests"] == []
+        assert doc["tts"]["completed_total"] == 1
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_v1_models_endpoint_lists_asr_and_diarization_and_tts_models() -> None:
     import json
 
     settings = Settings(_env_file=None)
@@ -332,14 +379,10 @@ async def test_v1_models_endpoint_lists_asr_and_diarization_models() -> None:
             assert entry["model_chunk_ms"] == spec.model_chunk_ms
             assert entry["has_eou"] == spec.has_eou
             assert entry["default"] == (key == settings.default_model)
-            # engine/streaming_capable -- added for the whisper.cpp support
-            # matrix on the admin dashboard (Supported Models by Service).
             assert entry["engine"] == spec.engine
             assert entry["streaming_capable"] == spec.streaming_capable
         assert sum(e["default"] for e in by_id.values() if e["type"] == "asr") == 1
-        # At least one streaming-capable (parakeet family) and one
-        # batch-only (whisper family) model registered -- pins that the
-        # split this dashboard section relies on is real, not vacuous.
+
         asr_entries = [e for e in by_id.values() if e["type"] == "asr"]
         assert any(e["streaming_capable"] is True for e in asr_entries)
         assert any(e["streaming_capable"] is False for e in asr_entries)
@@ -355,6 +398,19 @@ async def test_v1_models_endpoint_lists_asr_and_diarization_models() -> None:
             assert entry["supports_num_speakers_hint"] == spec.supports_num_speakers_hint
             assert entry["default"] == (key == settings.diarization_model)
         assert sum(e["default"] for e in by_id.values() if e["type"] == "diarization") == 1
+
+        # Every TTS model in the registry is present, typed correctly, with default marked
+        for key, spec in tts_models.TTS_MODELS.items():
+            assert key in by_id
+            entry = by_id[key]
+            assert entry["object"] == "model"
+            assert entry["type"] == "tts"
+            assert entry["engine"] == spec.engine
+            assert entry["sample_rate"] == spec.sample_rate
+            assert entry["default_voice"] == spec.default_voice
+            assert entry["supports_streaming"] == spec.supports_streaming
+            assert entry["default"] == (key == settings.tts_model)
+        assert sum(e["default"] for e in by_id.values() if e["type"] == "tts") == 1
     finally:
         server.shutdown()
 

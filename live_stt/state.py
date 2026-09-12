@@ -14,6 +14,7 @@ from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
 from live_stt.diarize_sessions import DiarizationSessionTracker
 from live_stt.transcribe_sessions import TranscribeSessionTracker
+from live_stt.tts_sessions import TTSSessionTracker
 
 
 @dataclass
@@ -35,6 +36,9 @@ class ServerState:
     # tracker is the transcribe-side analogue of diarization_sessions above,
     # same aggregate-counters-plus-small-live-list shape.
     transcribe_sessions: TranscribeSessionTracker = field(default_factory=TranscribeSessionTracker)
+
+    # TTS synthesis (POST /v1/audio/speech) session tracker.
+    tts_sessions: TTSSessionTracker = field(default_factory=TTSSessionTracker)
 
     # Set once, immediately, on SIGTERM -- before grpc.aio's own drain grace
     # period even starts. New calls are rejected from this instant.

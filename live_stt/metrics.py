@@ -85,6 +85,19 @@ transcribe_requests_total = Counter(
     "Completed batch transcription HTTP requests",
     ["outcome"],  # ok|failed|rejected_vram|rejected_capacity
 )
+tts_sessions_active = Gauge(
+    "live_stt_tts_sessions_active",
+    "TTS synthesis HTTP requests (POST /v1/audio/speech) currently running",
+)
+tts_requests_total = Counter(
+    "live_stt_tts_requests_total",
+    "Completed TTS HTTP requests",
+    ["outcome"],  # ok|failed|rejected_vram|rejected_capacity
+)
+tts_chars_total = Counter(
+    "live_stt_tts_chars_total",
+    "Total characters synthesized via TTS",
+)
 
 
 def set_build_info(

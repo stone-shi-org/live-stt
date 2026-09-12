@@ -13,6 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from live_stt.diarization_models import DEFAULT_DIARIZATION_MODEL_KEY
 from live_stt.models import DEFAULT_MODEL_KEY
+from live_stt.tts_models import DEFAULT_TTS_MODEL_KEY
 
 
 class Settings(BaseSettings):
@@ -211,6 +212,14 @@ class Settings(BaseSettings):
     # child process so that upon completion, 100% of GPU VRAM (including CUDA driver
     # context) is reclaimed by the operating system.
     diarize_in_subprocess: bool = True
+
+    # Text-to-Speech (TTS) configuration (live_stt/tts.py).
+    # tts_model: key from live_stt/tts_models.py (default: kokoro-82m-v1)
+    tts_model: str = DEFAULT_TTS_MODEL_KEY
+    tts_voice: str = "af_heart"
+    tts_device: str = "cpu"  # "cpu" | "cuda"
+    tts_vram_mb: int = 1500  # admission gate when tts_device is "cuda"
+    tts_in_subprocess: bool = True
 
     @model_validator(mode="after")
     def _check_grace_period(self) -> "Settings":
