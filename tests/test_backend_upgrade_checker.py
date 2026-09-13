@@ -62,7 +62,9 @@ def test_check_for_upgrades_installs_when_missing_and_enabled(
     def fake_install(conn_, install_root, engine, flavor):
         calls.append((engine, flavor))
         spec = BACKENDS[(engine, flavor)]
-        return installer.InstalledBackend(engine, flavor, spec.tag, spec.sha256, "/fake/path", "now", False)
+        return installer.InstalledBackend(
+            engine, flavor, spec.pinned_version, spec.sha256 or spec.image_digest, "/fake/path", "now", False
+        )
 
     monkeypatch.setattr(installer, "install", fake_install)
     results = upgrade_checker.check_for_upgrades(conn, str(tmp_path), auto_upgrade_enabled=True)
@@ -118,7 +120,17 @@ def test_upstream_visibility_report_covers_every_registered_backend_and_caches_p
     report = upgrade_checker.upstream_visibility_report()
 
     assert set(report) == {f"{e}:{f}" for (e, f) in BACKENDS}
-    assert len(calls) == len({spec.repo for spec in BACKENDS.values()})
-    for key, spec in ((f"{e}:{f}", s) for (e, f), s in BACKENDS.items()):
-        assert report[key]["pinned"] == spec.tag
-        assert report[key]["upstream_latest"] == "vX"
+    github_release_repos = {
+        spec.repo for spec in BACKENDS.values() if spec.source == "github_release"
+    }
+    assert len(calls) == len(github_release_repos)
+    for (engine, flavor), spec in BACKENDS.items():
+        key = f"{engine}:{flavor}"
+        assert report[key]["pinned"] == spec.pinned_version
+        if spec.source == "github_release":
+            assert report[key]["upstream_latest"] == "vX"
+        else:
+            # oci_image sources have no "latest release" equivalent to
+            # check (see upgrade_checker.py's docstring) -- always None,
+            # and fetch_upstream_latest_tag is never called for them.
+            assert report[key]["upstream_latest"] is None

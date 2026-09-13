@@ -40,6 +40,25 @@ bool send_error(const std::string& reason) {
 }  // namespace
 
 int main() {
+    // Required for LSTT_WHISPER_PREBUILT (LS-5 Phase 7b) -- reproduced for
+    // real while building the prebuilt path: without this,
+    // whisper_init_from_file_with_params() aborts with "GGML_ASSERT(device)
+    // failed" / "backends = 0" every time, because the CPU backend lives in
+    // a separate libggml-cpu-<arch>.so (one of several microarch variants,
+    // see live_stt/backends/registry.py's docstring) that nothing dlopen()s
+    // unless something calls this first -- confirmed NOT automatic inside
+    // whisper_init() itself. Every upstream whisper.cpp example (cli.cpp,
+    // server.cpp, stream.cpp, ...) calls this as literally its first line
+    // of main(), found by reading worker/third_party/whisper.cpp's own
+    // examples after our own worker (which never called it) reproduced the
+    // exact same abort they'd hit too if they skipped it. Harmless in the
+    // from-source STATIC build (every upstream example calls it
+    // unconditionally regardless of build config): with no sibling backend
+    // .so's on disk to find, it is a no-op there, and that build's
+    // statically-linked-in CPU backend registers itself through a separate
+    // path this call doesn't interfere with.
+    ggml_backend_load_all();
+
     live_stt::FrameType type;
     std::vector<uint8_t> payload;
 

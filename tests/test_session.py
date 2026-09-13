@@ -195,8 +195,17 @@ async def test_parakeet_tdt_engine_spawns_the_parakeet_tdt_binary() -> None:
     assert ready_event.ready.model == "parakeet-tdt-0.6b-v3"
 
 
+def _fake_active(engine: str, flavor: str, path: str):
+    from live_stt.backends.installer import InstalledBackend
+
+    return InstalledBackend(
+        engine=engine, flavor=flavor, version="v-test", sha256="deadbeef",
+        path=path, installed_at="2024-01-01T00:00:00+00:00", active=True,
+    )
+
+
 @pytest.mark.asyncio
-async def test_use_gpu_is_derived_from_backend_setting_not_hardcoded() -> None:
+async def test_use_gpu_is_derived_from_backend_setting_not_hardcoded(monkeypatch: pytest.MonkeyPatch) -> None:
     # Settings.parakeet_backend == "cuda" (LS-5: per-engine, was a single
     # global Settings.backend) -- CallSession._spawn_worker (session.py)
     # must derive use_gpu=True from this and thread it through
@@ -207,6 +216,18 @@ async def test_use_gpu_is_derived_from_backend_setting_not_hardcoded() -> None:
     # (tests/fakes/fake_worker_main.py) rather than mocking spawn() directly,
     # so this exercises the real CONFIG JSON that actually goes out over the
     # real IPC socket, not just the Python call arguments.
+    #
+    # As of LS-5 Phase 7d (no cpu/gpu flavor baked into the image anymore),
+    # requesting cuda requires an actual installed+activated cuda backend --
+    # see test_cuda_backend_without_an_installed_backend_raises below for
+    # that failure mode; this test mocks one being present.
+    import live_stt.session as session_module
+
+    monkeypatch.setattr(
+        session_module.installer,
+        "get_active_backend",
+        lambda db_path, engine: _fake_active("parakeet", "cuda", "/active/parakeet-cuda"),
+    )
     cuda_settings = Settings(
         _env_file=None, worker_bin=str(FAKE_WORKER), models_dir="/fake", parakeet_backend="cuda"
     )
@@ -218,6 +239,7 @@ async def test_use_gpu_is_derived_from_backend_setting_not_hardcoded() -> None:
     assert ready_event.ready is not None  # sanity: start() actually completed
     assert session._worker.ready.get("use_gpu_received") is True  # noqa: SLF001
 
+    monkeypatch.setattr(session_module.installer, "get_active_backend", lambda db_path, engine: None)
     cpu_settings = Settings(
         _env_file=None, worker_bin=str(FAKE_WORKER), models_dir="/fake", parakeet_backend="cpu"
     )
@@ -230,13 +252,61 @@ async def test_use_gpu_is_derived_from_backend_setting_not_hardcoded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_per_engine_backends_are_independent_mix_and_match() -> None:
+async def test_cuda_backend_without_an_installed_backend_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    # LS-5 Phase 7d: no flavor is baked into the image anymore, so
+    # requesting cuda with nothing installed+activated must fail loudly,
+    # not silently fall back to a cpu .so while still telling it use_gpu=True.
+    import live_stt.session as session_module
+
+    monkeypatch.setattr(session_module.installer, "get_active_backend", lambda db_path, engine: None)
+    settings = Settings(
+        _env_file=None, worker_bin=str(FAKE_WORKER), models_dir="/fake", parakeet_backend="cuda"
+    )
+    session = _session(settings=settings)
+    with pytest.raises(WorkerError, match="no cuda backend has been installed"):
+        await session.start()
+
+
+@pytest.mark.asyncio
+async def test_active_backend_flavor_mismatch_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An operator's *_backend setting and their installed/activated
+    # backend have drifted apart (e.g. activated a cpu version but the
+    # setting still says cuda, or vice versa) -- must fail loudly rather
+    # than silently spawning against whatever happens to be active.
+    import live_stt.session as session_module
+
+    monkeypatch.setattr(
+        session_module.installer,
+        "get_active_backend",
+        lambda db_path, engine: _fake_active("parakeet", "cpu", "/active/parakeet-cpu"),
+    )
+    settings = Settings(
+        _env_file=None, worker_bin=str(FAKE_WORKER), models_dir="/fake", parakeet_backend="cuda"
+    )
+    session = _session(settings=settings)
+    with pytest.raises(WorkerError, match="active installed backend for engine 'parakeet' is flavor='cpu'"):
+        await session.start()
+
+
+@pytest.mark.asyncio
+async def test_per_engine_backends_are_independent_mix_and_match(monkeypatch: pytest.MonkeyPatch) -> None:
     # LS-5's explicit ask ("user can pickup gpu for live stream, cpu for
     # [another engine]... no need all cpu or all gpu"): parakeet_backend and
     # whisper_backend must be settable independently, not derived from one
     # shared flag. Uses the same fake worker for both engines' binaries
     # (its IPC protocol doesn't care which "engine" it's pretending to be)
-    # so this stays a fast, offline unit test.
+    # so this stays a fast, offline unit test. parakeet is mocked with an
+    # active installed cuda backend (required as of Phase 7d); whisper has
+    # none active, which is fine since its setting asks for cpu.
+    import live_stt.session as session_module
+
+    def fake_get_active_backend(db_path, engine):
+        if engine == "parakeet":
+            return _fake_active("parakeet", "cuda", "/active/parakeet-cuda")
+        return None
+
+    monkeypatch.setattr(session_module.installer, "get_active_backend", fake_get_active_backend)
+
     mixed_settings = Settings(
         _env_file=None,
         worker_bin=str(FAKE_WORKER),
@@ -265,17 +335,23 @@ async def test_per_engine_backends_are_independent_mix_and_match() -> None:
 async def test_spawn_prefers_an_active_installed_backend_over_the_image_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # LS-5 Phase 7b: when live_stt.backends.installer.get_active_lib_dir()
+    # LS-5 Phase 7b: when live_stt.backends.installer.get_active_backend()
     # reports an active installed parakeet backend, CallSession must point
     # ggml_lib_dir at IT, not Settings.worker_ggml_lib_dir -- this is the
     # one place the download/install/activate mechanism actually changes
     # what gets spawned. Checked via the real fake-worker subprocess's
     # ld_library_path_received echo (tests/fakes/fake_worker_main.py),
     # same real-IPC pattern the use_gpu dispatch test above uses, rather
-    # than mocking WorkerHandle.spawn directly.
+    # than mocking WorkerHandle.spawn directly. Flavor is "cpu" here,
+    # matching the default parakeet_backend setting -- see the dedicated
+    # mismatch/missing-cuda tests above for those failure modes.
     import live_stt.session as session_module
 
-    monkeypatch.setattr(session_module, "get_active_lib_dir", lambda db_path, engine: "/active/backend/dir")
+    monkeypatch.setattr(
+        session_module.installer,
+        "get_active_backend",
+        lambda db_path, engine: _fake_active("parakeet", "cpu", "/active/backend/dir"),
+    )
     settings = Settings(
         _env_file=None,
         worker_bin=str(FAKE_WORKER),
@@ -295,10 +371,12 @@ async def test_spawn_falls_back_to_the_image_default_when_nothing_is_installed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The common case, and every deployment before this feature existed:
-    # no DB / nothing installed+activated -> unchanged behavior.
+    # no DB / nothing installed+activated -> unchanged behavior (as long as
+    # the *_backend setting is "cpu" -- see test_cuda_backend_without_an_
+    # installed_backend_raises above for the cuda case).
     import live_stt.session as session_module
 
-    monkeypatch.setattr(session_module, "get_active_lib_dir", lambda db_path, engine: None)
+    monkeypatch.setattr(session_module.installer, "get_active_backend", lambda db_path, engine: None)
     settings = Settings(
         _env_file=None,
         worker_bin=str(FAKE_WORKER),
@@ -311,6 +389,36 @@ async def test_spawn_falls_back_to_the_image_default_when_nothing_is_installed(
         assert session._worker.ready.get("ld_library_path_received") == "/image-default/lib-dir"  # noqa: SLF001
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_parakeet_tdt_shares_the_parakeet_active_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    # live_stt_worker_parakeet_tdt links the exact same underlying library
+    # as the streaming engine (see live_stt/backends/registry.py's
+    # ENGINE_ALIASES) -- installing+activating a "parakeet" backend must
+    # also take effect for parakeet_tdt spawns, queried by the canonical
+    # engine name "parakeet", not "parakeet_tdt".
+    import live_stt.session as session_module
+
+    queried_with = []
+
+    def fake_get_active_backend(db_path, engine):
+        queried_with.append(engine)
+        return _fake_active("parakeet", "cpu", "/active/parakeet-shared")
+
+    monkeypatch.setattr(session_module.installer, "get_active_backend", fake_get_active_backend)
+    settings = Settings(
+        _env_file=None,
+        worker_bin_parakeet_tdt=str(FAKE_WORKER),
+        models_dir="/fake",
+    )
+    session = _session(settings=settings, model_key="parakeet-tdt-0.6b-v3")
+    try:
+        await session.start()
+        assert session._worker.ready.get("ld_library_path_received") == "/active/parakeet-shared"  # noqa: SLF001
+    finally:
+        await session.close()
+    assert queried_with == ["parakeet"]
 
 
 def test_rotation_never_triggers_for_a_batch_only_model_even_past_every_threshold() -> None:

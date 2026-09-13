@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.18)
-project(live_stt_worker LANGUAGES CXX)
+# C, alongside CXX, purely for worker/cuda_driver_stub.c (LS-5 Phase 7b's
+# LSTT_WHISPER_PREBUILT CUDA branch) -- everything else in this project is
+# C++; see that file's docstring for why a tiny hand-written stub exists
+# instead of depending on the CUDA toolkit's own stubs/libcuda.so.
+project(live_stt_worker LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -73,6 +77,31 @@ if(LSTT_PARAKEET_PREBUILT)
   set(GGML_BASE_LIB "")
   set(GGML_CPU_LIB "")
   set(GGML_CUDA_LIB "")
+
+  # CUDA flavor only: absent entirely for the CPU flavor's directory (a
+  # NO_DEFAULT_PATH find_library() on a missing file just leaves the
+  # variable unset, not an error -- checked with EXISTS first anyway for a
+  # clearer message). Confirmed for real by actually linking the CUDA
+  # flavor's downloaded libparakeet.so: unlike the CPU flavor, it has its
+  # OWN unresolved references into libcudart/libcublas/libcublasLt (ggml's
+  # CUDA backend calls into them; a .so tolerates that at ITS OWN link, our
+  # executable's link does not -- same "shared lib vs executable" gap this
+  # file's from-source CUDA block already documents for
+  # ggml_backend_cuda_reg). These three .so's are bundled alongside
+  # libparakeet.so IN the downloaded tarball itself (verified via ldd on
+  # the real v0.5.0 linux-cuda-x64 release: it needs nothing beyond them,
+  # libgomp, and the driver's libcuda.so.1 at runtime) -- no system CUDA
+  # toolkit needed to link OR run this, unlike the from-source CUDA path
+  # below. Attached via INTERFACE_LINK_LIBRARIES on `parakeet` itself so
+  # both live_stt_worker and live_stt_worker_parakeet_tdt (which just link
+  # `parakeet`) pick this up automatically.
+  if(EXISTS "${PARAKEET_PREBUILT_DIR}/libcudart.so")
+    set_target_properties(parakeet PROPERTIES
+        INTERFACE_LINK_LIBRARIES
+            "${PARAKEET_PREBUILT_DIR}/libcudart.so;${PARAKEET_PREBUILT_DIR}/libcublas.so;${PARAKEET_PREBUILT_DIR}/libcublasLt.so"
+    )
+    message(STATUS "live_stt_worker (prebuilt): linking bundled CUDA runtime libs from ${PARAKEET_PREBUILT_DIR}")
+  endif()
 else()
   if(NOT EXISTS "${PARAKEET_BUILD_DIR}/libparakeet.a")
     message(FATAL_ERROR
@@ -235,17 +264,115 @@ set(WHISPER_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/whisper.cpp" CACHE 
 set(WHISPER_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build-whisper" CACHE PATH
     "standalone whisper.cpp build output; see scripts/build_worker.sh")
 
+# LS-5 Phase 7b follow-up: the prebuilt alternative, mirroring
+# LSTT_PARAKEET_PREBUILT above. OFF by default. Real, load-bearing
+# difference from parakeet's prebuilt path, confirmed by actually linking
+# and ldd-inspecting the real ggerganov/whisper.cpp "bin" release: it has
+# NO plain libggml-cpu.so at all -- only per-microarchitecture variants
+# (libggml-cpu-x64.so, -icelake.so, -sapphirerapids.so, ...), loaded at
+# RUNTIME via ggml's own ggml_backend_load_all() dlopen-by-directory-scan
+# mechanism (confirmed present as a real exported symbol in libggml.so.0),
+# not a link-time dependency. `ldd` on the real whisper-cli/libwhisper.so
+# from that release confirms they only link libwhisper.so.1/libggml.so.0/
+# libggml-base.so.0 directly -- so that is all THIS executable links
+# against too; the per-arch libggml-cpu-*.so files just need to be
+# co-located (same $ORIGIN directory) for ggml's own runtime scan to find
+# one that matches the host CPU.
+option(LSTT_WHISPER_PREBUILT
+    "Link the whisper engine against a downloaded libwhisper.so instead of building whisper.cpp from source (LS-5 Phase 7b)"
+    OFF)
+set(WHISPER_PREBUILT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/prebuilt-whisper" CACHE PATH
+    "Directory containing a fetched libwhisper.so + libggml*.so + headers -- see scripts/fetch_backend.sh")
+
 # NOT a FATAL_ERROR guard, unlike the parakeet block above -- deliberately.
 # parakeet's libparakeet.a is REQUIRED unconditionally (live_stt_worker is
 # this project's original, always-built target), but live_stt_worker_whisper
-# is new and, as of this pin, CPU-only (see CLAUDE.md -- CUDA whisper is a
-# later phase). The Dockerfile's worker-build-cuda stage configures this
-# SAME CMakeLists.txt without ever building whisper.cpp at all, and a plain
-# native dev checkout may reasonably have only run scripts/build_worker.sh's
-# parakeet half. A FATAL_ERROR here would break both of those on every
-# reconfigure the moment this block was added -- caught by checking, not by
-# assuming a symmetric build/test matrix for a brand-new optional engine.
-if(EXISTS "${WHISPER_BUILD_DIR}/src/libwhisper.a")
+# is new and optional (a plain native dev checkout may reasonably have only
+# run scripts/build_worker.sh's parakeet half, or fetched only the prebuilt
+# parakeet artifact). A FATAL_ERROR here would break that on every
+# reconfigure -- caught by checking, not by assuming a symmetric
+# build/test matrix for a brand-new optional engine.
+if(LSTT_WHISPER_PREBUILT)
+  set(_whisper_prebuilt_ready TRUE)
+  if(NOT EXISTS "${WHISPER_PREBUILT_DIR}/libwhisper.so")
+    set(_whisper_prebuilt_ready FALSE)
+  endif()
+else()
+  set(_whisper_prebuilt_ready EXISTS "${WHISPER_BUILD_DIR}/src/libwhisper.a")
+endif()
+
+if(LSTT_WHISPER_PREBUILT AND _whisper_prebuilt_ready)
+  add_library(whisper_lib SHARED IMPORTED)
+  set_target_properties(whisper_lib PROPERTIES
+      IMPORTED_LOCATION "${WHISPER_PREBUILT_DIR}/libwhisper.so"
+      INTERFACE_INCLUDE_DIRECTORIES "${WHISPER_PREBUILT_DIR}"
+  )
+  set(_WHISPER_GGML_LIB_DIR "${WHISPER_PREBUILT_DIR}")
+  find_library(WHISPER_GGML_LIB ggml PATHS "${_WHISPER_GGML_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+  find_library(WHISPER_GGML_BASE_LIB ggml-base PATHS "${_WHISPER_GGML_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+  # NOT REQUIRED, unlike the two above: whether a plain libggml-cpu.so/
+  # libggml-cuda.so exists here depends on WHICH prebuilt source this
+  # directory came from -- the github_release "bin" package (whisper:cpu)
+  # has no plain libggml-cpu.so at all (only per-microarch variants ggml
+  # dlopen()s itself at runtime, see the option()'s comment above), while
+  # the oci_image source (whisper:cuda, see
+  # live_stt/backends/registry.py's docstring) DOES ship a single
+  # already-selected libggml-cpu.so/libggml-cuda.so (that image was built
+  # for one specific target, not distributed as multiple variants). Either
+  # way, an unset (not-found) variable here is tolerated the same as
+  # GGML_CUDA_LIB already is in the parakeet block above.
+  find_library(WHISPER_GGML_CPU_LIB ggml-cpu PATHS "${_WHISPER_GGML_LIB_DIR}" NO_DEFAULT_PATH)
+  find_library(WHISPER_GGML_CUDA_LIB ggml-cuda PATHS "${_WHISPER_GGML_LIB_DIR}" NO_DEFAULT_PATH)
+  # A non-REQUIRED find_library() that finds nothing sets the variable to
+  # the literal string "<VAR>-NOTFOUND", not empty -- CMake's if() treats
+  # that as falsy (the GGML_CUDA_LIB checks elsewhere in this file rely on
+  # exactly that), but target_link_libraries() does NOT skip it when the
+  # variable is expanded directly into its argument list: it inserts the
+  # literal "...-NOTFOUND" string and CMake's generate step then rejects it
+  # ("used in this project, but they are set to NOTFOUND"). Found by
+  # actually building the plain github_release whisper:cpu artifact (no
+  # libggml-cpu.so at all there) through a real `docker build` after
+  # introducing these two optional find_library() calls -- reset to a
+  # clean empty string here, the same normalized "absent" value the
+  # parakeet block above uses, rather than leaving the sentinel to leak
+  # into target_link_libraries() below.
+  if(NOT WHISPER_GGML_CPU_LIB)
+    set(WHISPER_GGML_CPU_LIB "")
+  endif()
+  if(NOT WHISPER_GGML_CUDA_LIB)
+    set(WHISPER_GGML_CUDA_LIB "")
+  endif()
+  # CUDA runtime libs (cudart/cublas/cublasLt/nccl): present (and required
+  # to LINK, not just co-locate -- same "shared lib tolerates unresolved
+  # symbols, executable doesn't" gap the parakeet CUDA block above
+  # documents) only for the oci_image-sourced whisper:cuda artifact, which
+  # bundles them alongside the .so's for exactly this reason. Absent
+  # entirely for whisper:cpu's directory, so EXISTS-guarded the same way.
+  if(WHISPER_GGML_CUDA_LIB AND EXISTS "${_WHISPER_GGML_LIB_DIR}/libcudart.so")
+    # See worker/cuda_driver_stub.c's docstring: this extracted
+    # libggml-cuda.so calls the CUDA Driver API's newer VMM-based memory
+    # pool functions (cuMemCreate, cuMemMap, ...) directly -- confirmed via
+    # `nm -D --undefined-only` on the real file, not guessed -- which the
+    # CUDA toolkit normally resolves via its own stubs/libcuda.so at link
+    # time. Building our OWN tiny stub instead of requiring the toolkit
+    # keeps this build (and therefore, eventually, the whole image) free of
+    # a CUDA-toolkit dependency -- built into an isolated, never-installed
+    # target so it can never accidentally ship and shadow the real driver
+    # at runtime (see that file's docstring for why that would be a real,
+    # silent correctness bug).
+    add_library(cuda_driver_stub SHARED cuda_driver_stub.c)
+    set_target_properties(cuda_driver_stub PROPERTIES
+        OUTPUT_NAME cuda
+        VERSION 1
+        SOVERSION 1
+    )
+    set_target_properties(whisper_lib PROPERTIES
+        INTERFACE_LINK_LIBRARIES
+            "${_WHISPER_GGML_LIB_DIR}/libcudart.so;${_WHISPER_GGML_LIB_DIR}/libcublas.so;${_WHISPER_GGML_LIB_DIR}/libcublasLt.so;${_WHISPER_GGML_LIB_DIR}/libnccl.so.2;cuda_driver_stub"
+    )
+    message(STATUS "live_stt_worker_whisper (prebuilt): linking bundled CUDA runtime libs from ${_WHISPER_GGML_LIB_DIR} (+ a build-time-only CUDA driver link stub, see cuda_driver_stub.c)")
+  endif()
+elseif(_whisper_prebuilt_ready)
   add_library(whisper_lib STATIC IMPORTED)
   set_target_properties(whisper_lib PROPERTIES
       IMPORTED_LOCATION "${WHISPER_BUILD_DIR}/src/libwhisper.a"
@@ -279,7 +406,9 @@ if(EXISTS "${WHISPER_BUILD_DIR}/src/libwhisper.a")
       PATHS "${_WHISPER_GGML_LIB_DIR}"
       PATH_SUFFIXES "ggml-cuda"
       NO_DEFAULT_PATH)
+endif()
 
+if(_whisper_prebuilt_ready)
   add_executable(live_stt_worker_whisper
       main_whisper.cpp
       session_whisper.cpp
@@ -305,7 +434,16 @@ if(EXISTS "${WHISPER_BUILD_DIR}/src/libwhisper.a")
   if(WHISPER_GGML_CUDA_LIB)
     target_link_libraries(live_stt_worker_whisper PRIVATE ${WHISPER_GGML_CUDA_LIB})
     message(STATUS "live_stt_worker_whisper: linking CUDA backend ${WHISPER_GGML_CUDA_LIB}")
+  endif()
 
+  # Everything below is the FROM-SOURCE static CUDA build's own toolkit
+  # linking (see each comment for why a static ggml-cuda.a makes every
+  # transitive CUDA-toolkit symbol this executable's own link problem) --
+  # NOT applicable to LSTT_WHISPER_PREBUILT's oci_image-sourced whisper:cuda
+  # artifact, which is already fully self-contained: its bundled cudart/
+  # cublas/cublasLt/nccl .so's were linked directly onto the `whisper_lib`
+  # target itself, above, the same way the parakeet CUDA block does it.
+  if(WHISPER_GGML_CUDA_LIB AND NOT LSTT_WHISPER_PREBUILT)
     # Same reasoning as the parakeet block's identical CUDA::cuda_driver
     # line above -- libggml-cuda's CUDA Driver API calls (cuMemCreate,
     # cuDeviceGet, ...) resolve to the toolkit's link-time stub on a
@@ -369,8 +507,15 @@ if(EXISTS "${WHISPER_BUILD_DIR}/src/libwhisper.a")
       INSTALL_RPATH "$ORIGIN"
   )
 else()
-  message(STATUS
-    "live_stt_worker_whisper: SKIPPED -- ${WHISPER_BUILD_DIR}/src/libwhisper.a "
-    "not found. Run scripts/build_worker.sh to build whisper.cpp standalone "
-    "first if you need this target; parakeet's live_stt_worker is unaffected.")
+  if(LSTT_WHISPER_PREBUILT)
+    message(STATUS
+      "live_stt_worker_whisper: SKIPPED -- libwhisper.so not found at "
+      "${WHISPER_PREBUILT_DIR}. Run scripts/fetch_backend.sh whisper cpu "
+      "first if you need this target; parakeet's live_stt_worker is unaffected.")
+  else()
+    message(STATUS
+      "live_stt_worker_whisper: SKIPPED -- ${WHISPER_BUILD_DIR}/src/libwhisper.a "
+      "not found. Run scripts/build_worker.sh to build whisper.cpp standalone "
+      "first if you need this target; parakeet's live_stt_worker is unaffected.")
+  endif()
 endif()

@@ -13,6 +13,33 @@
 # only other GPU-reservation example in this estate) is the modern
 # compose-native way and is what this host's docker info already reports
 # working (`Runtimes: ... nvidia runc`).
+# LS-5 Phase 7d: `target: runtime-cuda` below now builds the EXACT SAME
+# image as the default docker-compose.yml's `target: runtime` -- verified
+# for real (docker build --target runtime and --target runtime-cuda produce
+# byte-identical image digests). Kept as a real, separately-taggable stage
+# purely so this file and any deploy tooling referencing the
+# "-cuda"/"runtime-cuda" name don't need to change; see Dockerfile's own
+# comment on that alias for the full reasoning. There is no more separate
+# CUDA build at all -- every engine's cpu AND cuda flavors are DOWNLOADED
+# (see live_stt/backends/registry.py), most self-contained, needing only
+# the real driver at container-run time (the `deploy.resources.reservations`
+# block below), never baked into any image.
+#
+# Real operational consequence of that: setting `LSTT_*_BACKEND=cuda` env
+# vars below is NOT sufficient by itself anymore (unlike the old
+# from-source-CUDA-image days) -- Settings' env-to-SQLite migration
+# (live_stt/settings_store.py) only seeds the INITIAL value on first boot;
+# nothing downloads or activates an actual cuda backend for you. Before the
+# first real call on a fresh ./data volume, install+activate each engine's
+# cuda flavor once (persists in the mounted volume, survives
+# `docker recreate` same as the settings DB):
+#   curl -X POST http://<host>:4031/api/backends/install  -d '{"engine":"parakeet","flavor":"cuda"}'
+#   curl -X POST http://<host>:4031/api/backends/activate -d '{"engine":"parakeet","flavor":"cuda","version":"<tag from the install response>"}'
+#   (repeat for "whisper" if LSTT_WHISPER_BACKEND=cuda too)
+# Skipping this is not silently ignored: live_stt/session.py's per-engine
+# dispatch fails every call for that engine with a clear WorkerError
+# ("no cuda backend has been installed+activated") rather than quietly
+# running on CPU while claiming GPU -- see that module's _resolve_lib_dir.
 services:
   live-stt:
     image: live-stt:latest-cuda

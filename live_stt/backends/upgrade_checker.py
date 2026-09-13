@@ -63,15 +63,16 @@ def check_for_upgrades(
         installed = [
             b for b in installer.list_installed(conn) if b.engine == engine and b.flavor == flavor
         ]
-        if any(b.version == spec.tag for b in installed):
-            results.append(UpgradeResult(engine, flavor, spec.tag, "already_installed"))
+        pinned = spec.pinned_version
+        if any(b.version == pinned for b in installed):
+            results.append(UpgradeResult(engine, flavor, pinned, "already_installed"))
             continue
         if not auto_upgrade_enabled:
             results.append(
                 UpgradeResult(
                     engine,
                     flavor,
-                    spec.tag,
+                    pinned,
                     "skipped_auto_upgrade_disabled",
                     detail="not yet installed locally; enable auto_upgrade_enabled or install manually",
                 )
@@ -79,9 +80,9 @@ def check_for_upgrades(
             continue
         try:
             installer.install(conn, install_root, engine, flavor)
-            results.append(UpgradeResult(engine, flavor, spec.tag, "installed"))
+            results.append(UpgradeResult(engine, flavor, pinned, "installed"))
         except installer.BackendInstallError as exc:
-            results.append(UpgradeResult(engine, flavor, spec.tag, "failed", detail=str(exc)))
+            results.append(UpgradeResult(engine, flavor, pinned, "failed", detail=str(exc)))
     return results
 
 
@@ -107,13 +108,23 @@ def upstream_visibility_report() -> dict[str, dict[str, str | None]]:
     -- read-only, informational (see this module's docstring). A
     difference here means "a human should go re-verify and re-pin," never
     "auto-install this."
+
+    oci_image-sourced entries (whisper:cuda -- see registry.py's docstring)
+    have no GitHub "latest release" equivalent to compare against (GHCR's
+    rolling "main-cuda" tag has no meaningful "latest version" the way a
+    real release does) -- upstream_latest is always None for those,
+    distinguishable from "checked, no answer" by their source field, not
+    silently conflated with a real check that happened to fail.
     """
     report: dict[str, dict[str, str | None]] = {}
     seen_repos: dict[str, str | None] = {}
     for (engine, flavor), spec in BACKENDS.items():
+        if spec.source != "github_release":
+            report[f"{engine}:{flavor}"] = {"pinned": spec.pinned_version, "upstream_latest": None}
+            continue
         if spec.repo not in seen_repos:
             seen_repos[spec.repo] = fetch_upstream_latest_tag(spec.repo)
-        report[f"{engine}:{flavor}"] = {"pinned": spec.tag, "upstream_latest": seen_repos[spec.repo]}
+        report[f"{engine}:{flavor}"] = {"pinned": spec.pinned_version, "upstream_latest": seen_repos[spec.repo]}
     return report
 
 

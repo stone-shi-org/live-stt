@@ -161,6 +161,21 @@ def handle_diarize_request(
             overrides["diarization_max_speakers"] = int(max_speakers)
         except ValueError:
             return 400, {"error": {"message": f"'max_speakers' must be an integer, got {max_speakers!r}"}}
+    # LS-5: per-request device choice ("on the fly" cpu/cuda, no separate
+    # download/install step needed the way the C++ ASR engines require --
+    # pyannote/torch already ship as ONE pip package that runs on either,
+    # see live_stt/diarization.py's _check_device docstring). Reuses the
+    # exact same settings.model_copy(update=...) override pattern the other
+    # per-request fields above already use, so every existing device-aware
+    # code path (the VRAM admission gate right below, _check_device's
+    # validation, _diarize_file_direct/_subprocess) picks this up with zero
+    # additional plumbing.
+    device = fields.get("device")
+    if device:
+        device_str = device.decode("utf-8", "replace")
+        if device_str not in ("cpu", "cuda"):
+            return 400, {"error": {"message": f"'device' must be 'cpu' or 'cuda', got {device_str!r}"}}
+        overrides["diarization_device"] = device_str
     effective_settings = settings.model_copy(update=overrides) if overrides else settings
 
     include_text = fields.get("include_text", b"false").decode("utf-8", "replace").strip().lower() == "true"

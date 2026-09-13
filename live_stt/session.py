@@ -28,7 +28,7 @@ from pathlib import Path
 
 from live_stt import __about__, metrics
 from live_stt.admission import WorkerBudget
-from live_stt.backends.installer import get_active_lib_dir
+from live_stt.backends import installer
 from live_stt.boundary import dedup_incoming_words
 from live_stt.config import Settings
 from live_stt.events import worker_json_to_events
@@ -90,6 +90,49 @@ class CallSession:
             )
         )
 
+    def _resolve_lib_dir(
+        self, registry_engine: str, engine_backend: str, fallback_lib_dir: Path | None
+    ) -> Path | None:
+        """LS-5 Phase 7b/7d: prefer a backend INSTALLED+ACTIVATED via the
+        registry/admin UI (live_stt/backends/installer.py) over the
+        image-baked default -- this is the one place the download
+        mechanism actually changes what gets spawned. `registry_engine` is
+        the CANONICAL engine name (installer.get_active_backend already
+        applies live_stt/backends/registry.py's ENGINE_ALIASES, so
+        "parakeet_tdt" and "parakeet" share one active row).
+
+        No cpu/gpu flavor is baked into the image anymore as of this phase
+        (LS-5's explicit goal) -- so unlike the transitional version of
+        this method, a cuda request with nothing installed+activated is a
+        hard, loud error here, not a silent fall-through to a cpu .so
+        while still claiming use_gpu=True (which would silently run on
+        CPU, or crash inside a CPU-only ggml build, depending on the
+        engine -- either way a real correctness failure this codebase's
+        "fail loud, not silently downgrade" convention elsewhere -- see
+        live_stt/redaction.py -- exists specifically to avoid). A flavor
+        MISMATCH (active installed backend doesn't match the configured
+        *_backend setting) is equally an error: it means an operator's
+        setting and their installed/activated backend have drifted apart,
+        which WorkerHandle.spawn() silently proceeding on would hide.
+        """
+        active = installer.get_active_backend(self._settings.db_path, registry_engine)
+        if active is not None:
+            if active.flavor != engine_backend:
+                raise WorkerError(
+                    f"{registry_engine}_backend={engine_backend!r} but the active installed "
+                    f"backend for engine {registry_engine!r} is flavor={active.flavor!r} -- "
+                    "install+activate a matching flavor via POST /api/backends/install and "
+                    "/api/backends/activate, or change the setting to match"
+                )
+            return Path(active.path)
+        if engine_backend == "cuda":
+            raise WorkerError(
+                f"{registry_engine}_backend=cuda but no cuda backend has been installed+activated "
+                f"for engine {registry_engine!r} -- POST /api/backends/install "
+                f"{{'engine': '{registry_engine}', 'flavor': 'cuda'}}, then /api/backends/activate, first"
+            )
+        return fallback_lib_dir
+
     async def _spawn_worker(self) -> WorkerHandle:
         gguf_path = str(Path(self._settings.models_dir) / self._model_spec.gguf_filename)
         # Engine-based dispatch: which binary/lib-dir/thread-count pair to
@@ -98,16 +141,18 @@ class CallSession:
         # either way) -- this is the one place that decides WHICH binary.
         if self._model_spec.engine == "whisper":
             worker_bin = Path(self._settings.worker_bin_whisper)
-            ggml_lib_dir = (
+            engine_backend = self._settings.whisper_backend
+            fallback_lib_dir = (
                 Path(self._settings.worker_ggml_lib_dir_whisper)
                 if self._settings.worker_ggml_lib_dir_whisper
                 else None
             )
+            ggml_lib_dir = self._resolve_lib_dir("whisper", engine_backend, fallback_lib_dir)
             n_threads = self._settings.n_threads_whisper
-            engine_backend = self._settings.whisper_backend
         elif self._model_spec.engine == "parakeet_tdt":
             worker_bin = Path(self._settings.worker_bin_parakeet_tdt)
-            ggml_lib_dir = (
+            engine_backend = self._settings.parakeet_tdt_backend
+            fallback_lib_dir = (
                 Path(self._settings.worker_ggml_lib_dir_parakeet_tdt)
                 if self._settings.worker_ggml_lib_dir_parakeet_tdt
                 else (
@@ -116,34 +161,25 @@ class CallSession:
                     else None
                 )
             )
+            # registry_engine="parakeet", not "parakeet_tdt": this worker
+            # binary links the exact same `parakeet` CMake target as the
+            # streaming engine (see live_stt/backends/registry.py's
+            # ENGINE_ALIASES) -- installer.get_active_backend already
+            # applies the alias, but passing the canonical name here too
+            # keeps this call site self-explanatory without relying on
+            # that being remembered.
+            ggml_lib_dir = self._resolve_lib_dir("parakeet", engine_backend, fallback_lib_dir)
             n_threads = self._settings.n_threads_parakeet_tdt
-            engine_backend = self._settings.parakeet_tdt_backend
         else:
             worker_bin = Path(self._settings.worker_bin)
-            # LS-5 Phase 7b: prefer a backend INSTALLED+ACTIVATED via the
-            # registry/admin UI (live_stt/backends/installer.py) over the
-            # image-baked default -- this is the one place the download
-            # mechanism actually changes what the service spawns. Only
-            # meaningful for the parakeet engine today: it's the only
-            # worker binary built against a dynamically-linked
-            # libparakeet.so (worker/CMakeLists.txt's
-            # LSTT_PARAKEET_PREBUILT), so swapping which directory
-            # LD_LIBRARY_PATH points at genuinely changes which .so gets
-            # loaded. Falls back to the pre-existing behavior (None if
-            # nothing installed/activated yet, or the DB doesn't exist) --
-            # fully backward compatible for every deployment that hasn't
-            # touched this new mechanism at all.
-            active_backend_dir = get_active_lib_dir(self._settings.db_path, "parakeet")
-            if active_backend_dir is not None:
-                ggml_lib_dir = Path(active_backend_dir)
-            else:
-                ggml_lib_dir = (
-                    Path(self._settings.worker_ggml_lib_dir)
-                    if self._settings.worker_ggml_lib_dir
-                    else None
-                )
-            n_threads = self._settings.n_threads_per_worker
             engine_backend = self._settings.parakeet_backend
+            fallback_lib_dir = (
+                Path(self._settings.worker_ggml_lib_dir)
+                if self._settings.worker_ggml_lib_dir
+                else None
+            )
+            ggml_lib_dir = self._resolve_lib_dir("parakeet", engine_backend, fallback_lib_dir)
+            n_threads = self._settings.n_threads_per_worker
         start = time.monotonic()
         handle = await WorkerHandle.spawn(
             worker_bin=worker_bin,

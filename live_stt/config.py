@@ -236,14 +236,23 @@ class Settings(BaseSettings):
     # CLAUDE.md); revisit if this service starts handling larger calls.
     diarization_min_speakers: int | None = 1
     diarization_max_speakers: int | None = 6
-    # "cpu" | "cuda". Independent of the ASR worker's own `backend` setting
-    # above -- pyannote.audio runs in this Python process via torch, not in
-    # the C++ worker, so a CUDA ASR deployment and a CPU diarization
-    # deployment (or vice versa) are two separate choices, not one. Measured
-    # for real on a 6-core CPU dev host against a 358s NOTSOFAR-1 meeting:
-    # 312.8s wall time (~0.87x realtime) -- see CLAUDE.md. Defaults to "cpu"
-    # since that's what's actually been exercised; opt into "cuda" only on a
-    # box that actually has a CUDA-capable GPU and driver.
+    # "cpu" | "cuda". Independent of the ASR engines' own parakeet_backend/
+    # whisper_backend/parakeet_tdt_backend settings above -- pyannote.audio
+    # runs in this Python process via torch, not in a C++ worker, so a CUDA
+    # ASR deployment and a CPU diarization deployment (or vice versa) are
+    # separate choices. Unlike those ASR settings, this ALSO never needs an
+    # install/activate step the way the C++ engines do (LS-5's
+    # live_stt/backends/ mechanism) -- pyannote/torch already ship as ONE
+    # pip package that runs on either device (see requirements-
+    # diarization.txt), so there's no separate cpu/cuda artifact to
+    # download at all. This field is just the DEFAULT: `POST
+    # /v1/audio/diarization`'s optional `device` field
+    # (live_stt/diarize_http.py) overrides it per request ("on the fly"),
+    # and `tools/diarize_call.py --device` does the same for the CLI.
+    # Measured for real on a 6-core CPU dev host against a 358s NOTSOFAR-1
+    # meeting: 312.8s wall time (~0.87x realtime) -- see CLAUDE.md. Defaults
+    # to "cpu" since that's what's actually been exercised most; opt into
+    # "cuda" only on a box that actually has a CUDA-capable GPU and driver.
     diarization_device: str = "cpu"
     # VRAM required to admit a diarization request when diarization_device
     # is "cuda" -- checked against live_stt.gpu.free_vram_mb() the same way

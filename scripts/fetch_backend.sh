@@ -22,11 +22,17 @@
 # download of each tarball, the same way fetch_model.sh's own comment
 # describes for its two originally-verified entries.
 #
-# CUDA flavors are deliberately NOT registered here yet -- a real cuda
-# entry needs a full download (500MB-900MB+ per file) and a real GPU to
-# confirm it actually runs, neither of which was done in this pass. Add
-# them following this exact pattern once that's actually been done, with a
-# freshly computed sha256, not a guess.
+# CUDA flavors are deliberately NOT in this table (LS-5 Phase 7d) --
+# both are real and registered in live_stt/backends/registry.py
+# (parakeet:cuda as a github_release, whisper:cuda as an oci_image needing
+# `docker` -- see that module's docstring), but this script only needs to
+# cover what the Dockerfile fetches at BUILD time, which is CPU only: cuda
+# flavors are meant to be installed at RUNTIME instead, via
+# POST /api/backends/install (live_stt/backends/installer.py), so an
+# operator can pick a flavor per engine without rebuilding the image at
+# all. Extending this script to also handle oci_image sources would need a
+# `docker` dependency this early-build-layer bash script doesn't otherwise
+# have any reason to carry.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

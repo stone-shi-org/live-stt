@@ -123,6 +123,31 @@ class TestHandleDiarizeRequest:
         assert captured["settings"].diarization_min_speakers == 2
         assert captured["settings"].diarization_max_speakers == 4
 
+    def test_invalid_device_is_400(self):
+        body = _multipart_body({"device": "tpu"}, file_field="file", file_bytes=b"wav")
+        status, doc = _call(content_type=CONTENT_TYPE, body=body, settings=_settings())
+        assert status == 400
+        assert "device" in doc["error"]["message"]
+
+    def test_device_forwarded_as_a_settings_override(self, monkeypatch: pytest.MonkeyPatch):
+        # LS-5: per-request device choice ("on the fly" cpu/cuda) -- reuses
+        # the exact same settings.model_copy(update=...) mechanism the
+        # min_speakers/max_speakers overrides above already use.
+        captured = {}
+
+        def fake_diarize_file(path, *, settings, words):
+            captured["settings"] = settings
+            return {"task": "diarize", "num_speakers": 0, "segments": [], "speakers": []}
+
+        monkeypatch.setattr(diarize_http, "diarize_file", fake_diarize_file)
+        body = _multipart_body({"device": "cpu"}, file_field="file", file_bytes=b"wav")
+        status, doc = _call(
+            content_type=CONTENT_TYPE, body=body, settings=_settings(diarization_device="cuda")
+        )
+
+        assert status == 200
+        assert captured["settings"].diarization_device == "cpu"
+
     def test_missing_dependency_is_503_not_400(self, monkeypatch: pytest.MonkeyPatch):
         def fake_diarize_file(*args, **kwargs):
             raise DiarizationError("pyannote.audio is not installed. ...")
@@ -214,6 +239,28 @@ class TestVramAdmission:
         assert "5000" in doc["error"]["message"] and "13000" in doc["error"]["message"]
         assert tracker.rejected_vram_total == 1
         assert tracker.active == 0  # never started -- rejected before start()
+
+    def test_vram_gate_follows_a_per_request_device_override_not_just_the_base_setting(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # LS-5: device="cuda" on a request against a settings object whose
+        # OWN diarization_device is "cpu" must still trigger the VRAM gate
+        # -- the override (diarize_http.py's settings.model_copy) has to be
+        # what admission actually checks, not the pre-override base setting.
+        monkeypatch.setattr(diarize_http.gpu, "free_vram_mb", lambda: 100)
+
+        def fake_diarize_file(*a, **k):
+            raise AssertionError("pipeline must not run when VRAM is insufficient")
+
+        monkeypatch.setattr(diarize_http, "diarize_file", fake_diarize_file)
+        body = _multipart_body({"device": "cuda"}, file_field="file", file_bytes=b"wav")
+        status, doc = _call(
+            content_type=CONTENT_TYPE,
+            body=body,
+            settings=_settings(diarization_device="cpu", diarization_vram_mb=13000),
+        )
+        assert status == 503
+        assert "insufficient VRAM" in doc["error"]["message"]
 
     def test_cuda_with_sufficient_vram_runs_normally(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(diarize_http.gpu, "free_vram_mb", lambda: 20000)
