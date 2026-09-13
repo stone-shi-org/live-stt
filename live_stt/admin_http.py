@@ -26,7 +26,6 @@ from prometheus_client import generate_latest
 
 from live_stt import (
     __about__,
-    db,
     diarization_models,
     diarize_http,
     gpu,
@@ -1229,11 +1228,16 @@ def _backends_doc(state: ServerState) -> dict:
     """
     if state.settings_store is None:
         return {"store_available": False, "registered": [], "installed": []}
-    conn = db.connect(state.settings.db_path)
-    try:
-        installed = installer.list_installed(conn)
-    finally:
-        conn.close()
+    # Reuse the settings store's OWN already-open connection (see
+    # SettingsStore.connection's docstring) rather than independently
+    # calling db.connect(state.settings.db_path) again -- besides being a
+    # redundant connection, that second call re-derives the path from
+    # Settings.db_path instead of whatever this store was ACTUALLY
+    # constructed with, which is exactly what let a real bug slip through
+    # unit tests locally (passed against a writable /app in the Docker
+    # test image, then hit a real PermissionError on a bare CI agent where
+    # /app doesn't exist) before being caught for real on Bamboo.
+    installed = installer.list_installed(state.settings_store.connection)
     return {
         "store_available": True,
         "registered": [
@@ -1271,17 +1275,16 @@ def _handle_backend_install(state: ServerState, body: bytes) -> tuple[int, dict]
     if not engine or not flavor:
         return 400, {"error": "expected a JSON object: {'engine': ..., 'flavor': ...}"}
 
-    conn = db.connect(state.settings.db_path)
     try:
-        installed = installer.install(conn, state.settings.backends_dir, engine, flavor)
+        installed = installer.install(
+            state.settings_store.connection, state.settings.backends_dir, engine, flavor
+        )
     except KeyError as exc:
         return 400, {"error": str(exc)}
     except installer.BackendInstallError as exc:
         # Download/checksum/extraction/safety-probe failure -- an upstream
         # or network problem, not a bad request; 502 (not 500) says so.
         return 502, {"error": str(exc)}
-    finally:
-        conn.close()
     return 200, {
         "engine": installed.engine,
         "flavor": installed.flavor,
@@ -1302,13 +1305,10 @@ def _handle_backend_activate(state: ServerState, body: bytes) -> tuple[int, dict
     if not engine or not flavor or not version:
         return 400, {"error": "expected a JSON object: {'engine': ..., 'flavor': ..., 'version': ...}"}
 
-    conn = db.connect(state.settings.db_path)
     try:
-        installer.activate(conn, engine, flavor, version)
+        installer.activate(state.settings_store.connection, engine, flavor, version)
     except installer.BackendInstallError as exc:
         return 400, {"error": str(exc)}
-    finally:
-        conn.close()
     return 200, {"activated": {"engine": engine, "flavor": flavor, "version": version}}
 
 

@@ -22,6 +22,7 @@ safety regression, not just a UX nit -- keep it short and justified.
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from typing import Any
 
@@ -77,6 +78,23 @@ class SettingsStore:
         self._db_path = db_path
         self._conn = db.connect(db_path)
         self._lock = threading.Lock()
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """The one already-open connection this store was constructed
+        with. Exists so OTHER users of the same DB file (LS-5's backend
+        installer, via live_stt/admin_http.py) reuse THIS connection
+        instead of independently calling live_stt.db.connect(settings.
+        db_path) again -- a second, separate connect() call is not just
+        wasteful, it's a real correctness gap: it re-derives the path from
+        `Settings.db_path` instead of using whatever this store was
+        ACTUALLY constructed with (":memory:", a test's tmp_path, or a
+        real deployment path), and a test that forgets to keep those two
+        in sync gets a confusing failure against the wrong (or a
+        nonexistent/unwritable) path instead of the one it meant to use --
+        exactly the bug this property was added to close.
+        """
+        return self._conn
 
     def migrate_if_empty(self, defaults: Settings) -> bool:
         """Seeds the store from `defaults` (an env/.env/compiled-default

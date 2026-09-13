@@ -45,6 +45,22 @@ def _offline_safety(monkeypatch: pytest.MonkeyPatch) -> None:
     # confirmed the hard way when installing requirements-diarization.txt for a
     # real end-to-end test made test_diarization_defaults fail on this exact host.
     monkeypatch.delenv("LSTT_DIARIZATION_HF_TOKEN", raising=False)
+    # LS-5: Settings.db_path/backends_dir default to /app/... (the real
+    # container layout) -- a real bug this fixture didn't catch: a test
+    # that forgets to override db_path only fails in SOME environments
+    # (passed locally and in the Docker test-unit image, where the process
+    # runs as root and can create /app/data; failed for real on the bare
+    # Bamboo CI agent, a non-root native pytest run where it can't -- see
+    # LS-5's Bamboo investigation). A plain "/nonexistent-..." path
+    # wouldn't reliably catch this either: root can still mkdir a brand
+    # new top-level directory. Pointing at a path THROUGH an existing
+    # regular file (/etc/passwd, present on every Linux box including
+    # minimal container images) makes os.makedirs() fail with
+    # NotADirectoryError deterministically regardless of privilege level --
+    # so a test that forgets to override these now fails the SAME way
+    # everywhere, not just on whichever environment happens to be stricter.
+    monkeypatch.setenv("LSTT_DB_PATH", "/etc/passwd/lstt-tests-must-override-db-path/live_stt.db")
+    monkeypatch.setenv("LSTT_BACKENDS_DIR", "/etc/passwd/lstt-tests-must-override-backends-dir")
 
 
 @pytest.fixture()
