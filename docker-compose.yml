@@ -32,10 +32,40 @@ services:
       # in this service can't corrupt it.
       - ./models:/models:ro
       # Bind, not a named volume: same backup-ability reasoning as
-      # my-meeting-notes' ./data mount. Currently unused (no persisted
-      # state -- see CLAUDE.md) but reserved for future audio-dump-on-error
-      # output (LSTT_AUDIO_DUMP) and any future local cache.
+      # my-meeting-notes' ./data mount. Holds the SQLite settings DB and the
+      # persistent backend-install directory (LSTT_BACKENDS_DIR) -- both
+      # survive `docker recreate`/image upgrades by design (LS-5).
       - ./data:/app/data
+      # LS-5: required for live_stt/backends/installer.py's oci_image
+      # install path (whisper:cuda today -- see registry.py's docstring) to
+      # work at all -- it shells out to `docker create`/`docker cp` against
+      # the HOST's docker daemon to extract a prebuilt .so from a real
+      # ghcr.io image, since that flavor isn't buildable from a plain
+      # release tarball the way every github_release-sourced flavor is.
+      # Found missing for real: an operator hit installer.py's own "docker
+      # is not available in this environment" error trying to install it
+      # against a deployed container with no socket mounted and no `docker`
+      # CLI on PATH (the latter half fixed in the Dockerfile's runtime
+      # stage; this mount is the other half).
+      #
+      # REAL SECURITY TRADEOFF, not a routine bind mount: a container with
+      # the host's docker.sock can create/run containers with arbitrary
+      # host bind mounts (e.g. `-v /:/host`), which is equivalent to root on
+      # the HOST, not just this container -- this is a well-known, serious
+      # container-escape vector, independent of anything this codebase does
+      # with the socket itself. Accepted here because (a) this service
+      # already runs as root with no seccomp/AppArmor hardening beyond
+      # RLIMIT_CORE=0, so it isn't crossing an existing privilege boundary
+      # that wasn't already soft, and (b) the alternative (rebuilding/
+      # re-pushing an image just to add a CUDA flavor) is exactly what LS-5
+      # set out to eliminate. If this service's threat model ever tightens
+      # (e.g. exposed beyond home-net), replace this with a scoped socket
+      # proxy (e.g. tecnativa/docker-socket-proxy limited to CREATE/
+      # POST/containers/*/archive) rather than the raw socket -- not done
+      # here since nothing on this deployment's actual threat model today
+      # requires it, but don't copy this mount into a less-trusted context
+      # without that hardening.
+      - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
     networks:
       - home-net

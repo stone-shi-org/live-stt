@@ -68,6 +68,37 @@ RUN set -eux; \
     done; \
     curl -fsSL -o /out/whisper.h "https://raw.githubusercontent.com/ggerganov/whisper.cpp/b5130/include/whisper.h"
 
+# ---- stage: docker CLI (LS-5 -- real gap found and closed post-deploy) -----
+# live_stt/backends/installer.py's oci_image install path (whisper:cuda --
+# see registry.py's docstring) shells out to a real `docker create`/
+# `docker cp` against a real ghcr.io image to extract libwhisper.so.* without
+# needing this Dockerfile to vendor a CUDA toolkit at build time. That means
+# the RUNNING container needs an actual `docker` binary on PATH -- found
+# missing for real when an operator tried `POST /api/backends/install`
+# {"engine":"whisper","flavor":"cuda"} against a deployed container and got
+# installer.py's own "docker is not available in this environment" error.
+# Not `apt-get install docker.io`: that metapackage drags in dockerd,
+# containerd, runc, containerd-shim-runc-v2, etc -- a full engine's worth of
+# binaries this container will never run (it only ever talks to the HOST's
+# daemon over a mounted socket, see docker-compose.yml's own comment on
+# that). Fetched instead as Docker's real, pinned, sha256-verified static-CLI
+# release tarball (the same download-verify-extract shape
+# scripts/fetch_backend.sh already uses for the ASR engines), keeping only
+# the single ~38MB `docker` binary and discarding the tarball's other seven
+# files (docker-init/ctr/containerd/containerd-shim-runc-v2/dockerd/
+# docker-proxy/runc) -- none of which this container has any use for.
+FROM python:3.12-slim AS docker-cli-fetch
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN curl -fsSL -o docker-cli.tgz \
+        https://download.docker.com/linux/static/stable/x86_64/docker-27.3.1.tgz \
+    && echo "9b4f6fe406e50f9085ee474c451e2bb5adb119a03591f467922d3b4e2ddf31d3  docker-cli.tgz" | sha256sum -c - \
+    && tar -xzf docker-cli.tgz docker/docker \
+    && mkdir -p /out && mv docker/docker /out/docker \
+    && chmod +x /out/docker
+
 # ---- stage: the C++ worker, linked against the artifacts above ------------
 # Builds live_stt_worker (parakeet), live_stt_worker_parakeet_tdt, and
 # live_stt_worker_whisper in one `cmake --build` -- three targets of the
@@ -128,6 +159,18 @@ FROM py-deps AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
     && rm -rf /var/lib/apt/lists/*
+
+# See docker-cli-fetch's own comment above for why this is a pinned static
+# binary and not `apt-get install docker.io`. This alone is NOT sufficient
+# for live_stt/backends/installer.py's oci_image install path to work --
+# the container also needs a real docker DAEMON reachable, i.e. the deploy's
+# compose file must mount the host's /var/run/docker.sock (see
+# docker-compose.yml's own comment on that mount and its real security
+# tradeoff). Without that mount, installer.py's _run_docker() now gets past
+# the FileNotFoundError this fixes and instead fails at the daemon-connect
+# step with a clear "Cannot connect to the Docker daemon" error -- a
+# different, correctly-diagnosable failure, not a silent hang or crash.
+COPY --from=docker-cli-fetch /out/docker /usr/local/bin/docker
 
 COPY --from=worker-build /src/live-stt-worker/worker/build/live_stt_worker /app/worker/live_stt_worker
 COPY --from=worker-build /src/live-stt-worker/worker/build/live_stt_worker_parakeet_tdt /app/worker/live_stt_worker_parakeet_tdt
