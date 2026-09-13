@@ -161,7 +161,18 @@ def _run_docker(args: list[str]) -> None:
 
 def _install_oci_image(spec: BackendSpec, version_dir: Path) -> None:
     image_ref = f"{spec.image_registry}/{spec.image_repo}@{spec.image_digest}"
-    container_name = f"lstt-backend-install-{os.getpid()}-{version_dir.name}"
+    # version_dir.name is spec.pinned_version, which for an oci_image source
+    # IS spec.image_digest (see registry.py's pinned_version property) --
+    # e.g. "sha256:6042be...". That colon is a perfectly normal filesystem
+    # character (version_dir itself is fine on disk) but Docker container
+    # names only allow [a-zA-Z0-9][a-zA-Z0-9_.-]* -- found for real the hard
+    # way, installing whisper:cuda against a live deployment: `docker
+    # create --name lstt-backend-install-57-sha256:604...` failed with
+    # "Invalid container name", a DIFFERENT error from (and only reachable
+    # after fixing) the earlier "docker not available"/"Cannot connect to
+    # the Docker daemon" gaps. Sanitize just the container name, not
+    # version_dir itself -- the directory layout is unaffected.
+    container_name = f"lstt-backend-install-{os.getpid()}-{version_dir.name.replace(':', '-')}"
     _run_docker(["create", "--platform", "linux/amd64", "--name", container_name, image_ref])
     try:
         for dest_name, (path_in_image, expected_sha) in spec.image_files.items():

@@ -274,6 +274,19 @@ def test_install_oci_image_copies_verifies_and_symlinks(tmp_path: Path, monkeypa
     assert any(call[0] == "create" for call in docker_calls)
     assert any(call[0] == "cp" for call in docker_calls)
 
+    # Real regression: version_dir.name IS spec.image_digest for an
+    # oci_image source (e.g. "sha256:aaaa..." here, via _oci_spec above),
+    # and a bare, unsanitized use of that in --name would embed the colon.
+    # The fake _run_docker above never validates this (it's not the real
+    # docker daemon), which is exactly why this shipped once and only broke
+    # against a REAL `docker create` on a real deployment -- see
+    # installer.py's own comment on _install_oci_image's container_name
+    # line. Assert directly on the actual argument passed to _run_docker so
+    # a future regression fails here, not in production.
+    create_call = next(call for call in docker_calls if call[0] == "create")
+    container_name = create_call[create_call.index("--name") + 1]
+    assert ":" not in container_name
+
 
 def test_install_oci_image_rejects_a_file_with_the_wrong_sha256(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
