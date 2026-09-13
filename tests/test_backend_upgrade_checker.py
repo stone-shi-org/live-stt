@@ -31,7 +31,9 @@ class _FakeResponse:
         return False
 
 
-def test_check_for_upgrades_reports_already_installed(tmp_path: Path) -> None:
+def test_check_for_upgrades_reports_already_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     conn = db.connect(":memory:")
     installer.ensure_schema(conn)
     spec = BACKENDS[("parakeet", "cpu")]
@@ -40,6 +42,37 @@ def test_check_for_upgrades_reports_already_installed(tmp_path: Path) -> None:
         ("parakeet", "cpu", spec.tag, spec.sha256, str(tmp_path / "p"), "2024-01-01T00:00:00+00:00"),
     )
     conn.commit()
+
+    # Only parakeet:cpu is seeded as installed above -- every OTHER
+    # registered (engine, flavor) pair is "not yet installed", and with
+    # auto_upgrade_enabled=True below, check_for_upgrades() would call the
+    # REAL installer.install() for each of them (parakeet:cuda, whisper:cpu,
+    # whisper:cuda at time of writing) if this weren't mocked. That is a
+    # real, large network download plus a real `docker create`/`docker cp`
+    # against a real ghcr.io image -- exactly the unmocked call that made
+    # this test hang for 20+ minutes on Bamboo's bare CI agent (LIV-LIV-33/
+    # 34) until its build-hang detector force-killed the process tree. It
+    # didn't reproduce locally because this repo's own sandboxed Docker
+    # build blocks/rejects egress fast, so installer.install() failed
+    # quickly with BackendInstallError -- which check_for_upgrades already
+    # catches and reports as action="failed" -- masking the bug rather than
+    # tripping it. Mocking here (matching the correct pattern already used
+    # by test_check_for_upgrades_installs_when_missing_and_enabled below,
+    # and matching this file's own docstring claim) is the actual fix, not
+    # environment-dependent luck.
+    def fake_install(conn_, install_root, engine, flavor):
+        other_spec = BACKENDS[(engine, flavor)]
+        return installer.InstalledBackend(
+            engine,
+            flavor,
+            other_spec.pinned_version,
+            other_spec.sha256 or other_spec.image_digest,
+            "/fake/path",
+            "now",
+            False,
+        )
+
+    monkeypatch.setattr(installer, "install", fake_install)
 
     results = upgrade_checker.check_for_upgrades(conn, str(tmp_path), auto_upgrade_enabled=True)
     parakeet_result = next(r for r in results if r.engine == "parakeet" and r.flavor == "cpu")
