@@ -287,6 +287,21 @@ def test_install_oci_image_copies_verifies_and_symlinks(tmp_path: Path, monkeypa
     container_name = create_call[create_call.index("--name") + 1]
     assert ":" not in container_name
 
+    # Real regression, found separately and later than the container-name
+    # one above: version_dir.name (the ON-DISK directory, not just the
+    # docker container name) also embeds spec.image_digest -- and this
+    # directory can become session.py's ggml_lib_dir, which
+    # WorkerHandle.spawn() puts straight into LD_LIBRARY_PATH, a
+    # COLON-DELIMITED path list. A colon in the directory name silently
+    # splits it into two bogus paths there, so every transitive dependency
+    # of that directory's OWN .so files (libcudart.so.13 etc, physically
+    # present) fails to resolve -- confirmed for real via `ldd` against the
+    # actual production deployment. `version` itself (the API-facing/DB
+    # value) must stay exactly the real digest; only the directory name is
+    # sanitized.
+    assert result.version == spec.image_digest  # unsanitized -- API contract unchanged
+    assert ":" not in Path(result.path).name  # but the actual directory must be
+
 
 def test_install_oci_image_rejects_a_file_with_the_wrong_sha256(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

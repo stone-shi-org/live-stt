@@ -241,7 +241,21 @@ def install(conn: sqlite3.Connection, install_root: str, engine: str, flavor: st
     engine = canonical_engine(engine)
     spec = resolve(engine, flavor)
     version = spec.pinned_version
-    version_dir = Path(install_root) / engine / flavor / version
+    # The ON-DISK directory name is sanitized separately from `version`
+    # (which stays exactly spec.pinned_version -- the DB column, and what
+    # the install/activate API returns/accepts, both unchanged). For an
+    # oci_image source, pinned_version IS the image digest (e.g.
+    # "sha256:6042be..."), and that literal colon is fatal later: this
+    # directory can become session.py's ggml_lib_dir, which
+    # WorkerHandle.spawn() puts straight into LD_LIBRARY_PATH -- a
+    # COLON-DELIMITED path list. The dynamic linker splits on ':', turning
+    # one real directory into two bogus, nonexistent ones, so every one of
+    # that directory's OWN `.so` files' transitive dependencies silently
+    # fails to resolve. Found for real against the actual 10.100.0.50
+    # deployment: `ldd` on the installed libggml-cuda.so reported
+    # libcudart.so.13/libcublas.so.13/etc as "not found" despite
+    # LD_LIBRARY_PATH pointing exactly at the directory containing them.
+    version_dir = Path(install_root) / engine / flavor / version.replace(":", "-")
     version_dir.mkdir(parents=True, exist_ok=True)
 
     marker = version_dir / ".installed"
