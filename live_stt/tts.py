@@ -132,7 +132,7 @@ def _kokoro_lang_code(voice: str) -> str:
     return "a"
 
 
-def _resolve_piper_voice_model(models_dir: str, voice: str) -> Path:
+def _resolve_piper_voice_model(models_dir: str, voice: str, deps_dir: str) -> Path:
     """Piper needs a real, locally-present voice model file (.onnx, with
     its .onnx.json config expected alongside it by PiperVoice.load()) --
     unlike kokoro, which resolves its own weights internally. Reuses
@@ -142,12 +142,22 @@ def _resolve_piper_voice_model(models_dir: str, voice: str) -> Path:
     """
     model_path = Path(models_dir) / f"{voice}.onnx"
     if not model_path.is_file():
+        piper_deps = str(Path(deps_dir) / "piper")
         raise TTSUnavailableError(
-            f"piper voice model not found: {model_path} -- fetch it first, e.g. "
-            f"`python3 -m piper.download_voices {voice} --output-dir {models_dir}` "
-            "(needs the piper engine installed -- see POST /api/tts-engines/install "
-            "{'engine': 'piper'} -- since that command is itself provided by the "
-            "piper-tts package)."
+            f"piper voice model not found: {model_path} -- fetch it first with "
+            f"piper's real download command (confirmed for real: its flag is "
+            f"`--download-dir`, NOT `--output-dir` -- an earlier version of this "
+            f"message had that wrong). Also confirmed for real: {models_dir} is "
+            f"mounted READ-ONLY inside this running container (same convention as "
+            f"ASR's model volume), so running the download command via `docker exec` "
+            f"on THIS container will fail with a read-only-filesystem error -- fetch "
+            f"it via a separate one-off container sharing the SAME models volume "
+            f"WITHOUT :ro instead, e.g.: `docker run --rm -e PYTHONPATH={piper_deps} "
+            f"-v <the same models volume>:{models_dir} <this image> python3 -m "
+            f"piper.download_voices {voice} --download-dir {models_dir}` (needs the "
+            "piper engine installed first -- see POST /api/tts-engines/install "
+            "{'engine': 'piper'} -- since that download command is itself provided "
+            "by the piper-tts package)."
         )
     return model_path
 
@@ -228,7 +238,7 @@ def _synthesize_chunk_direct(
                 "requirements-tts-piper.txt yourself for local/manual use."
             ) from exc
 
-        model_path = _resolve_piper_voice_model(models_dir, voice)
+        model_path = _resolve_piper_voice_model(models_dir, voice, deps_dir)
         use_cuda = device == "cuda"
         if use_cuda:
             try:

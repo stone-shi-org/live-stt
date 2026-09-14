@@ -192,6 +192,28 @@ class TestMissingEngineRaisesClearly:
         with pytest.raises(TTSUnavailableError, match="piper is not installed"):
             synthesize("Hello", model="piper-en-us", settings=settings)
 
+    def test_missing_piper_voice_model_names_the_real_download_flag(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # Real bug, found for real while running a piper voice-model
+        # download for the first time: this message used to say
+        # `--output-dir`, but piper's actual download_voices.py CLI flag
+        # is `--download-dir` -- confirmed by actually running the wrong
+        # one and getting "unrecognized arguments". Separately also
+        # confirmed for real: models_dir is mounted READ-ONLY inside the
+        # running container, so the message must not suggest running the
+        # download command via `docker exec` on that same container.
+        fake_piper = types.ModuleType("piper")
+        fake_piper.PiperVoice = type("PiperVoice", (), {})  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "piper", fake_piper)
+        settings = Settings(_env_file=None, tts_in_subprocess=False, models_dir=str(tmp_path))
+        with pytest.raises(TTSUnavailableError) as exc_info:
+            synthesize("Hello", model="piper-en-us", settings=settings)
+        message = str(exc_info.value)
+        # The real, correct flag must appear in the actual example command.
+        assert "piper.download_voices" in message and "--download-dir" in message
+        assert "read-only" in message.lower()
+
     def test_real_subprocess_worker_propagates_the_same_error(self, tmp_path) -> None:
         # synthesize()'s own dispatch always takes the direct path under
         # pytest (see its PYTEST_CURRENT_TEST check, a pre-existing guard
