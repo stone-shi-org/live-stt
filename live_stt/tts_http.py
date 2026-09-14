@@ -72,7 +72,6 @@ def handle_speech_request(
 
     text_str = str(text)
     model_key = payload.get("model") or settings.tts_model
-    voice = payload.get("voice") or settings.tts_voice
     response_format = payload.get("response_format", "mp3")
     stream = payload.get("stream", False)
     if isinstance(stream, str):
@@ -88,6 +87,19 @@ def handle_speech_request(
         model_spec = tts_models.resolve(model_key)
     except KeyError as exc:
         return 400, json.dumps({"error": str(exc)}).encode(), "application/json", {}
+
+    # Real bug, found for real: this used to be `payload.get("voice") or
+    # settings.tts_voice`, computed BEFORE model_spec existed -- so
+    # Settings.tts_voice's global default ("af_heart", a kokoro voice name)
+    # got passed straight through as an explicit voice= to tts.synthesize()
+    # even when the request asked for a DIFFERENT engine (e.g.
+    # model=piper-en-us), silently pointing piper's voice-model lookup at
+    # "af_heart.onnx" -- a file that was never going to exist -- instead of
+    # piper's own real default en_US-lessac-medium. tts.resolve_voice()
+    # already carries the correct "only honor the global default if it's
+    # actually valid for THIS model" logic; reused here instead of
+    # duplicating (and re-breaking) it.
+    voice = tts.resolve_voice(payload.get("voice"), settings, model_spec)
 
     # VRAM Gate for CUDA
     if settings.tts_device == "cuda":

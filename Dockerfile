@@ -177,8 +177,21 @@ FROM py-deps AS runtime
 # and `apt-get install` at container runtime would need network-reachable
 # package indexes AND `rm -rf /var/lib/apt/lists/*` from earlier layers
 # undone -- not worth reintroducing for a small, always-safe-to-have utility.
+# espeak-ng: for the kokoro TTS engine (live_stt/tts_installer.py) --
+# kokoro's own README lists it as a dependency of its misaki G2P library,
+# used for English out-of-dictionary word fallback and non-English
+# languages. Tested for real WITHOUT it first: a real runtime kokoro
+# install + a real "hello world" synthesis call both succeeded with no
+# espeak-ng present at all -- misaki's English path fell back to a
+# spaCy model (en_core_web_sm, auto-pip-installed on first use, a real
+# ~13MB one-time download misaki does entirely on its own the first time
+# ANY text is synthesized post-install, not something live_stt's own code
+# triggers) rather than requiring espeak-ng. Kept in the image anyway,
+# proactively, as cheap (a few MB) insurance for out-of-dictionary words
+# or a future non-English kokoro voice -- not because a real failure was
+# observed without it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgomp1 ffmpeg \
+        libgomp1 ffmpeg espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 # HF_HOME: inside the already-mounted, already-writable /app/data volume
 # (docker-compose.yml/ai.yml: live-stt-data:/app/data), harmless to set
@@ -236,6 +249,13 @@ COPY run.py version.txt* ./
 # same "pin what THIS build verified" reasoning as everywhere else in this
 # codebase that resists floating on "latest".
 COPY requirements-diarization.txt requirements-diarization-sortformer.txt ./
+# Same reasoning, for TTS engines (live_stt/tts_installer.py, POST
+# /api/tts-engines/install) -- kokoro/piper are the last remaining
+# baked-in-nowhere-to-runtime-installable-somewhere gap this repo had;
+# see tts_installer.py's own docstring for the real silent-fallback bug
+# this closes (an uninstalled engine used to make live_stt/tts.py return
+# a fake sine-wave tone instead of real speech, with no visible error).
+COPY requirements-tts-kokoro.txt requirements-tts-piper.txt ./
 
 ENV LSTT_WORKER_BIN=/app/worker/live_stt_worker \
     LSTT_WORKER_BIN_PARAKEET_TDT=/app/worker/live_stt_worker_parakeet_tdt \

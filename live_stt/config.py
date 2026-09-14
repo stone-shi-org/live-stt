@@ -298,6 +298,14 @@ class Settings(BaseSettings):
     tts_device: str = "cpu"  # "cpu" | "cuda"
     tts_vram_mb: int = 1500  # admission gate when tts_device is "cuda"
     tts_in_subprocess: bool = True
+    # Runtime-installed TTS engine dependency trees (live_stt/tts_installer.py),
+    # same "one image, install what you need" mechanism as
+    # diarization_deps_dir above -- kokoro/piper are deliberately NOT baked
+    # into requirements.txt (see requirements-tts-kokoro.txt/
+    # requirements-tts-piper.txt). Under the same already-mounted ./data
+    # volume as db_path/backends_dir/diarization_deps_dir, so an installed
+    # engine survives `docker recreate`.
+    tts_deps_dir: str = "/app/data/tts-deps"
 
     @model_validator(mode="after")
     def _check_grace_period(self) -> "Settings":

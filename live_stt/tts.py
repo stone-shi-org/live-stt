@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import io
 import json
-import math
 import os
 import re
-import struct
 import subprocess
 import sys
 import tempfile
@@ -69,16 +67,89 @@ def pcm_to_wav(
     return out.getvalue()
 
 
-def _generate_synthetic_tone(text: str, sample_rate: int) -> bytes:
-    """Generate synthetic 16-bit PCM tone for offline test/fallback mode."""
-    duration_sec = max(0.1, min(len(text) * 0.05, 3.0))
-    total_samples = int(sample_rate * duration_sec)
-    freq = 440.0
-    pcm = bytearray()
-    for i in range(total_samples):
-        sample = int(16000.0 * math.sin(2.0 * math.pi * freq * (i / sample_rate)))
-        pcm.extend(struct.pack("<h", sample))
-    return bytes(pcm)
+def _ensure_deps_on_path(deps_dir: str, engine: str) -> None:
+    """Prepend `engine`'s runtime-installed dependency directory (see
+    live_stt/tts_installer.py) to sys.path, if it exists and isn't already
+    there -- so an engine installed via POST /api/tts-engines/install
+    becomes importable without a container restart. Mirrors live_stt/
+    diarization.py's identical _ensure_deps_on_path exactly; see that
+    function's docstring for the full reasoning (called in every process
+    that might load an engine, cheap enough to re-check every time rather
+    than mutate sys.path once at startup).
+    """
+    from live_stt.tts_installer import engine_deps_dir
+
+    engine_dir = str(engine_deps_dir(deps_dir, engine))
+    if engine_dir not in sys.path and Path(engine_dir).is_dir():
+        sys.path.insert(0, engine_dir)
+
+
+# Process-lifetime caches, keyed by what actually determines a loaded
+# object's identity -- avoids reloading a real ~82M-param torch model (or
+# a piper .onnx model) on every SENTENCE CHUNK within one synthesize()
+# call, let alone every call. Correct to share across calls within one
+# process: kokoro's KPipeline/piper's PiperVoice are read-only inference
+# objects once constructed, nothing here mutates them per-call. Empty at
+# the start of every `live_stt.tts_worker` subprocess (a fresh process
+# each time, by design -- see that module's docstring on why: 100% VRAM
+# reclamation), so this only helps the tts_in_subprocess=False /
+# direct-fallback path, which is the path the offline test suite and any
+# CPU-only deployment actually exercises repeatedly.
+_KOKORO_PIPELINE_CACHE: dict[tuple[str, str | None], object] = {}
+_PIPER_VOICE_CACHE: dict[tuple[str, bool], object] = {}
+
+
+def resolve_voice(voice: str | None, settings: Settings, model_spec: TTSModelSpec) -> str:
+    """An explicit per-request `voice` always wins. Otherwise, real bug
+    found while testing the fixes above: `Settings.tts_voice` defaults to
+    "af_heart" (a kokoro voice name) globally, with no awareness of which
+    model is actually selected -- requesting `model=piper-en-us` with no
+    explicit voice silently carried that kokoro default straight into
+    piper's voice lookup (`af_heart.onnx`, a file that was never going to
+    exist, instead of piper's own real default `en_US-lessac-medium`).
+    Only honor the configured tts_voice when it's actually one of THIS
+    model's supported voices; otherwise fall back to the model's own
+    default, never a different engine's.
+    """
+    if voice:
+        return voice
+    if settings.tts_voice in model_spec.supported_voices:
+        return settings.tts_voice
+    return model_spec.default_voice
+
+
+def _kokoro_lang_code(voice: str) -> str:
+    """kokoro's KPipeline needs a lang_code matching the voice's language
+    family (confirmed against the real upstream README) -- 'a' for
+    American English voices (af_*/am_*), 'b' for British (bf_*/bm_*).
+    Every voice in live_stt/tts_models.py's kokoro-82m-v1 entry is one of
+    these two families today; defaults to 'a' for anything else rather
+    than raising, since an unrecognized prefix is more likely a new voice
+    this function hasn't been taught about yet than a real error.
+    """
+    if voice.startswith(("bf_", "bm_")):
+        return "b"
+    return "a"
+
+
+def _resolve_piper_voice_model(models_dir: str, voice: str) -> Path:
+    """Piper needs a real, locally-present voice model file (.onnx, with
+    its .onnx.json config expected alongside it by PiperVoice.load()) --
+    unlike kokoro, which resolves its own weights internally. Reuses
+    Settings.models_dir, the same mounted-volume convention ASR's GGUF/
+    .bin model files already use, rather than inventing a second "where do
+    TTS models live" concept.
+    """
+    model_path = Path(models_dir) / f"{voice}.onnx"
+    if not model_path.is_file():
+        raise TTSUnavailableError(
+            f"piper voice model not found: {model_path} -- fetch it first, e.g. "
+            f"`python3 -m piper.download_voices {voice} --output-dir {models_dir}` "
+            "(needs the piper engine installed -- see POST /api/tts-engines/install "
+            "{'engine': 'piper'} -- since that command is itself provided by the "
+            "piper-tts package)."
+        )
+    return model_path
 
 
 def _synthesize_chunk_direct(
@@ -88,47 +159,121 @@ def _synthesize_chunk_direct(
     voice: str,
     speed: float = 1.0,
     device: str = "cpu",
+    models_dir: str = "/models",
+    deps_dir: str = "/app/data/tts-deps",
 ) -> bytes:
-    """Direct in-process synthesis of a single text chunk to raw int16 PCM bytes."""
+    """Direct in-process synthesis of a single text chunk to raw int16 PCM
+    bytes. Raises TTSUnavailableError (never silently substitutes fake
+    audio) when the engine isn't installed, isn't wired correctly, or its
+    voice model is missing -- see the module docstring's account of the
+    real, deployed bug this replaces: a bare synthetic tone returned as a
+    200 OK for every request, on any deployment that never happened to
+    have kokoro/piper installed, with no operator-visible signal anything
+    was wrong.
+    """
     if not text_chunk.strip():
         return b""
 
-    # Kokoro Engine
     if model_spec.engine == "kokoro":
+        _ensure_deps_on_path(deps_dir, "kokoro")
         try:
-            # Check for kokoro / kokoro-onnx / torch kokoro
-            import kokoro  # type: ignore[import-not-found]
-            # If kokoro library is installed, use it
-            if hasattr(kokoro, "generate"):
-                audio_array = kokoro.generate(text_chunk, voice=voice, speed=speed, lang="en-us")
-                # Convert numpy float/int to int16 PCM
-                import numpy as np
-                if isinstance(audio_array, np.ndarray):
-                    if audio_array.dtype != np.int16:
-                        audio_int16 = (np.clip(audio_array, -1.0, 1.0) * 32767.0).astype(np.int16)
-                    else:
-                        audio_int16 = audio_array
-                    return audio_int16.tobytes()
-        except ImportError:
-            pass
-        except Exception as exc:
-            logger.warning("kokoro direct generation raised exception: %s", exc)
+            from kokoro import KPipeline  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise TTSUnavailableError(
+                "kokoro is not installed. It is deliberately excluded from "
+                "requirements.txt (a real speech-synthesis model with its own "
+                "dependency tree, not something every deployment needs) -- "
+                "POST /api/tts-engines/install {'engine': 'kokoro'} to install it "
+                "into this running deployment (persists across `docker recreate`), "
+                "or install requirements-tts-kokoro.txt yourself for local/manual use."
+            ) from exc
 
-    # Piper Engine
+        lang_code = _kokoro_lang_code(voice)
+        pipeline_device = "cuda" if device == "cuda" else None  # None = kokoro's own CPU default
+        cache_key = (lang_code, pipeline_device)
+        pipeline = _KOKORO_PIPELINE_CACHE.get(cache_key)
+        if pipeline is None:
+            try:
+                pipeline = KPipeline(lang_code=lang_code, device=pipeline_device)
+            except Exception as exc:  # noqa: BLE001 -- surfaced as one clear error type
+                raise TTSUnavailableError(
+                    f"failed to load kokoro pipeline (lang_code={lang_code!r}): {exc}"
+                ) from exc
+            _KOKORO_PIPELINE_CACHE[cache_key] = pipeline
+
+        import numpy as np
+
+        pcm = bytearray()
+        try:
+            for result in pipeline(text_chunk, voice=voice, speed=speed):
+                if result.audio is None:
+                    continue
+                audio_np = result.audio.detach().cpu().numpy()
+                audio_int16 = (np.clip(audio_np, -1.0, 1.0) * 32767.0).astype(np.int16)
+                pcm.extend(audio_int16.tobytes())
+        except Exception as exc:  # noqa: BLE001 -- surfaced as one clear error type
+            raise TTSUnavailableError(f"kokoro synthesis failed: {exc}") from exc
+        return bytes(pcm)
+
     elif model_spec.engine == "piper":
+        _ensure_deps_on_path(deps_dir, "piper")
         try:
-            import piper  # type: ignore[import-not-found]
-            if hasattr(piper, "synthesize"):
-                out_bytes = piper.synthesize(text_chunk, voice=voice, speed=speed)
-                if isinstance(out_bytes, bytes):
-                    return out_bytes
-        except ImportError:
-            pass
-        except Exception as exc:
-            logger.warning("piper direct generation raised exception: %s", exc)
+            from piper import PiperVoice  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise TTSUnavailableError(
+                "piper is not installed. It is deliberately excluded from "
+                "requirements.txt -- POST /api/tts-engines/install "
+                "{'engine': 'piper'} to install it into this running deployment "
+                "(persists across `docker recreate`), or install "
+                "requirements-tts-piper.txt yourself for local/manual use."
+            ) from exc
 
-    # Fallback to synthetic tone (ensures safe operation in offline/test environments)
-    return _generate_synthetic_tone(text_chunk, model_spec.sample_rate)
+        model_path = _resolve_piper_voice_model(models_dir, voice)
+        use_cuda = device == "cuda"
+        if use_cuda:
+            try:
+                import onnxruntime  # type: ignore[import-not-found]
+
+                if "CUDAExecutionProvider" not in onnxruntime.get_available_providers():
+                    raise TTSUnavailableError(
+                        "tts_device=cuda for the piper engine, but the installed "
+                        "onnxruntime has no CUDAExecutionProvider -- piper-tts's own "
+                        "pip dependency is CPU-only onnxruntime; install "
+                        "onnxruntime-gpu (in place of plain onnxruntime) to actually "
+                        "get GPU acceleration, or set tts_device=cpu to match what's "
+                        "really installed."
+                    )
+            except ImportError as exc:
+                raise TTSUnavailableError("onnxruntime is not importable despite piper being installed") from exc
+
+        piper_cache_key = (str(model_path), use_cuda)
+        piper_voice = _PIPER_VOICE_CACHE.get(piper_cache_key)
+        if piper_voice is None:
+            try:
+                piper_voice = PiperVoice.load(str(model_path), use_cuda=use_cuda)
+            except Exception as exc:  # noqa: BLE001 -- surfaced as one clear error type
+                raise TTSUnavailableError(f"failed to load piper voice {model_path}: {exc}") from exc
+            _PIPER_VOICE_CACHE[piper_cache_key] = piper_voice
+
+        # length_scale is piper's inverse-of-speed knob (2.0 == twice as
+        # slow) -- confirmed against the real upstream Python API docs.
+        length_scale = 1.0 / speed if speed > 0 else 1.0
+        try:
+            from piper.config import SynthesisConfig  # type: ignore[import-not-found]
+
+            syn_config = SynthesisConfig(length_scale=length_scale)
+        except ImportError:
+            syn_config = None
+
+        pcm = bytearray()
+        try:
+            for audio_chunk in piper_voice.synthesize(text_chunk, syn_config=syn_config):
+                pcm.extend(audio_chunk.audio_int16_bytes)
+        except Exception as exc:  # noqa: BLE001 -- surfaced as one clear error type
+            raise TTSUnavailableError(f"piper synthesis failed: {exc}") from exc
+        return bytes(pcm)
+
+    raise TTSUnavailableError(f"unknown TTS engine {model_spec.engine!r} for model {model_spec.key!r}")
 
 
 def pcm_to_format(
@@ -173,6 +318,8 @@ def _synthesize_in_subprocess(
     voice: str,
     speed: float,
     device: str,
+    models_dir: str,
+    deps_dir: str,
 ) -> bytes:
     """Run synthesis in an isolated subprocess worker so GPU VRAM is 100% reclaimed."""
     with tempfile.TemporaryDirectory(prefix="lstt-tts-") as tmpdir:
@@ -187,6 +334,8 @@ def _synthesize_in_subprocess(
             "voice": voice,
             "speed": speed,
             "device": device,
+            "models_dir": models_dir,
+            "deps_dir": deps_dir,
             "out_pcm_path": str(out_pcm_file),
         }
         req_file.write_text(json.dumps(req_payload), encoding="utf-8")
@@ -194,7 +343,21 @@ def _synthesize_in_subprocess(
         cmd = [sys.executable, "-m", "live_stt.tts_worker", str(req_file), str(res_file)]
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
-        if proc.returncode != 0 or not res_file.exists():
+        # NOT `proc.returncode != 0 or not res_file.exists()` -- tts_worker.py
+        # deliberately exits 1 for EVERY error, including well-typed,
+        # already-serialized-to-res_file ones (TTSBadRequestError,
+        # TTSUnavailableError), not just genuine crashes. Checking
+        # returncode here discarded that real, specific error in favor of
+        # a generic "subprocess worker failed" message -- found while
+        # testing the TTSUnavailableError fix above: a real
+        # "kokoro is not installed" response, written correctly to
+        # res_file, was getting swallowed into an opaque TTSError purely
+        # because the worker's own (correct, intentional) exit(1)
+        # convention looked like a crash from here. Mirrors
+        # live_stt/diarization.py's _diarize_file_subprocess, which only
+        # ever checks `res_file.is_file()` for the true "worker crashed
+        # with nothing to say" case.
+        if not res_file.is_file():
             err_msg = proc.stderr.strip() or f"Subprocess exited with code {proc.returncode}"
             raise TTSError(f"TTS subprocess worker failed: {err_msg}")
 
@@ -233,7 +396,7 @@ def synthesize(
     resolved_settings = settings or Settings(_env_file=None)
     model_key = model or resolved_settings.tts_model
     model_spec = tts_models.resolve(model_key)
-    selected_voice = voice or resolved_settings.tts_voice or model_spec.default_voice
+    selected_voice = resolve_voice(voice, resolved_settings, model_spec)
     device = resolved_settings.tts_device
 
     # Synthesize all chunks
@@ -248,10 +411,21 @@ def synthesize(
                 voice=selected_voice,
                 speed=speed,
                 device=device,
+                models_dir=resolved_settings.models_dir,
+                deps_dir=resolved_settings.tts_deps_dir,
             )
             pcm_accumulator.extend(raw_pcm)
+        except (TTSUnavailableError, TTSBadRequestError):
+            # A real, well-typed error from the subprocess (e.g. the
+            # engine genuinely isn't installed) -- propagate immediately.
+            # Retrying via the direct in-process path below would just
+            # reproduce the identical failure a second time (same missing
+            # dependency, same process environment) while masking a clean
+            # error behind a redundant subprocess round-trip.
+            raise
         except Exception:
-            # Fallback to direct chunk synthesis
+            # A genuine subprocess-level failure (crash, timeout,
+            # malformed response) -- retry once in-process for resilience.
             for chunk in chunks:
                 pcm_accumulator.extend(
                     _synthesize_chunk_direct(
@@ -260,6 +434,8 @@ def synthesize(
                         voice=selected_voice,
                         speed=speed,
                         device=device,
+                        models_dir=resolved_settings.models_dir,
+                        deps_dir=resolved_settings.tts_deps_dir,
                     )
                 )
     else:
@@ -271,6 +447,8 @@ def synthesize(
                     voice=selected_voice,
                     speed=speed,
                     device=device,
+                    models_dir=resolved_settings.models_dir,
+                    deps_dir=resolved_settings.tts_deps_dir,
                 )
             )
 
@@ -293,7 +471,7 @@ def synthesize_stream(
     resolved_settings = settings or Settings(_env_file=None)
     model_key = model or resolved_settings.tts_model
     model_spec = tts_models.resolve(model_key)
-    selected_voice = voice or resolved_settings.tts_voice or model_spec.default_voice
+    selected_voice = resolve_voice(voice, resolved_settings, model_spec)
     device = resolved_settings.tts_device
 
     chunks = chunk_text(text)
@@ -304,6 +482,8 @@ def synthesize_stream(
             voice=selected_voice,
             speed=speed,
             device=device,
+            models_dir=resolved_settings.models_dir,
+            deps_dir=resolved_settings.tts_deps_dir,
         )
         if chunk_pcm:
             chunk_audio, _ = pcm_to_format(chunk_pcm, model_spec.sample_rate, response_format)

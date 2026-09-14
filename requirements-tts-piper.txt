@@ -1,0 +1,31 @@
+# Piper TTS engine (live_stt/tts.py's "piper" engine, live_stt/
+# tts_models.py's piper-en-us entry) -- installed at RUNTIME via
+# POST /api/tts-engines/install {"engine": "piper"} (live_stt/
+# tts_installer.py), same reasoning as requirements-tts-kokoro.txt.
+#
+# Real public API confirmed against the actual upstream project
+# (OHF-Voice/piper1-gpl's docs/API_PYTHON.md) before wiring this up --
+# `from piper import PiperVoice; PiperVoice.load(onnx_path, use_cuda=...)`,
+# NOT the flat `import piper; piper.synthesize(text, voice=, speed=)`
+# module-level call this codebase's tts.py originally (incorrectly)
+# assumed. That mismatch meant piper synthesis could never have worked
+# even with the package installed -- fixed alongside this file, in
+# tts.py's own piper branch.
+#
+# `piper-tts` (PyPI) pulls in plain `onnxruntime` (CPU-only) as its own
+# dependency automatically -- GPU acceleration additionally needs
+# `onnxruntime-gpu` (a SEPARATE package providing the same import name;
+# the two are not meant to coexist) installed on top, which this
+# requirements file deliberately does NOT do automatically: swapping a
+# CPU-only onnxruntime the pip resolver already satisfied for the GPU
+# variant safely (uninstalling one before installing the other) is not
+# something a plain `-r requirements.txt` install call can do LS-5-style
+# without real risk of leaving a broken half-swapped environment. Voice
+# models themselves (.onnx + .onnx.json) are NOT fetched by this
+# installer either -- they belong in the mounted models directory
+# (LSTT_MODELS_DIR), the same convention ASR's GGUF/.bin files already
+# use; live_stt/tts.py raises a clear, actionable TTSUnavailableError
+# naming the exact `python3 -m piper.download_voices <voice>` command if
+# the expected file isn't there, rather than silently failing or (worse)
+# silently returning fake audio.
+piper-tts>=1.8.0

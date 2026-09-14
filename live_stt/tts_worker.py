@@ -46,6 +46,8 @@ def main() -> None:
     voice = req_data.get("voice", "af_heart")
     speed = float(req_data.get("speed", 1.0))
     device = req_data.get("device", "cpu")
+    models_dir = req_data.get("models_dir", "/models")
+    deps_dir = req_data.get("deps_dir", "/app/data/tts-deps")
     out_pcm_path = Path(req_data["out_pcm_path"])
 
     try:
@@ -60,6 +62,8 @@ def main() -> None:
                     voice=voice,
                     speed=speed,
                     device=device,
+                    models_dir=models_dir,
+                    deps_dir=deps_dir,
                 )
             )
         out_pcm_path.write_bytes(bytes(pcm_acc))

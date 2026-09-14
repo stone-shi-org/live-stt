@@ -1,0 +1,14 @@
+# Kokoro-82M TTS engine (live_stt/tts.py's "kokoro" engine,
+# live_stt/tts_models.py's kokoro-82m-v1 entry) -- installed at RUNTIME via
+# POST /api/tts-engines/install {"engine": "kokoro"} (live_stt/
+# tts_installer.py), not baked into the image, the same reasoning
+# requirements-diarization.txt already documents for pyannote.audio: a
+# real speech-synthesis model with its own dependency tree, not something
+# every STT-only deployment needs to pay for.
+#
+# numpy is NOT repeated here -- already a base requirements.txt dependency
+# (used elsewhere in this codebase, e.g. the telephony LUT), so it is
+# already present in every deployment regardless of whether this engine is
+# ever installed.
+kokoro>=0.8.4
+soundfile>=0.12.1

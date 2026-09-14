@@ -33,6 +33,7 @@ from live_stt import (
     models,
     transcribe_http,
     tts_http,
+    tts_installer,
     tts_models,
 )
 from live_stt.backends import installer
@@ -1042,6 +1043,22 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
         <tbody id="diarizationBody"><tr><td colspan="4">Loading...</td></tr></tbody>
     </table>
 
+    <h1 style="margin-top:32px;">TTS Engines</h1>
+    <p style="color:var(--text-muted);">
+        Text-to-speech's kokoro/piper dependency trees -- deliberately NOT baked into this
+        image (see live_stt/tts_installer.py's docstring). Install once per deployment; installs
+        persist under the mounted data volume and survive `docker recreate`, no restart needed --
+        an install takes effect on the very next /v1/audio/speech request. Before this UI existed,
+        an uninstalled engine silently returned a fake sine-wave tone instead of real speech with
+        no visible error -- that's fixed too (live_stt/tts.py now raises a clear error instead),
+        so a 502 here or a failed request elsewhere means exactly what it says.
+    </p>
+    <div id="ttsBanner"></div>
+    <table>
+        <thead><tr><th>Engine</th><th>Requirements file</th><th>Installed</th><th>Actions</th></tr></thead>
+        <tbody id="ttsBody"><tr><td colspan="4">Loading...</td></tr></tbody>
+    </table>
+
     <script>
         let original = {};
         let hotFields = new Set();
@@ -1220,10 +1237,47 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
             tbody.innerHTML = rows.join('') || '<tr><td colspan="4">No diarization engines registered.</td></tr>';
         }
 
+        function showTtsBanner(kind, text) {
+            const b = document.getElementById('ttsBanner');
+            b.className = kind;
+            b.innerText = text;
+        }
+
+        async function installTtsEngine(engine) {
+            showTtsBanner('ok', `Installing ${engine}... (a real pip install, can take several minutes -- do not navigate away)`);
+            const resp = await fetch('/api/tts-engines/install', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({engine}),
+            });
+            const doc = await resp.json();
+            if (resp.ok) {
+                showTtsBanner('ok', `${doc.already_installed ? 'Already installed' : 'Installed'}: ${engine} -> ${doc.path}`);
+            } else {
+                showTtsBanner('err', doc.error || 'install failed');
+            }
+            await loadTtsEngines();
+        }
+
+        async function loadTtsEngines() {
+            const resp = await fetch('/api/tts-engines');
+            const doc = await resp.json();
+            const tbody = document.getElementById('ttsBody');
+            const rows = Object.entries(doc.engines || {}).map(([engine, info]) => {
+                const installBtn = info.installed
+                    ? ''
+                    : `<button onclick="installTtsEngine('${engine}')">Install</button>`;
+                return `<tr><td>${engine}</td><td>${info.requirements_file}</td>` +
+                    `<td>${info.installed ? 'yes' : 'no'}</td><td>${installBtn}</td></tr>`;
+            });
+            tbody.innerHTML = rows.join('') || '<tr><td colspan="4">No TTS engines registered.</td></tr>';
+        }
+
         document.getElementById('saveBtn').addEventListener('click', save);
         load();
         loadBackends();
         loadDiarizationEngines();
+        loadTtsEngines();
     </script>
 </body>
 </html>
@@ -1404,6 +1458,40 @@ def _handle_diarization_engine_install(state: ServerState, body: bytes) -> tuple
     }
 
 
+def _tts_engines_doc(state: ServerState) -> dict:
+    """GET /api/tts-engines: every KNOWN TTS engine (live_stt/
+    tts_installer.py's REQUIREMENTS_FILES -- "kokoro", "piper") alongside
+    whether its dependency tree has actually been installed into THIS
+    deployment's persistent tts_deps_dir yet. Direct analogue of GET
+    /api/diarization-engines, added for the same reason: before this,
+    neither engine had an install path at all, and live_stt/tts.py used to
+    silently substitute a synthetic tone for real speech when they weren't
+    importable -- see that module's docstring for the real bug this closes.
+    """
+    return {"engines": tts_installer.status(state.settings.tts_deps_dir)}
+
+
+def _handle_tts_engine_install(state: ServerState, body: bytes) -> tuple[int, dict]:
+    try:
+        payload = json.loads(body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return 400, {"error": "invalid JSON body"}
+    engine = payload.get("engine")
+    if not engine:
+        return 400, {"error": "expected a JSON object: {'engine': 'kokoro' | 'piper'}"}
+
+    try:
+        result = tts_installer.install(state.settings.tts_deps_dir, engine)
+    except tts_installer.TTSInstallError as exc:
+        # Same 502-for-everything tradeoff as _handle_diarization_engine_install.
+        return 502, {"error": str(exc)}
+    return 200, {
+        "engine": result.engine,
+        "path": result.path,
+        "already_installed": result.already_installed,
+    }
+
+
 def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def _write(self, status: int, body: bytes, content_type: str) -> None:
@@ -1429,6 +1517,8 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                 self._write_json(200, _backends_doc(state))
             elif self.path == "/api/diarization-engines":
                 self._write_json(200, _diarization_engines_doc(state))
+            elif self.path == "/api/tts-engines":
+                self._write_json(200, _tts_engines_doc(state))
             elif self.path == "/api/health":
                 status = state.health_status()
                 http_status = 200 if status == "ok" else 503
@@ -1659,6 +1749,11 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                 length = int(self.headers.get("Content-Length", 0) or 0)
                 body = self.rfile.read(length) if length else b""
                 status, doc = _handle_diarization_engine_install(state, body)
+                self._write_json(status, doc)
+            elif self.path == "/api/tts-engines/install":
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length) if length else b""
+                status, doc = _handle_tts_engine_install(state, body)
                 self._write_json(status, doc)
             else:
                 self._write_json(404, {"error": "not found"})

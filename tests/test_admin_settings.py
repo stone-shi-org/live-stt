@@ -73,6 +73,22 @@ async def test_settings_page_includes_diarization_engines_install_ui() -> None:
 
 
 @pytest.mark.asyncio
+async def test_settings_page_includes_tts_engines_install_ui() -> None:
+    # Same reasoning as the diarization-engines UI test above, for
+    # live_stt/tts_installer.py's kokoro/piper install endpoints.
+    server = serve_admin_http("127.0.0.1", 0, _state())
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/settings", timeout=5) as resp:
+            body = resp.read().decode()
+            assert "ttsBody" in body
+            assert "installTtsEngine" in body
+            assert "/api/tts-engines/install" in body
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_get_api_settings_reports_store_unavailable_when_none_configured() -> None:
     server = serve_admin_http("127.0.0.1", 0, _state(settings_store=None))
     try:
