@@ -95,6 +95,7 @@ class WorkerHandle:
         language: str,
         n_threads: int,
         ggml_lib_dir: Path | None = None,
+        ggml_backend_path: Path | None = None,
         use_gpu: bool = False,
     ) -> "WorkerHandle":
         parent_sock, child_sock = socket.socketpair()
@@ -102,6 +103,31 @@ class WorkerHandle:
         env = dict(os.environ)
         if ggml_lib_dir is not None:
             env["LD_LIBRARY_PATH"] = str(ggml_lib_dir)
+        if ggml_backend_path is not None:
+            # Only meaningful for an engine whose worker calls ggml's OWN
+            # ggml_backend_load_all() (today: main_whisper.cpp, see that
+            # file's comment) -- a SEPARATE dynamic-backend-discovery
+            # mechanism from ordinary shared-library linking, and one that
+            # does NOT consult LD_LIBRARY_PATH at all. Confirmed by reading
+            # ggml_backend_load_all_from_path() in the vendored
+            # ggml-backend-reg.cpp: its search_paths are the compile-time
+            # GGML_BACKEND_DIR, the WORKER BINARY'S OWN directory, and the
+            # process's current working directory -- never LD_LIBRARY_PATH.
+            # Found for real: a runtime-installed whisper:cuda backend
+            # (live_stt/backends/installer.py's oci_image path) correctly
+            # set LD_LIBRARY_PATH to its install directory, yet the worker
+            # logged `whisper_backend_init_gpu: no GPU found` and silently
+            # ran on CPU anyway -- LD_LIBRARY_PATH pointing at
+            # libggml-cuda.so simply never got looked at by this loader.
+            # ggml_backend_load_all_from_path()'s own last step DOES read
+            # one thing outside those three search paths: the
+            # GGML_BACKEND_PATH env var, loading exactly the one file it
+            # names via ggml_backend_load() directly -- so pointing this at
+            # the activated backend's libggml-cuda.so (a real file, not a
+            # directory) makes the runtime-installed CUDA backend
+            # discoverable without touching the worker's CWD or relying on
+            # LD_LIBRARY_PATH at all.
+            env["GGML_BACKEND_PATH"] = str(ggml_backend_path)
         try:
             proc = subprocess.Popen(
                 [str(worker_bin)],

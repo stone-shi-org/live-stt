@@ -149,6 +149,24 @@ class CallSession:
             )
             ggml_lib_dir = self._resolve_lib_dir("whisper", engine_backend, fallback_lib_dir)
             n_threads = self._settings.n_threads_whisper
+            # Whisper's worker is the one engine whose main() calls ggml's
+            # own ggml_backend_load_all() (see main_whisper.cpp's comment) --
+            # a dynamic-discovery mechanism that does NOT consult
+            # LD_LIBRARY_PATH (confirmed by reading the vendored
+            # ggml-backend-reg.cpp; see WorkerHandle.spawn()'s own comment
+            # on ggml_backend_path for the full story). A cuda flavor
+            # installed+activated at RUNTIME (as opposed to baked into the
+            # image at build time) therefore needs its libggml-cuda.so
+            # pointed at explicitly via GGML_BACKEND_PATH, or the worker
+            # silently falls back to CPU while still logging
+            # `whisper_backend_init_gpu: no GPU found` -- found for real
+            # against the actual 10.100.0.50 deployment. Only relevant for
+            # cuda: the baked-in CPU flavor's per-microarch .so's already
+            # resolve correctly via the worker binary's OWN directory,
+            # ggml_backend_load_all()'s other (always-searched) path.
+            ggml_backend_path = (
+                ggml_lib_dir / "libggml-cuda.so" if engine_backend == "cuda" and ggml_lib_dir else None
+            )
         elif self._model_spec.engine == "parakeet_tdt":
             worker_bin = Path(self._settings.worker_bin_parakeet_tdt)
             engine_backend = self._settings.parakeet_tdt_backend
@@ -170,6 +188,13 @@ class CallSession:
             # that being remembered.
             ggml_lib_dir = self._resolve_lib_dir("parakeet", engine_backend, fallback_lib_dir)
             n_threads = self._settings.n_threads_parakeet_tdt
+            # Parakeet TDT's worker never calls ggml_backend_load_all() --
+            # its ggml backends are ordinary DT_NEEDED shared-library
+            # dependencies, resolved via LD_LIBRARY_PATH ($ORIGIN rpath +
+            # ggml_lib_dir) same as the streaming engine below -- see
+            # CLAUDE.md's parakeet.cpp build notes. No GGML_BACKEND_PATH
+            # needed or meaningful here.
+            ggml_backend_path = None
         else:
             worker_bin = Path(self._settings.worker_bin)
             engine_backend = self._settings.parakeet_backend
@@ -180,6 +205,7 @@ class CallSession:
             )
             ggml_lib_dir = self._resolve_lib_dir("parakeet", engine_backend, fallback_lib_dir)
             n_threads = self._settings.n_threads_per_worker
+            ggml_backend_path = None  # see the parakeet_tdt branch's comment above
         start = time.monotonic()
         handle = await WorkerHandle.spawn(
             worker_bin=worker_bin,
@@ -187,6 +213,7 @@ class CallSession:
             language=self._config.language,
             n_threads=n_threads,
             ggml_lib_dir=ggml_lib_dir,
+            ggml_backend_path=ggml_backend_path,
             # Per-engine backend choice (LS-5) -- each of parakeet_backend/
             # whisper_backend/parakeet_tdt_backend is independent, so one
             # deployment can genuinely run the live stream on GPU while

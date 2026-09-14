@@ -108,6 +108,16 @@ def main() -> None:
                 # real-subprocess way use_gpu_received above already does,
                 # rather than mocking WorkerHandle.spawn directly.
                 "ld_library_path_received": os.environ.get("LD_LIBRARY_PATH"),
+                # Same reasoning, for GGML_BACKEND_PATH (see
+                # WorkerHandle.spawn()'s own comment on why this exists
+                # SEPARATELY from LD_LIBRARY_PATH -- ggml's own
+                # ggml_backend_load_all() dynamic-backend-discovery
+                # mechanism does not consult LD_LIBRARY_PATH at all, so a
+                # runtime-installed cuda flavor of the whisper engine needs
+                # this instead. Only ever set for whisper+cuda in real
+                # session.py code, but this fake worker doesn't care which
+                # "engine" it's pretending to be.
+                "ggml_backend_path_received": os.environ.get("GGML_BACKEND_PATH"),
             }
         ).encode(),
     )

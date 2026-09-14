@@ -289,6 +289,98 @@ async def test_active_backend_flavor_mismatch_raises(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
+async def test_whisper_cuda_sets_ggml_backend_path_for_the_active_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Real bug, found against the actual 10.100.0.50 deployment: a
+    # runtime-installed whisper:cuda backend correctly got LD_LIBRARY_PATH
+    # pointed at its install directory, but the worker logged
+    # `whisper_backend_init_gpu: no GPU found` and silently ran on CPU
+    # anyway. Root cause: whisper's worker is the one engine whose main()
+    # calls ggml's OWN ggml_backend_load_all() (main_whisper.cpp), a
+    # dynamic-backend-discovery mechanism that -- confirmed by reading the
+    # vendored ggml-backend-reg.cpp -- does NOT consult LD_LIBRARY_PATH at
+    # all; it only searches the worker binary's own directory, the
+    # process's CWD, or (this fix) the GGML_BACKEND_PATH env var pointing
+    # at one specific .so file. This is whisper-ONLY: parakeet/parakeet_tdt
+    # never call ggml_backend_load_all() (see the sibling test below),
+    # since their ggml backends are ordinary linked shared libraries.
+    import live_stt.session as session_module
+
+    monkeypatch.setattr(
+        session_module.installer,
+        "get_active_backend",
+        lambda db_path, engine: _fake_active("whisper", "cuda", "/active/whisper-cuda"),
+    )
+    settings = Settings(
+        _env_file=None,
+        worker_bin_whisper=str(FAKE_WORKER),
+        models_dir="/fake",
+        whisper_backend="cuda",
+    )
+    session = _session(settings=settings, model_key="whisper-base.en-q8_0")
+    try:
+        await session.start()
+        assert session._worker.ready.get("ld_library_path_received") == "/active/whisper-cuda"  # noqa: SLF001
+        assert (
+            session._worker.ready.get("ggml_backend_path_received")  # noqa: SLF001
+            == "/active/whisper-cuda/libggml-cuda.so"
+        )
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_whisper_cpu_never_sets_ggml_backend_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The baked-in CPU flavor's per-microarch .so's already resolve
+    # correctly via ggml_backend_load_all()'s OTHER always-searched path
+    # (the worker binary's own directory) -- GGML_BACKEND_PATH must stay
+    # unset here, or an unrelated stray env var could shadow that working
+    # default with a nonexistent/wrong file.
+    import live_stt.session as session_module
+
+    monkeypatch.setattr(session_module.installer, "get_active_backend", lambda db_path, engine: None)
+    settings = Settings(
+        _env_file=None,
+        worker_bin_whisper=str(FAKE_WORKER),
+        models_dir="/fake",
+        whisper_backend="cpu",
+    )
+    session = _session(settings=settings, model_key="whisper-base.en-q8_0")
+    try:
+        await session.start()
+        assert session._worker.ready.get("ggml_backend_path_received") is None  # noqa: SLF001
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_parakeet_tdt_cuda_never_sets_ggml_backend_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Parakeet TDT shares parakeet's ordinary-linked-library ggml backend
+    # (never calls ggml_backend_load_all()) -- GGML_BACKEND_PATH would be
+    # meaningless (and potentially confusing/harmful) for it even on cuda.
+    import live_stt.session as session_module
+
+    monkeypatch.setattr(
+        session_module.installer,
+        "get_active_backend",
+        lambda db_path, engine: _fake_active("parakeet", "cuda", "/active/parakeet-cuda"),
+    )
+    settings = Settings(
+        _env_file=None,
+        worker_bin_parakeet_tdt=str(FAKE_WORKER),
+        models_dir="/fake",
+        parakeet_tdt_backend="cuda",
+    )
+    session = _session(settings=settings, model_key="parakeet-tdt-0.6b-v3")
+    try:
+        await session.start()
+        assert session._worker.ready.get("ggml_backend_path_received") is None  # noqa: SLF001
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_per_engine_backends_are_independent_mix_and_match(monkeypatch: pytest.MonkeyPatch) -> None:
     # LS-5's explicit ask ("user can pickup gpu for live stream, cpu for
     # [another engine]... no need all cpu or all gpu"): parakeet_backend and
