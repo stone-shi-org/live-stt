@@ -4,23 +4,22 @@
 # adapted for this repo's git submodule (worker/third_party/parakeet.cpp)
 # and its LSTT_REGISTRY convention.
 #
-# Three jobs, run in PARALLEL in the same stage (default Bamboo behavior for
-# jobs listed under one stage -- no explicit dependency between them), one
-# per image variant this repo builds (see build.sh --help): plain CPU, CUDA,
-# and CUDA+diarize. Deliberately every push, not manual-only/on-demand --
-# chosen over a leaner "CPU on every push, CUDA/diarize manual" split so all
-# three tags never drift out of sync with each other or with what's actually
-# in the repo. The real cost of that choice: every single push, including a
-# one-line CPU-only change, pays for a full CUDA+diarize build+push too
-# (~9.5GB image, see CLAUDE.md's Dockerfile runtime-cuda-diarize entry) --
-# accepted deliberately, not an oversight. Each job does its own checkout,
-# submodule init, and full test.sh run rather than sharing artifacts between
-# jobs -- redundant test.sh executions across three PARALLEL jobs cost extra
-# agent-minutes, not extra wall-clock, and keeping each job fully
-# self-contained avoids Bamboo artifact-passing complexity between them.
-# None of the three actually needs a GPU to build (see CLAUDE.md: "10.100.0.50
-# itself builds this target fine... no live GPU needed to build, only to
-# run"), so the same docker-capable agent pool serves all three jobs.
+# ONE job, building the ONE image tag this repo now ships (LS-5's full
+# ask, extended past ASR cpu/cuda to diarization engines too -- see
+# Dockerfile's "runtime" stage and build.sh). This file used to define
+# THREE parallel jobs (plain CPU, CUDA, CUDA+diarize), one per
+# separately-BUILT image variant -- collapsed to one job because there is
+# no longer a second/third variant to build: every capability beyond the
+# always-shipped parakeet/whisper CPU baseline (any ASR engine's cuda
+# flavor, any diarization engine's heavy Python dependency tree) is
+# installed into this SAME image at container RUNTIME instead, via the
+# admin API (live_stt/backends/installer.py, live_stt/
+# diarization_installer.py). This also fixes a real, independently-found
+# problem the old 3-job shape had: building the CUDA+diarize+(at one point,
+# manually) sortformer variant on every single push was disk-hungry enough
+# to exhaust the Bamboo agent's disk mid-build (see LIV-LIV-35's real
+# "no space left on device" failure) -- with one image now, that pressure
+# is gone by construction, not by tuning disk quotas.
 #
 # One-time manual setup still required in the Bamboo UI (not automatable via
 # the REST API used elsewhere in this repo's tooling -- there is no
@@ -32,9 +31,7 @@
 #      plan LSTT-LSTT ("live-stt-docker"); every push after that re-applies
 #      this file, no further UI steps needed.
 #   3. Confirm at least one build agent advertises the "system.docker.executable"
-#      capability (needed for `./test.sh --docker` and every `./build.sh -p`
-#      variant below) -- and enough free disk for three concurrent image
-#      builds (the diarize one alone is ~9.5GB before layer dedup).
+#      capability (needed for `./test.sh --docker` and `./build.sh -p`).
 version: 2
 plan:
   project-key: LIV
@@ -46,16 +43,6 @@ stages:
       final: false
       jobs:
         - Default Job
-  - CUDA Stage:
-      manual: false
-      final: false
-      jobs:
-        - CUDA Build Job
-  - CUDA Diarize Stage:
-      manual: false
-      final: false
-      jobs:
-        - CUDA Diarize Build Job
 Default Job:
   key: JOB1
   tasks:
@@ -88,70 +75,6 @@ Default Job:
             set -euo pipefail
             docker builder prune -af || true
             ./build.sh -p -r registry.shifamily.com/homestack
-            docker image prune -f || true
-  requirements:
-    - system.docker.executable
-CUDA Build Job:
-  key: JOB2
-  tasks:
-    - checkout:
-        force-clean-build: 'false'
-    - script:
-        interpreter: SHELL
-        scripts:
-          - |
-            set -euo pipefail
-            git submodule sync --recursive
-            git submodule update --init --recursive
-    - script:
-        interpreter: SHELL
-        scripts:
-          - |
-            # Same test.sh as Default Job -- there is no separate CUDA-only
-            # test suite (gpu-marked tests need a real device this agent
-            # pool doesn't have, see CLAUDE.md), this just gates the CUDA
-            # build on the same offline-safe unit tests as the CPU one.
-            ./test.sh --docker
-    - test-parser:
-        type: junit
-        test-results: '**/test-reports/*.xml'
-    - script:
-        interpreter: SHELL
-        scripts:
-          - |
-            set -euo pipefail
-            docker builder prune -af || true
-            ./build.sh --cuda -p -r registry.shifamily.com/homestack
-            docker image prune -f || true
-  requirements:
-    - system.docker.executable
-CUDA Diarize Build Job:
-  key: JOB3
-  tasks:
-    - checkout:
-        force-clean-build: 'false'
-    - script:
-        interpreter: SHELL
-        scripts:
-          - |
-            set -euo pipefail
-            git submodule sync --recursive
-            git submodule update --init --recursive
-    - script:
-        interpreter: SHELL
-        scripts:
-          - |
-            ./test.sh --docker
-    - test-parser:
-        type: junit
-        test-results: '**/test-reports/*.xml'
-    - script:
-        interpreter: SHELL
-        scripts:
-          - |
-            set -euo pipefail
-            docker builder prune -af || true
-            ./build.sh --cuda --diarize -p -r registry.shifamily.com/homestack
             docker image prune -f || true
   requirements:
     - system.docker.executable

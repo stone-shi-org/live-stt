@@ -885,6 +885,58 @@ in `configure()` and there is no loop anywhere near it.
   now GPU speed) would still
   apply to a future revisit if a later Sortformer release lifts the 4-speaker cap or the
   `nv_one_logger` Python-version ceiling is fixed upstream — this is a "not now," not a "never."
+
+- **One image tag, full stop (LS-5, post-7d) — extends the "no more GPU/CPU tags" goal past ASR
+  to diarization engines too, verified for real end-to-end.** Before this, getting diarization at
+  all meant choosing a separately-BUILT image (`runtime-cuda-diarize` for pyannote,
+  `runtime-cuda-diarize-sortformer` for +nemo) at deploy time — exactly the per-capability
+  image-tag proliferation the rest of LS-5 already eliminated for ASR's cpu/cuda split, just not
+  yet applied to this corner. Closed the same way: a new `live_stt/diarization_installer.py`
+  (the diarization-engine analogue of `live_stt/backends/installer.py`) that `pip install --target
+  <persistent dir> -r <requirements file>`s an engine's dependency tree on demand, via
+  `POST /api/diarization-engines/install {"engine": "pyannote" | "nemo_sortformer"}` — the
+  requirements files themselves (`requirements-diarization.txt`, `requirements-diarization-
+  sortformer.txt`) are still shipped as plain files in the image (so exact, repo-pinned versions
+  install regardless of what the repo's default branch has since changed), just no longer
+  `RUN pip install`ed at build time. `live_stt/diarization.py`'s `_ensure_deps_on_path()` prepends
+  the installed directory to `sys.path` immediately before each engine's lazy import, in EVERY
+  process that might load one — the main server process AND, critically, the
+  `live_stt.diarize_worker` subprocess `diarize_file()` spawns by default — so an engine installed
+  once persists across `docker recreate` (same already-mounted `/app/data` volume as
+  `backends_dir`/`db_path`) with no re-run-pip-on-every-restart step needed. The Dockerfile's
+  `runtime-cuda`, `runtime-cuda-diarize`, and `runtime-cuda-diarize-sortformer` stages are DELETED
+  (not kept as empty aliases the way `runtime-cuda` briefly was in 7d) — there is exactly one
+  `runtime` stage/tag now, with `ffmpeg` baked in unconditionally (small system package pyannote's
+  torchcodec needs at import time once installed; the actual heavy ML dependency trees stay
+  runtime-installable, ffmpeg does not need to be) and `HF_HOME` pointed at the mounted volume
+  unconditionally too (harmless before any diarization engine is installed). `build.sh` lost its
+  `--cuda`/`--diarize`/`--sortformer` flags entirely — one target, one tag family, always.
+  `bamboo-specs.yaml` collapsed from three parallel jobs (plain/CUDA/CUDA+diarize) to one, which
+  also incidentally closes the real disk-exhaustion failure a 3-variant-every-push shape caused
+  (see the LIV-LIV-35 Bamboo entry elsewhere in this project's history) — not by tuning agent disk
+  quotas, but by there no longer being three multi-GB variants to build on every push at all.
+  **Verified for real, not just unit-tested**: built the new single `runtime` image fresh, ran it
+  with NO diarization dependency baked in (confirmed `ModuleNotFoundError: No module named
+  'pyannote'` before install), called `POST /api/diarization-engines/install {"engine":
+  "pyannote"}` against the running container (a real `pip install`, several minutes, real
+  torch/pyannote.audio download), and then — in the SAME already-running container, no restart —
+  confirmed three separate ways that it became usable: (1) `live_stt.diarization.load_pipeline()`
+  called directly got past the import entirely and reached the (expected, token-related)
+  `DiarizationError`, not `ModuleNotFoundError`; (2) the real `live_stt.diarize_worker` subprocess
+  — the actual code path `diarize_file()` uses by default in production — invoked standalone
+  against a synthetic silent WAV showed the identical result, proving the sys.path bootstrap works
+  in the subprocess that matters, not just the parent process; (3) `GET /api/diarization-engines`
+  correctly flipped `pyannote.installed` from `false` to `true`. Also redeployed for real to the
+  actual 10.100.0.50 production container (`ai.yml`, home-docker-script repo, switched from
+  `:latest-cuda-diarize` to the single `:latest` tag) and re-verified `POST /v1/audio/diarization`
+  went from a real `503` (module missing on the plain pre-collapse image) back to functioning after
+  the redeploy. **What's not yet done**: the admin dashboard has no UI for the new
+  `/api/diarization-engines` endpoints (JSON API only, mirroring how `/api/backends` started);
+  `nemo_sortformer`'s runtime-install path is covered by the same code and by unit tests but was
+  NOT independently re-verified against a real `pip install` the way pyannote's was in this pass
+  (same code path, not itself proof); and `ai.env`/`ai.yml`'s GPU sizing comments still describe
+  the old baked-image assumptions in a couple of places not touched by this specific change.
+
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and

@@ -84,6 +84,19 @@ class Settings(BaseSettings):
     auto_upgrade_enabled: bool = False
     upgrade_check_interval_sec: float = 21600.0  # 6h
 
+    # LS-5 (post-7d extension): runtime-installed diarization ENGINE
+    # dependency trees (live_stt/diarization_installer.py) -- the same
+    # "one image, install what you need at runtime" idea as backends_dir
+    # above, extended from ASR's compiled C++ artifacts to diarization's
+    # heavy Python dependency trees (pyannote.audio+torch,
+    # nemo_toolkit[asr]). Before this, getting diarization at all meant a
+    # separate baked image (runtime-cuda-diarize / -sortformer) chosen at
+    # BUILD time -- exactly the per-capability image-tag proliferation
+    # LS-5 set out to eliminate for cpu/cuda, just not yet applied to this
+    # corner. Under the same already-mounted ./data volume as db_path/
+    # backends_dir, so an installed engine survives `docker recreate`.
+    diarization_deps_dir: str = "/app/data/diarization-deps"
+
     # Matches the Dockerfile runtime stage's layout (worker binary + its
     # ggml .so's copied into the same directory so the $ORIGIN rpath baked
     # in at link time resolves them -- see CLAUDE.md). worker_ggml_lib_dir

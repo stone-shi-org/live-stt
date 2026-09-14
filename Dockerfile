@@ -25,9 +25,9 @@
 # of baked in here, via POST /api/backends/install (live_stt/backends/
 # installer.py), not at image build time. That is the whole point of this
 # phase: no cpu/gpu split baked into the Docker image at all anymore (see
-# the runtime-cuda alias stage further down) -- an operator picks a flavor
-# per engine, per deployment, without rebuilding or even recreating the
-# image.
+# the "runtime" stage's own comment further down -- there is now exactly
+# ONE image tag) -- an operator picks a flavor per engine, per deployment,
+# without rebuilding or even recreating the image.
 FROM python:3.12-slim AS parakeet-fetch
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl \
@@ -154,11 +154,41 @@ COPY scripts/gen_proto.sh ./scripts/gen_proto.sh
 RUN mkdir -p live_stt && bash scripts/gen_proto.sh
 
 # ---- stage: runtime ---------------------------------------------------------
+# THE single image tag this repo ships (LS-5's full ask, extended past ASR
+# cpu/cuda to diarization engines too): no runtime-cuda / runtime-cuda-diarize
+# / runtime-cuda-diarize-sortformer variants exist anymore. Every capability
+# beyond the always-shipped parakeet/whisper CPU baseline -- any ASR engine's
+# cuda flavor (live_stt/backends/installer.py) AND any diarization engine's
+# heavy Python dependency tree (live_stt/diarization_installer.py, pyannote
+# or nemo_sortformer) -- is installed into this SAME running container at
+# RUNTIME, on demand, via the admin API. See CLAUDE.md for the full writeup
+# of why the earlier per-capability image tags existed and why they were
+# removed once the download-at-runtime mechanism covered diarization too.
 FROM py-deps AS runtime
 # libgomp1: OpenMP runtime ggml-cpu links against.
+# ffmpeg: needed only once a diarization engine is actually installed at
+# runtime (pyannote.audio decodes audio via torchcodec, which dlopens
+# libavutil/libavcodec/etc at IMPORT time -- confirmed the hard way,
+# see CLAUDE.md's "container-specific bug" entry from when this was still
+# baked into a separate runtime-cuda-diarize stage). Baked into the one
+# image unconditionally now rather than made itself runtime-installable:
+# it's a small system package (not the multi-hundred-MB-to-multi-GB
+# Python ML stacks this file's diarization_deps_dir mechanism exists for),
+# and `apt-get install` at container runtime would need network-reachable
+# package indexes AND `rm -rf /var/lib/apt/lists/*` from earlier layers
+# undone -- not worth reintroducing for a small, always-safe-to-have utility.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgomp1 \
+        libgomp1 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+# HF_HOME: inside the already-mounted, already-writable /app/data volume
+# (docker-compose.yml/ai.yml: live-stt-data:/app/data), harmless to set
+# unconditionally -- only read by pyannote.audio/huggingface_hub, which
+# aren't even importable until a diarization engine is installed at
+# runtime. Ensures a gated model download, once it happens, survives
+# `docker recreate` using infrastructure that already exists rather than a
+# container-local cache re-downloaded (and re-burning the HF token's rate
+# limit) on every restart.
+ENV HF_HOME=/app/data/hf-cache
 
 # See docker-cli-fetch's own comment above for why this is a pinned static
 # binary and not `apt-get install docker.io`. This alone is NOT sufficient
@@ -196,6 +226,16 @@ COPY --from=worker-build /src/live-stt-worker/worker/prebuilt-whisper/*.so* /app
 COPY --from=proto-build /app/live_stt/pb/ /app/live_stt/pb/
 COPY live_stt/ ./live_stt/
 COPY run.py version.txt* ./
+# Shipped as plain files, deliberately NOT `pip install -r`'d here --
+# live_stt/diarization_installer.py's install() reads these at RUNTIME
+# (pip install --target <persistent dir> -r <this file>), on demand, via
+# POST /api/diarization-engines/install. Keeping the files in the image
+# (rather than fetching them from the internet at install time too) means
+# the exact, repo-pinned dependency versions get installed regardless of
+# what a future git push to this repo's default branch might change --
+# same "pin what THIS build verified" reasoning as everywhere else in this
+# codebase that resists floating on "latest".
+COPY requirements-diarization.txt requirements-diarization-sortformer.txt ./
 
 ENV LSTT_WORKER_BIN=/app/worker/live_stt_worker \
     LSTT_WORKER_BIN_PARAKEET_TDT=/app/worker/live_stt_worker_parakeet_tdt \
@@ -217,88 +257,6 @@ EXPOSE 50051 8000
 # take that long, especially the first CUDA build's PTX JIT (Phase 5).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=4).status==200 else 1)"
-
-CMD ["python", "run.py"]
-
-# ---- stage: runtime-cuda -- BACKWARD-COMPATIBILITY ALIAS (LS-5 Phase 7d) ---
-# Through Phase 6, this was a SEPARATE image built from an nvidia/cuda base,
-# compiling every engine from source with CUDA enabled. As of this phase
-# that entire separate build path is gone: every engine's cpu AND cuda
-# flavors are DOWNLOADED (github_release or oci_image -- see
-# live_stt/backends/registry.py), most of them self-contained (bundling
-# their own cudart/cublas/etc), needing only the real driver's libcuda.so.1
-# at RUNTIME (nvidia-container-toolkit's `--gpus all`, never baked into any
-# image) -- so there is no longer a build-time reason for a CUDA-specific
-# base image, or for `runtime` and `runtime-cuda` to differ AT ALL. This is
-# exactly LS-5's ask: "no more GPU/CPU tags on docker container."
-#
-# Kept as a real, buildable stage/tag anyway -- not deleted -- purely for
-# backward compatibility with what already depends on the NAME
-# "runtime-cuda": docker-compose.gpu.yml's `target: runtime-cuda`,
-# build.sh's `--cuda` flag (tags images `-cuda`), and (most importantly) the
-# real production deployment's `ai.yml`, which references image tags built
-# from `runtime-cuda-diarize` below. Renaming all of those was judged
-# higher-risk than keeping one clearly-commented empty alias stage.
-#
-# Getting an actual GPU-flavored engine running on either `runtime` or
-# `runtime-cuda` now means the SAME thing either way: install+activate a
-# cuda backend at runtime via POST /api/backends/install,activate (see
-# live_stt/admin_http.py) -- see docker-compose.gpu.yml's own comment for
-# the operational sequence.
-FROM runtime AS runtime-cuda
-
-# ---- stage: runtime + post-call diarization baked in ------------------
-# pyannote.audio/torch/torchaudio (requirements-diarization.txt) are
-# deliberately NOT in runtime itself -- diarization is an opt-in,
-# offline-only tool, and every OTHER deployment of the always-on grpc.aio
-# server shouldn't pay for a multi-hundred-MB torch install it never uses
-# (see live_stt/diarization.py). This stage exists because a specific
-# deployment (10.100.0.50) wants both ASR and diarization in the one
-# running container -- see CLAUDE.md's "Batch ASR over HTTP" / "Post-call
-# speaker diarization" entries. Named "-cuda-diarize" for the same
-# backward-compatibility reason runtime-cuda above is kept: real deployment
-# config already references this exact tag. torch's own PyPI wheels bundle
-# their own CUDA runtime (nvidia-cublas-cu12 etc as pip dependencies) --
-# confirmed by this needing no CUDA-toolkit system package here at all,
-# only the real driver at container-run time, same story as the C++ engines.
-#
-# ffmpeg (pyannote.audio decodes audio via torchcodec/libavutil, and
-# kokoro/piper TTS engines also benefit from audio utilities) is installed
-# directly in THIS stage now, not inherited from a CUDA base image the way
-# it used to be -- `runtime`'s own base (python:3.12-slim) doesn't carry it.
-#
-# HF_HOME points inside the already-mounted, already-writable /app/data
-# volume (see docker-compose.yml/ai.yml: `live-stt-data:/app/data`) rather
-# than a new named volume -- the pyannote model then survives container
-# restarts/recreates for free, using infrastructure that already exists,
-# instead of a container-local cache that re-downloads the gated model from
-# HuggingFace (and burns a token's rate limit) on every restart.
-FROM runtime-cuda AS runtime-cuda-diarize
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-ENV HF_HOME=/app/data/hf-cache
-COPY requirements-diarization.txt .
-RUN pip install --no-cache-dir -r requirements-diarization.txt \
-        --index-url https://pypi.org/simple/
-
-CMD ["python", "run.py"]
-
-# ---- stage: adds NVIDIA Sortformer v2.1 (live_stt/diarization.py's
-# "nemo_sortformer" engine, LS-4) on top of runtime-cuda-diarize's
-# pyannote.audio install. A separate stage/tag, not a change to what
-# runtime-cuda-diarize means -- see requirements-diarization-sortformer.txt's
-# own comment: nemo_toolkit's dependency tree is heavier, and this is a
-# second, more niche opt-in engine on an already-opt-in feature. Confirmed
-# during the LS-4 spike that nemo_toolkit[asr]==3.0.0 installs and imports
-# cleanly under this image's actual Python 3.12 -- unlike the dev-host/
-# GPU-box throwaway venvs used for the spike itself, which hit a real
-# Python-3.14 packaging blocker (see CLAUDE.md's LS-4 entry for the full
-# story; it does not apply to this stage's interpreter).
-FROM runtime-cuda-diarize AS runtime-cuda-diarize-sortformer
-COPY requirements-diarization-sortformer.txt .
-RUN pip install --no-cache-dir -r requirements-diarization-sortformer.txt \
-        --index-url https://pypi.org/simple/
 
 CMD ["python", "run.py"]
 

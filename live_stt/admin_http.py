@@ -26,6 +26,7 @@ from prometheus_client import generate_latest
 
 from live_stt import (
     __about__,
+    diarization_installer,
     diarization_models,
     diarize_http,
     gpu,
@@ -1312,6 +1313,46 @@ def _handle_backend_activate(state: ServerState, body: bytes) -> tuple[int, dict
     return 200, {"activated": {"engine": engine, "flavor": flavor, "version": version}}
 
 
+def _diarization_engines_doc(state: ServerState) -> dict:
+    """GET /api/diarization-engines: every KNOWN diarization engine
+    (live_stt/diarization_installer.py's REQUIREMENTS_FILES -- "pyannote",
+    "nemo_sortformer") alongside whether its heavy dependency tree has
+    actually been installed into THIS deployment's persistent
+    diarization_deps_dir yet. The ASR analogue of GET /api/backends, for
+    the same reason: a dashboard/operator needs to see what's installable
+    vs. what's already usable before calling
+    POST /api/diarization-engines/install.
+    """
+    return {"engines": diarization_installer.status(state.settings.diarization_deps_dir)}
+
+
+def _handle_diarization_engine_install(state: ServerState, body: bytes) -> tuple[int, dict]:
+    try:
+        payload = json.loads(body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return 400, {"error": "invalid JSON body"}
+    engine = payload.get("engine")
+    if not engine:
+        return 400, {"error": "expected a JSON object: {'engine': 'pyannote' | 'nemo_sortformer'}"}
+
+    try:
+        result = diarization_installer.install(state.settings.diarization_deps_dir, engine)
+    except diarization_installer.DiarizationInstallError as exc:
+        # Same reasoning as _handle_backend_install's 502: this is a real
+        # pip/network/disk failure, an unknown engine name is the one case
+        # that's actually the caller's fault -- but distinguishing the two
+        # here would mean parsing the exception message, which is exactly
+        # the fragile string-matching this codebase avoids elsewhere (see
+        # diarize_http.py's own handler for the same tradeoff already made
+        # and accepted). 502 for all of it, consistent with the ASR path.
+        return 502, {"error": str(exc)}
+    return 200, {
+        "engine": result.engine,
+        "path": result.path,
+        "already_installed": result.already_installed,
+    }
+
+
 def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def _write(self, status: int, body: bytes, content_type: str) -> None:
@@ -1335,6 +1376,8 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                 self._write_json(200, _settings_doc(state))
             elif self.path == "/api/backends":
                 self._write_json(200, _backends_doc(state))
+            elif self.path == "/api/diarization-engines":
+                self._write_json(200, _diarization_engines_doc(state))
             elif self.path == "/api/health":
                 status = state.health_status()
                 http_status = 200 if status == "ok" else 503
@@ -1560,6 +1603,11 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                 length = int(self.headers.get("Content-Length", 0) or 0)
                 body = self.rfile.read(length) if length else b""
                 status, doc = _handle_backend_activate(state, body)
+                self._write_json(status, doc)
+            elif self.path == "/api/diarization-engines/install":
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length) if length else b""
+                status, doc = _handle_diarization_engine_install(state, body)
                 self._write_json(status, doc)
             else:
                 self._write_json(404, {"error": "not found"})

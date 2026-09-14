@@ -68,6 +68,32 @@ class _SegmentLike(Protocol):
     end: float
 
 
+def _ensure_deps_on_path(settings: Settings, engine: str) -> None:
+    """Prepend `engine`'s runtime-installed dependency directory (see
+    live_stt/diarization_installer.py) to sys.path, if it exists and isn't
+    already there -- so an engine installed via
+    POST /api/diarization-engines/install becomes importable without a
+    container restart. Called immediately before each engine's lazy
+    import, in EVERY process that might load one: the main server process
+    and, critically, the `live_stt.diarize_worker` subprocess
+    `diarize_file()` spawns by default -- both re-run this cheap check
+    rather than mutating sys.path once at process startup, since a fresh
+    install can happen at any time while a long-lived server process is
+    already running.
+
+    A no-op either way if the engine's dependencies were never installed
+    at runtime: nothing to prepend, and the subsequent import then either
+    resolves normally (dependencies baked into the image some other way)
+    or fails with the same ImportError-derived DiarizationError message
+    below, unchanged from before this function existed.
+    """
+    from live_stt.diarization_installer import engine_deps_dir
+
+    deps_dir = str(engine_deps_dir(settings.diarization_deps_dir, engine))
+    if deps_dir not in sys.path and Path(deps_dir).is_dir():
+        sys.path.insert(0, deps_dir)
+
+
 def load_pipeline(settings: Settings) -> Any:
     """Load the configured diarization engine's model object -- a pyannote
     ``Pipeline`` or a nemo ``SortformerEncLabelModel``, dispatched on
@@ -96,14 +122,17 @@ def _load_pyannote_pipeline(spec: Any, settings: Settings) -> Any:
     deliberately NOT a dependency of the always-on grpc.aio server process,
     only of this opt-in, offline tool.
     """
+    _ensure_deps_on_path(settings, "pyannote")
     try:
         from pyannote.audio import Pipeline
     except ImportError as exc:
         raise DiarizationError(
             "pyannote.audio is not installed. It is deliberately excluded "
             "from requirements.txt (heavy torch/torchaudio dependency for an "
-            "offline-only tool) -- install requirements-diarization.txt to "
-            "use post-call diarization."
+            "offline-only tool) -- POST /api/diarization-engines/install "
+            "{'engine': 'pyannote'} to install it into this running "
+            "deployment (persists across `docker recreate`), or install "
+            "requirements-diarization.txt yourself for local/manual use."
         ) from exc
 
     if spec.gated and not settings.diarization_hf_token:
@@ -152,6 +181,7 @@ def _load_sortformer_model(spec: Any, settings: Settings) -> Any:
     ``_load_pyannote_pipeline`` there is no token check here -- if a future
     nemo-engine entry ever IS gated, this will need one.
     """
+    _ensure_deps_on_path(settings, "nemo_sortformer")
     try:
         from nemo.collections.asr.models import SortformerEncLabelModel
     except ImportError as exc:
@@ -159,9 +189,11 @@ def _load_sortformer_model(spec: Any, settings: Settings) -> Any:
             "nemo_toolkit[asr] is not installed. It is deliberately excluded "
             "from requirements.txt and requirements-diarization.txt (an even "
             "heavier dependency tree than pyannote.audio's own, for a "
-            "second, opt-in engine) -- install "
-            "requirements-diarization-sortformer.txt to use "
-            f"{spec.hf_repo_id!r}."
+            "second, opt-in engine) -- POST /api/diarization-engines/install "
+            "{'engine': 'nemo_sortformer'} to install it into this running "
+            "deployment (persists across `docker recreate`), or install "
+            f"requirements-diarization-sortformer.txt yourself for local/"
+            f"manual use of {spec.hf_repo_id!r}."
         ) from exc
 
     device = _check_device(settings)

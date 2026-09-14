@@ -213,6 +213,55 @@ class TestLoadPipelineErrors:
         assert pipeline is not None
 
 
+class TestEnsureDepsOnPath:
+    """live_stt/diarization.py's _ensure_deps_on_path -- the sys.path
+    bootstrap that makes a runtime-installed engine (live_stt/
+    diarization_installer.py) importable without a container restart.
+    """
+
+    def test_prepends_an_existing_deps_dir_to_sys_path(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
+        import sys
+
+        from live_stt.diarization import _ensure_deps_on_path
+
+        engine_dir = tmp_path / "pyannote"
+        engine_dir.mkdir()
+        original_path = list(sys.path)
+        monkeypatch.setattr(sys, "path", list(original_path))
+
+        _ensure_deps_on_path(_settings(diarization_deps_dir=str(tmp_path)), "pyannote")
+
+        assert sys.path[0] == str(engine_dir)
+
+    def test_is_a_noop_when_the_engine_was_never_installed(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
+        import sys
+
+        from live_stt.diarization import _ensure_deps_on_path
+
+        original_path = list(sys.path)
+        monkeypatch.setattr(sys, "path", list(original_path))
+
+        _ensure_deps_on_path(_settings(diarization_deps_dir=str(tmp_path)), "pyannote")
+
+        assert sys.path == original_path
+
+    def test_does_not_add_the_same_directory_twice(self, tmp_path, monkeypatch: pytest.MonkeyPatch):
+        import sys
+
+        from live_stt.diarization import _ensure_deps_on_path
+
+        engine_dir = tmp_path / "pyannote"
+        engine_dir.mkdir()
+        original_path = list(sys.path)
+        monkeypatch.setattr(sys, "path", list(original_path))
+
+        settings = _settings(diarization_deps_dir=str(tmp_path))
+        _ensure_deps_on_path(settings, "pyannote")
+        _ensure_deps_on_path(settings, "pyannote")
+
+        assert sys.path.count(str(engine_dir)) == 1
+
+
 class TestLoadPipelineDevice:
     def _stub_pyannote(self, monkeypatch: pytest.MonkeyPatch, fake_pipeline: object) -> None:
         import sys

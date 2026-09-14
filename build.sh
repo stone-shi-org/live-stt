@@ -1,22 +1,20 @@
 #!/usr/bin/env bash
 #
-# Build and tag the container image.
+# Build and tag the container image. ONE target, ONE tag family --
+# there is no --cuda/--diarize/--sortformer flag anymore (removed, not
+# deprecated-as-no-ops, since every caller of this script -- bamboo-specs.yaml,
+# ai.yml -- was updated in the same change that removed them; see git
+# history if you're looking for the old per-capability image split). Every
+# capability beyond the always-shipped parakeet/whisper CPU baseline (any
+# ASR engine's cuda flavor, any diarization engine's heavy Python
+# dependency tree) is installed into this SAME image at container RUNTIME
+# instead, via the admin API -- see live_stt/backends/installer.py and
+# live_stt/diarization_installer.py.
 #
 #   ./build.sh                              build live-stt:latest locally, no registry
 #   ./build.sh -p                           build and push (requires -r or LSTT_REGISTRY)
 #   ./build.sh -t v1.2                      add an extra tag
 #   ./build.sh -r registry.example.com/x    tag for a specific registry
-#   ./build.sh --cuda                       build runtime-cuda instead, tags get a -cuda suffix
-#   ./build.sh --cuda --diarize             build runtime-cuda-diarize (CUDA ASR + pyannote.audio
-#                                            baked in, see requirements-diarization.txt), tags get
-#                                            a -cuda-diarize suffix -- requires --cuda, no CPU+
-#                                            diarize image target exists
-#   ./build.sh --cuda --diarize --sortformer  build runtime-cuda-diarize-sortformer (adds NVIDIA
-#                                            Sortformer v2.1, see
-#                                            requirements-diarization-sortformer.txt, LS-4), tags
-#                                            get a -cuda-diarize-sortformer suffix -- requires
-#                                            --cuda --diarize, no smaller-image sortformer target
-#                                            exists
 #   LSTT_REGISTRY=registry.example.com/x ./build.sh   same, via environment
 #
 # Registry precedence: -r flag > LSTT_REGISTRY env var > unset (local image only).
@@ -31,19 +29,13 @@ REGISTRY="${LSTT_REGISTRY:-}"
 IMAGE="live-stt"
 PUSH=0
 EXTRA_TAG=""
-CUDA=0
-DIARIZE=0
-SORTFORMER=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -p|--push)     PUSH=1; shift ;;
         -t|--tag)      EXTRA_TAG="$2"; shift 2 ;;
         -r|--registry) REGISTRY="$2"; shift 2 ;;
-        --cuda)        CUDA=1; shift ;;
-        --diarize)     DIARIZE=1; shift ;;
-        --sortformer)  SORTFORMER=1; shift ;;
-        -h|--help)     sed -n '2,24p' "$0"; exit 0 ;;
+        -h|--help)     sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -55,34 +47,12 @@ if [ "$PUSH" -eq 1 ] && [ -z "$REGISTRY" ]; then
     exit 1
 fi
 
-if [ "$DIARIZE" -eq 1 ] && [ "$CUDA" -ne 1 ]; then
-    echo "ERROR: --diarize currently requires --cuda -- no runtime-diarize (CPU) target exists." >&2
-    exit 1
-fi
-
-if [ "$SORTFORMER" -eq 1 ] && [ "$DIARIZE" -ne 1 ]; then
-    echo "ERROR: --sortformer requires --diarize (and --cuda) -- it extends runtime-cuda-diarize." >&2
-    exit 1
-fi
-
 # REPO is the full tag prefix: "live-stt" locally, or
 # "registry.example.com/homestack/live-stt" once a registry is set.
 REPO="${REGISTRY:+${REGISTRY}/}${IMAGE}"
 
 TARGET="runtime"
 SUFFIX=""
-if [ "$CUDA" -eq 1 ]; then
-    TARGET="runtime-cuda"
-    SUFFIX="-cuda"
-fi
-if [ "$DIARIZE" -eq 1 ]; then
-    TARGET="runtime-cuda-diarize"
-    SUFFIX="-cuda-diarize"
-fi
-if [ "$SORTFORMER" -eq 1 ]; then
-    TARGET="runtime-cuda-diarize-sortformer"
-    SUFFIX="-cuda-diarize-sortformer"
-fi
 
 # version.txt is baked into the image and surfaced at GetServerInfo (and
 # /api/version), so a running container can always be traced back to a
@@ -115,8 +85,11 @@ fi
 
 log "Version: ${HASH} (${TIMESTAMP}), parakeet.cpp @ ${PARAKEET_REF:0:7}, whisper.cpp @ ${WHISPER_REF:0:7}"
 
-# Serialize docker builds on hosts where concurrent builds (e.g. Bamboo running
-# CPU, CUDA, and Diarize jobs in parallel) would otherwise contend for disk space.
+# Serialize docker builds on hosts where more than one build might run at
+# once (e.g. a manual rebuild racing a CI trigger) and would otherwise
+# contend for disk space -- kept even though there is only one Bamboo job
+# now (see bamboo-specs.yaml), since this script itself has no way to know
+# it's the only caller on a given host.
 LOCKFILE="${TMPDIR:-/tmp}/live-stt-build.lock"
 log "Acquiring build lock (${LOCKFILE})..."
 exec 200>"$LOCKFILE"
