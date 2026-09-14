@@ -55,6 +55,24 @@ async def test_settings_page_serves_html() -> None:
 
 
 @pytest.mark.asyncio
+async def test_settings_page_includes_diarization_engines_install_ui() -> None:
+    # Mirrors the pre-existing "Engine Backends" install/activate UI on
+    # this same page -- pyannote/nemo_sortformer are installable at
+    # runtime (live_stt/diarization_installer.py) the same way ASR cuda
+    # flavors are, and an operator needs a UI to trigger it, not just curl.
+    server = serve_admin_http("127.0.0.1", 0, _state())
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/settings", timeout=5) as resp:
+            body = resp.read().decode()
+            assert "diarizationBody" in body
+            assert "installDiarizationEngine" in body
+            assert "/api/diarization-engines/install" in body
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_get_api_settings_reports_store_unavailable_when_none_configured() -> None:
     server = serve_admin_http("127.0.0.1", 0, _state(settings_store=None))
     try:

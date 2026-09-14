@@ -1028,6 +1028,20 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
         <tbody id="backendsBody"><tr><td colspan="6">Loading...</td></tr></tbody>
     </table>
 
+    <h1 style="margin-top:32px;">Diarization Engines</h1>
+    <p style="color:var(--text-muted);">
+        Post-call speaker diarization's heavy Python dependency trees (pyannote.audio+torch,
+        NVIDIA Sortformer/nemo_toolkit) -- deliberately NOT baked into this image (see
+        live_stt/diarization_installer.py's docstring). Install once per deployment; installs
+        persist under the mounted data volume and survive `docker recreate`, no restart needed --
+        an install takes effect on the very next diarization request.
+    </p>
+    <div id="diarizationBanner"></div>
+    <table>
+        <thead><tr><th>Engine</th><th>Requirements file</th><th>Installed</th><th>Actions</th></tr></thead>
+        <tbody id="diarizationBody"><tr><td colspan="4">Loading...</td></tr></tbody>
+    </table>
+
     <script>
         let original = {};
         let hotFields = new Set();
@@ -1170,9 +1184,46 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
             tbody.innerHTML = rows.join('') || '<tr><td colspan="6">No backends registered.</td></tr>';
         }
 
+        function showDiarizationBanner(kind, text) {
+            const b = document.getElementById('diarizationBanner');
+            b.className = kind;
+            b.innerText = text;
+        }
+
+        async function installDiarizationEngine(engine) {
+            showDiarizationBanner('ok', `Installing ${engine}... (a real pip install, can take several minutes -- do not navigate away)`);
+            const resp = await fetch('/api/diarization-engines/install', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({engine}),
+            });
+            const doc = await resp.json();
+            if (resp.ok) {
+                showDiarizationBanner('ok', `${doc.already_installed ? 'Already installed' : 'Installed'}: ${engine} -> ${doc.path}`);
+            } else {
+                showDiarizationBanner('err', doc.error || 'install failed');
+            }
+            await loadDiarizationEngines();
+        }
+
+        async function loadDiarizationEngines() {
+            const resp = await fetch('/api/diarization-engines');
+            const doc = await resp.json();
+            const tbody = document.getElementById('diarizationBody');
+            const rows = Object.entries(doc.engines || {}).map(([engine, info]) => {
+                const installBtn = info.installed
+                    ? ''
+                    : `<button onclick="installDiarizationEngine('${engine}')">Install</button>`;
+                return `<tr><td>${engine}</td><td>${info.requirements_file}</td>` +
+                    `<td>${info.installed ? 'yes' : 'no'}</td><td>${installBtn}</td></tr>`;
+            });
+            tbody.innerHTML = rows.join('') || '<tr><td colspan="4">No diarization engines registered.</td></tr>';
+        }
+
         document.getElementById('saveBtn').addEventListener('click', save);
         load();
         loadBackends();
+        loadDiarizationEngines();
     </script>
 </body>
 </html>
