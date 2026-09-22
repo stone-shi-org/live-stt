@@ -35,7 +35,8 @@ but do not build an interface expecting partial captions mid-request on top
 of this -- it does not do that. ``stream`` unset/``"false"`` returns a plain
 JSON body instead (OpenAI Whisper-API-shaped: ``{"text": ...}``, or with
 ``response_format=verbose_json``: ``{"task", "language", "duration", "text",
-"words"}``).
+"words"}``, where each item in ``words`` is ``{"word", "start", "end",
+"confidence"}``).
 
 **Audio format**: only 16kHz mono 16-bit PCM WAV is accepted -- the same
 restriction ``servicer.Transcribe`` enforces on the gRPC path ("unsupported
@@ -317,7 +318,7 @@ async def handle_transcribe_request(
             "language": language or "",
             "duration": total_audio_sec,
             "text": text,
-            "words": [{"word": w.text, "start": w.start_sec, "end": w.end_sec} for w in words],
+            "words": [{"word": w.text, "start": w.start_sec, "end": w.end_sec, "confidence": w.confidence} for w in words],
         }
     else:
         doc = {"text": text}

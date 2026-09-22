@@ -268,7 +268,7 @@ class TestHandleTranscribeRequestResponses:
     """_run_transcription monkeypatched -- these test response shaping only."""
 
     def _patch(self, monkeypatch: pytest.MonkeyPatch, *, text="hello world", words=None, total_audio_sec=2.0, generations=1):
-        words = words if words is not None else [asr_pb2.Word(text="hello", start_sec=0.0, end_sec=0.5)]
+        words = words if words is not None else [asr_pb2.Word(text="hello", start_sec=0.0, end_sec=0.5, confidence=0.875)]
 
         async def fake_run(pcm, *, settings, spec, language, budget):
             return text, words, total_audio_sec, generations
@@ -300,7 +300,7 @@ class TestHandleTranscribeRequestResponses:
         assert doc["task"] == "transcribe"
         assert doc["language"] == "en-US"
         assert doc["duration"] == 3.2
-        assert doc["words"] == [{"word": "hello", "start": 0.0, "end": 0.5}]
+        assert doc["words"] == [{"word": "hello", "start": 0.0, "end": 0.5, "confidence": 0.875}]
 
     @pytest.mark.asyncio
     async def test_stream_true_returns_sse_matching_my_meeting_notes_contract(self, monkeypatch: pytest.MonkeyPatch):
