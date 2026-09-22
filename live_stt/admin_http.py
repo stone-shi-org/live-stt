@@ -50,12 +50,13 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
     <title>🎙️ Live-STT Admin & Statistics</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-dark: #0f172a;
-            --panel-bg: #1e293b;
-            --panel-border: #334155;
+            --bg-dark: #090d16;
+            --panel-bg: #111827;
+            --panel-header-bg: #162032;
+            --panel-border: #1f293d;
             --accent-blue: #38bdf8;
             --accent-indigo: #6366f1;
             --accent-green: #10b981;
@@ -63,7 +64,8 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             --accent-red: #ef4444;
             --text-main: #f8fafc;
             --text-muted: #94a3b8;
-            --hover-bg: #334155;
+            --hover-bg: #1e293b;
+            --input-bg: #0b1120;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -75,7 +77,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             min-height: 100vh;
             display: flex;
             flex-direction: column;
-            padding-bottom: 2rem;
+            padding-bottom: 3rem;
         }
 
         header {
@@ -91,15 +93,18 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         .logo-title {
             display: flex;
             align-items: center;
-            gap: 0.75rem;
+            gap: 0.85rem;
         }
 
         .logo-icon {
-            font-size: 1.75rem;
+            font-size: 1.85rem;
             background: rgba(99, 102, 241, 0.2);
-            padding: 0.5rem;
+            padding: 0.5rem 0.6rem;
             border-radius: 12px;
             border: 1px solid rgba(99, 102, 241, 0.4);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
         }
 
         h1 {
@@ -153,14 +158,73 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             100% { transform: scale(0.95); opacity: 0.8; }
         }
 
+        /* Top Navigation Bar */
+        .nav-bar {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: rgba(17, 24, 39, 0.95);
+            border-bottom: 1px solid var(--panel-border);
+            padding: 0 2rem;
+            position: sticky;
+            top: 0;
+            z-index: 50;
+            backdrop-filter: blur(10px);
+        }
+
+        .nav-tab {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.55rem;
+            padding: 0.95rem 1.35rem;
+            background: none;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            font-family: inherit;
+        }
+
+        .nav-tab:hover {
+            color: var(--text-main);
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .nav-tab.active {
+            color: var(--accent-blue);
+            border-bottom-color: var(--accent-blue);
+            font-weight: 600;
+        }
+
+        .nav-badge {
+            background: rgba(56, 189, 248, 0.15);
+            color: var(--accent-blue);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            border-radius: 9999px;
+            padding: 0.15rem 0.5rem;
+            font-size: 0.7rem;
+            font-weight: 600;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
         .container {
             max-width: 1400px;
             width: 100%;
             margin: 1.5rem auto 0 auto;
             padding: 0 1.5rem;
-            display: flex;
+        }
+
+        .tab-content {
+            display: none;
             flex-direction: column;
             gap: 1.5rem;
+        }
+
+        .tab-content.active {
+            display: flex;
         }
 
         .grid-cards {
@@ -178,6 +242,11 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             flex-direction: column;
             gap: 0.5rem;
             box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            transition: transform 0.15s ease, border-color 0.15s ease;
+        }
+
+        .card:hover {
+            border-color: rgba(99, 102, 241, 0.35);
         }
 
         .card-label {
@@ -257,7 +326,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
 
         .config-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
             gap: 1.25rem;
         }
 
@@ -273,6 +342,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             font-weight: 600;
             color: var(--accent-blue);
             margin-bottom: 0.8rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
         }
 
         .kv-table {
@@ -290,7 +362,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         }
 
         .kv-table td {
-            padding: 0.4rem 0;
+            padding: 0.45rem 0;
         }
 
         .kv-key {
@@ -306,17 +378,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             word-break: break-all;
         }
 
-        .col-id {
-            width: 100px;
-        }
-
-        .col-elapsed {
-            width: 120px;
-        }
-
-        .col-info {
-            width: auto;
-        }
+        .col-id { width: 100px; }
+        .col-elapsed { width: 120px; }
+        .col-info { width: auto; }
 
         .model-name-cell {
             display: inline-flex;
@@ -367,7 +431,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             gap: 0.4rem;
             background: var(--hover-bg);
             color: var(--text-main);
-            padding: 0.5rem 1rem;
+            padding: 0.55rem 1.1rem;
             border-radius: 8px;
             font-size: 0.85rem;
             font-weight: 500;
@@ -386,6 +450,194 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             font-size: 0.75rem;
             color: var(--text-muted);
             font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* Settings Tab UI */
+        .settings-header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 1rem;
+            flex-wrap: wrap;
+            margin-bottom: 1rem;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-indigo), var(--accent-blue));
+            color: white;
+            font-weight: 600;
+            padding: 0.65rem 1.4rem;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: opacity 0.2s, transform 0.1s;
+        }
+        .btn-primary:hover:not(:disabled) {
+            opacity: 0.92;
+            transform: translateY(-1px);
+        }
+        .btn-primary:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .settings-toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            align-items: center;
+            margin: 1.25rem 0;
+            justify-content: space-between;
+        }
+
+        .search-box {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background: rgba(15, 23, 42, 0.7);
+            border: 1px solid var(--panel-border);
+            border-radius: 8px;
+            padding: 0.45rem 0.85rem;
+            color: var(--text-muted);
+            min-width: 260px;
+        }
+        .search-box input {
+            background: transparent;
+            border: none;
+            outline: none;
+            color: var(--text-main);
+            font-family: inherit;
+            font-size: 0.85rem;
+            width: 100%;
+        }
+
+        .category-pills {
+            display: flex;
+            gap: 0.4rem;
+            flex-wrap: wrap;
+        }
+
+        .cat-pill {
+            background: rgba(30, 41, 59, 0.6);
+            border: 1px solid var(--panel-border);
+            color: var(--text-muted);
+            padding: 0.35rem 0.85rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.15s;
+            font-family: inherit;
+        }
+        .cat-pill:hover {
+            color: var(--text-main);
+            border-color: var(--accent-indigo);
+        }
+        .cat-pill.active {
+            background: rgba(99, 102, 241, 0.2);
+            color: var(--accent-blue);
+            border-color: var(--accent-blue);
+            font-weight: 600;
+        }
+
+        .section-divider-row {
+            background: rgba(30, 41, 59, 0.7) !important;
+        }
+        .section-divider-row td {
+            padding: 0.65rem 0.75rem !important;
+            border-top: 1px solid var(--panel-border);
+            border-bottom: 1px solid var(--panel-border);
+        }
+        .section-divider-title {
+            font-size: 0.85rem;
+            font-weight: 700;
+            color: var(--accent-blue);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .settings-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+        .settings-table th {
+            text-align: left;
+            padding: 0.65rem 0.75rem;
+            color: var(--text-muted);
+            font-weight: 600;
+            border-bottom: 1px solid var(--panel-border);
+        }
+        .settings-table td {
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid rgba(51, 65, 85, 0.3);
+            vertical-align: middle;
+        }
+        .settings-table tr:hover:not(.section-divider-row) {
+            background: rgba(255, 255, 255, 0.02);
+        }
+        .settings-table input[type=text], .settings-table input[type=number] {
+            background: var(--input-bg);
+            color: var(--text-main);
+            border: 1px solid var(--panel-border);
+            border-radius: 6px;
+            padding: 0.4rem 0.6rem;
+            width: 100%;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            box-sizing: border-box;
+        }
+        .settings-table input[type=text]:focus, .settings-table input[type=number]:focus {
+            border-color: var(--accent-blue);
+            outline: none;
+        }
+        .settings-table input[type=checkbox] {
+            accent-color: var(--accent-indigo);
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+        .settings-table button {
+            background: var(--hover-bg);
+            color: var(--text-main);
+            border: 1px solid var(--panel-border);
+            border-radius: 6px;
+            padding: 0.35rem 0.75rem;
+            font-size: 0.8rem;
+            cursor: pointer;
+            font-weight: 500;
+            transition: all 0.15s;
+        }
+        .settings-table button:hover {
+            background: var(--accent-indigo);
+            border-color: var(--accent-indigo);
+            color: white;
+        }
+
+        .badge.hot { background: rgba(16,185,129,0.2); color: var(--accent-green); }
+        .badge.restart { background: rgba(245,158,11,0.2); color: var(--accent-yellow); }
+
+        #banner, #backendsBanner, #diarizationBanner, #ttsBanner {
+            display: none;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 0.85rem;
+        }
+        #banner.ok, #backendsBanner.ok, #diarizationBanner.ok, #ttsBanner.ok {
+            display: block !important;
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid var(--accent-green);
+            color: #34d399;
+        }
+        #banner.err, #backendsBanner.err, #diarizationBanner.err, #ttsBanner.err {
+            display: block !important;
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid var(--accent-red);
+            color: #f87171;
         }
     </style>
 </head>
@@ -406,268 +658,371 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         </div>
     </header>
 
+    <nav class="nav-bar">
+        <button class="nav-tab active" id="nav-status" onclick="switchTab('status')">
+            <span>📊</span>
+            <span>Running Status</span>
+            <span class="nav-badge" id="tabBadgeCalls">0 active</span>
+        </button>
+        <button class="nav-tab" id="nav-models" onclick="switchTab('models')">
+            <span>🧩</span>
+            <span>Models & Endpoints</span>
+        </button>
+        <button class="nav-tab" id="nav-settings" onclick="switchTab('settings')">
+            <span>⚙️</span>
+            <span>Configuration & Settings</span>
+        </button>
+    </nav>
+
     <div class="container">
-        <!-- Metric Cards -->
-        <div class="grid-cards">
-            <div class="card">
-                <div class="card-label">Active Calls</div>
-                <div class="card-value" id="valActiveCalls">0</div>
-                <div class="card-subtext" id="subActiveCalls">Max Capacity: -</div>
-            </div>
-            <div class="card">
-                <div class="card-label">Active Workers</div>
-                <div class="card-value" id="valActiveWorkers">0</div>
-                <div class="card-subtext" id="subActiveWorkers">Max Workers: -</div>
-            </div>
-            <div class="card">
-                <div class="card-label">Reserve Slots</div>
-                <div class="card-value" id="valReserveSlots">-</div>
-                <div class="card-subtext">Reserved for Overlap Shadow</div>
-            </div>
-            <div class="card">
-                <div class="card-label">Server State</div>
-                <div class="card-value" id="valServerState" style="font-size:1.4rem;">OK</div>
-                <div class="card-subtext" id="subDraining">Draining: False</div>
-            </div>
-        </div>
-
-        <!-- GPU & Diarization Cards -->
-        <div class="grid-cards">
-            <div class="card">
-                <div class="card-label">GPU VRAM Free</div>
-                <div class="card-value" id="valGpuVramFree">-</div>
-                <div class="card-subtext" id="subGpuVramTotal">of - total</div>
-            </div>
-            <div class="card">
-                <div class="card-label">GPU Utilization</div>
-                <div class="card-value" id="valGpuUtil">-</div>
-                <div class="card-subtext">Compute, whole card</div>
-            </div>
-            <div class="card">
-                <div class="card-label">Diarization Sessions</div>
-                <div class="card-value" id="valDiarizeActive">0</div>
-                <div class="card-subtext">Currently running</div>
-            </div>
-            <div class="card">
-                <div class="card-label">Diarization Totals</div>
-                <div class="card-value" id="valDiarizeTotals" style="font-size:1.1rem;">0 / 0 / 0</div>
-                <div class="card-subtext">ok / failed / VRAM-rejected</div>
-            </div>
-        </div>
-
-        <!-- Transcript (batch HTTP) Cards -->
-        <div class="grid-cards">
-            <div class="card">
-                <div class="card-label">Transcript Requests</div>
-                <div class="card-value" id="valTranscribeActive">0</div>
-                <div class="card-subtext">Currently running (POST /v1/audio/transcriptions)</div>
-            </div>
-            <div class="card">
-                <div class="card-label">Transcript Totals</div>
-                <div class="card-value" id="valTranscribeTotals" style="font-size:1.1rem;">0 / 0 / 0 / 0</div>
-                <div class="card-subtext">ok / failed / VRAM-rejected / capacity-rejected</div>
-            </div>
-        </div>
-
-        <!-- TTS (Speech Synthesis) Cards -->
-        <div class="grid-cards">
-            <div class="card">
-                <div class="card-label">TTS Requests</div>
-                <div class="card-value" id="valTtsActive">0</div>
-                <div class="card-subtext">Currently running (POST /v1/audio/speech)</div>
-            </div>
-            <div class="card">
-                <div class="card-label">TTS Totals</div>
-                <div class="card-value" id="valTtsTotals" style="font-size:1.1rem;">0 / 0 / 0 / 0</div>
-                <div class="card-subtext">ok / failed / VRAM-rejected / capacity-rejected</div>
-            </div>
-        </div>
-
-        <!-- Connection & Capacity Progress -->
-        <div class="section-card">
-            <div class="section-title">📊 Capacity & Resource Usage</div>
-            <div class="progress-group">
-                <div class="progress-item">
-                    <div class="progress-label-row">
-                        <span>Active Concurrent Calls</span>
-                        <span id="callUsageText">0 / 0 (0%)</span>
-                    </div>
-                    <div class="progress-bar-bg">
-                        <div class="progress-bar-fill" id="callProgressBar"></div>
-                    </div>
+        <!-- TAB 1: RUNNING STATUS -->
+        <div id="tab-status" class="tab-content active">
+            <!-- Metric Cards -->
+            <div class="grid-cards">
+                <div class="card">
+                    <div class="card-label">Active Calls</div>
+                    <div class="card-value" id="valActiveCalls">0</div>
+                    <div class="card-subtext" id="subActiveCalls">Max Capacity: -</div>
                 </div>
-                <div class="progress-item">
-                    <div class="progress-label-row">
-                        <span>Worker Pool Utilization</span>
-                        <span id="workerUsageText">0 / 0 (0%)</span>
-                    </div>
-                    <div class="progress-bar-bg">
-                        <div class="progress-bar-fill" id="workerProgressBar"></div>
-                    </div>
+                <div class="card">
+                    <div class="card-label">Active Workers</div>
+                    <div class="card-value" id="valActiveWorkers">0</div>
+                    <div class="card-subtext" id="subActiveWorkers">Max Workers: -</div>
                 </div>
-                <div class="progress-item" id="vramProgressRow" style="display:none;">
-                    <div class="progress-label-row">
-                        <span>GPU VRAM Usage (whole card, all tenants)</span>
-                        <span id="vramUsageText">- / - (0%)</span>
+                <div class="card">
+                    <div class="card-label">Reserve Slots</div>
+                    <div class="card-value" id="valReserveSlots">-</div>
+                    <div class="card-subtext">Reserved for Overlap Shadow</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">Server State</div>
+                    <div class="card-value" id="valServerState" style="font-size:1.4rem;">OK</div>
+                    <div class="card-subtext" id="subDraining">Draining: False</div>
+                </div>
+            </div>
+
+            <!-- Connection & Capacity Progress -->
+            <div class="section-card">
+                <div class="section-title">📊 Capacity & Resource Usage</div>
+                <div class="progress-group">
+                    <div class="progress-item">
+                        <div class="progress-label-row">
+                            <span>Active Concurrent Calls</span>
+                            <span id="callUsageText">0 / 0 (0%)</span>
+                        </div>
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="callProgressBar"></div>
+                        </div>
                     </div>
-                    <div class="progress-bar-bg">
-                        <div class="progress-bar-fill" id="vramProgressBar"></div>
+                    <div class="progress-item">
+                        <div class="progress-label-row">
+                            <span>Worker Pool Utilization</span>
+                            <span id="workerUsageText">0 / 0 (0%)</span>
+                        </div>
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="workerProgressBar"></div>
+                        </div>
+                    </div>
+                    <div class="progress-item" id="vramProgressRow" style="display:none;">
+                        <div class="progress-label-row">
+                            <span>GPU VRAM Usage (whole card, all tenants)</span>
+                            <span id="vramUsageText">- / - (0%)</span>
+                        </div>
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="vramProgressBar"></div>
+                        </div>
                     </div>
                 </div>
             </div>
-        </div>
 
-        <!-- Active Diarization Requests -->
-        <div class="section-card">
-            <div class="section-title">🎤 Active Diarization Requests</div>
-            <table class="kv-table" id="diarizeActiveTable">
-                <thead>
-                    <tr>
-                        <td class="kv-key col-id">ID</td>
-                        <td class="kv-key col-elapsed">Elapsed</td>
-                        <td class="kv-key col-info">Device</td>
-                    </tr>
-                </thead>
-                <tbody id="diarizeActiveTbody">
-                    <tr><td colspan="3" class="card-subtext">No active diarization requests</td></tr>
-                </tbody>
-            </table>
-        </div>
-
-        <!-- Active Transcript Requests -->
-        <div class="section-card">
-            <div class="section-title">📝 Active Transcript Requests</div>
-            <table class="kv-table" id="transcribeActiveTable">
-                <thead>
-                    <tr>
-                        <td class="kv-key col-id">ID</td>
-                        <td class="kv-key col-elapsed">Elapsed</td>
-                        <td class="kv-key col-info">Model</td>
-                    </tr>
-                </thead>
-                <tbody id="transcribeActiveTbody">
-                    <tr><td colspan="3" class="card-subtext">No active transcript requests</td></tr>
-                </tbody>
-            </table>
-        </div>
-
-        <!-- Active TTS Requests -->
-        <div class="section-card">
-            <div class="section-title">🔊 Active Speech Synthesis Requests</div>
-            <table class="kv-table" id="ttsActiveTable">
-                <thead>
-                    <tr>
-                        <td class="kv-key col-id">ID</td>
-                        <td class="kv-key col-elapsed">Elapsed</td>
-                        <td class="kv-key col-info">Model / Voice</td>
-                    </tr>
-                </thead>
-                <tbody id="ttsActiveTbody">
-                    <tr><td colspan="3" class="card-subtext">No active TTS requests</td></tr>
-                </tbody>
-            </table>
-        </div>
-
-        <!-- Supported Models by Service -->
-        <div class="section-card">
-            <div class="section-title">🧩 Supported Models by Service</div>
-            <div class="config-grid">
-                <div class="config-group">
-                    <div class="config-group-header">📞 Live Call &mdash; gRPC <code>Transcribe</code> (streaming)</div>
-                    <table class="kv-table" id="svcLiveCallTable">
-                        <tbody id="svcLiveCallTbody">
-                            <tr><td class="card-subtext">Loading...</td></tr>
-                        </tbody>
-                    </table>
+            <!-- Subsystem & GPU Telemetry Cards -->
+            <div class="grid-cards">
+                <div class="card">
+                    <div class="card-label">GPU VRAM Free</div>
+                    <div class="card-value" id="valGpuVramFree">-</div>
+                    <div class="card-subtext" id="subGpuVramTotal">of - total</div>
                 </div>
-                <div class="config-group">
-                    <div class="config-group-header">📝 Batch Transcript &mdash; <code>POST /v1/audio/transcriptions</code></div>
-                    <table class="kv-table" id="svcTranscriptTable">
-                        <tbody id="svcTranscriptTbody">
-                            <tr><td class="card-subtext">Loading...</td></tr>
-                        </tbody>
-                    </table>
+                <div class="card">
+                    <div class="card-label">GPU Utilization</div>
+                    <div class="card-value" id="valGpuUtil">-</div>
+                    <div class="card-subtext">Compute, whole card</div>
                 </div>
-                <div class="config-group">
-                    <div class="config-group-header">🎤 Diarization &mdash; <code>POST /v1/audio/diarization</code></div>
-                    <table class="kv-table" id="svcDiarizationTable">
-                        <tbody id="svcDiarizationTbody">
-                            <tr><td class="card-subtext">Loading...</td></tr>
-                        </tbody>
-                    </table>
+                <div class="card">
+                    <div class="card-label">Diarization Sessions</div>
+                    <div class="card-value" id="valDiarizeActive">0</div>
+                    <div class="card-subtext">Currently running</div>
                 </div>
-                <div class="config-group">
-                    <div class="config-group-header">🔊 Text-to-Speech &mdash; <code>POST /v1/audio/speech</code></div>
-                    <table class="kv-table" id="svcTtsTable">
-                        <tbody id="svcTTSTbody">
-                            <tr><td class="card-subtext">Loading...</td></tr>
-                        </tbody>
-                    </table>
+                <div class="card">
+                    <div class="card-label">Diarization Totals</div>
+                    <div class="card-value" id="valDiarizeTotals" style="font-size:1.1rem;">0 / 0 / 0</div>
+                    <div class="card-subtext">ok / failed / VRAM-rejected</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">Transcript Requests</div>
+                    <div class="card-value" id="valTranscribeActive">0</div>
+                    <div class="card-subtext">Currently running (POST /v1/audio/transcriptions)</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">Transcript Totals</div>
+                    <div class="card-value" id="valTranscribeTotals" style="font-size:1.1rem;">0 / 0 / 0 / 0</div>
+                    <div class="card-subtext">ok / fail / vram / cap</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">TTS Requests</div>
+                    <div class="card-value" id="valTtsActive">0</div>
+                    <div class="card-subtext">Currently running (POST /v1/audio/speech)</div>
+                </div>
+                <div class="card">
+                    <div class="card-label">TTS Totals</div>
+                    <div class="card-value" id="valTtsTotals" style="font-size:1.1rem;">0 / 0 / 0 / 0</div>
+                    <div class="card-subtext">ok / fail / vram / cap</div>
+                </div>
+            </div>
+
+            <!-- Active In-Flight Requests -->
+            <div class="section-card">
+                <div class="section-title">🎤 Active Diarization Requests</div>
+                <table class="kv-table" id="diarizeActiveTable">
+                    <thead>
+                        <tr>
+                            <td class="kv-key col-id">ID</td>
+                            <td class="kv-key col-elapsed">Elapsed</td>
+                            <td class="kv-key col-info">Device</td>
+                        </tr>
+                    </thead>
+                    <tbody id="diarizeActiveTbody">
+                        <tr><td colspan="3" class="card-subtext">No active diarization requests</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="section-card">
+                <div class="section-title">📝 Active Transcript Requests</div>
+                <table class="kv-table" id="transcribeActiveTable">
+                    <thead>
+                        <tr>
+                            <td class="kv-key col-id">ID</td>
+                            <td class="kv-key col-elapsed">Elapsed</td>
+                            <td class="kv-key col-info">Model</td>
+                        </tr>
+                    </thead>
+                    <tbody id="transcribeActiveTbody">
+                        <tr><td colspan="3" class="card-subtext">No active transcript requests</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="section-card">
+                <div class="section-title">🔊 Active Speech Synthesis Requests</div>
+                <table class="kv-table" id="ttsActiveTable">
+                    <thead>
+                        <tr>
+                            <td class="kv-key col-id">ID</td>
+                            <td class="kv-key col-elapsed">Elapsed</td>
+                            <td class="kv-key col-info">Model / Voice</td>
+                        </tr>
+                    </thead>
+                    <tbody id="ttsActiveTbody">
+                        <tr><td colspan="3" class="card-subtext">No active TTS requests</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- TAB 2: MODELS & ENDPOINTS -->
+        <div id="tab-models" class="tab-content">
+            <!-- Supported Models by Service -->
+            <div class="section-card">
+                <div class="section-title">🧩 Supported Models by Service</div>
+                <div class="config-grid">
+                    <div class="config-group">
+                        <div class="config-group-header">📞 Live Call &mdash; gRPC <code>Transcribe</code> (streaming)</div>
+                        <table class="kv-table" id="svcLiveCallTable">
+                            <tbody id="svcLiveCallTbody">
+                                <tr><td class="card-subtext">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="config-group">
+                        <div class="config-group-header">📝 Batch Transcript &mdash; <code>POST /v1/audio/transcriptions</code></div>
+                        <table class="kv-table" id="svcTranscriptTable">
+                            <tbody id="svcTranscriptTbody">
+                                <tr><td class="card-subtext">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="config-group">
+                        <div class="config-group-header">🎤 Diarization &mdash; <code>POST /v1/audio/diarization</code></div>
+                        <table class="kv-table" id="svcDiarizationTable">
+                            <tbody id="svcDiarizationTbody">
+                                <tr><td class="card-subtext">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="config-group">
+                        <div class="config-group-header">🔊 Text-to-Speech &mdash; <code>POST /v1/audio/speech</code></div>
+                        <table class="kv-table" id="svcTtsTable">
+                            <tbody id="svcTTSTbody">
+                                <tr><td class="card-subtext">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- API Links -->
+            <div class="section-card">
+                <div class="section-title">🔗 API & Telemetry Endpoints</div>
+                <div class="links-row">
+                    <a href="/api/health" target="_blank" class="btn-link">🏥 /api/health</a>
+                    <a href="/api/stats" target="_blank" class="btn-link">📈 /api/stats</a>
+                    <a href="/api/config" target="_blank" class="btn-link">🛠️ /api/config</a>
+                    <a href="/api/version" target="_blank" class="btn-link">ℹ️ /api/version</a>
+                    <a href="/v1/models" target="_blank" class="btn-link">🧩 /v1/models</a>
+                    <a href="/metrics" target="_blank" class="btn-link">📊 /metrics (Prometheus)</a>
                 </div>
             </div>
         </div>
 
-        <!-- Server Configuration -->
-        <div class="section-card">
-            <div class="section-title">⚙️ Server Configuration & Settings (<a href="/settings" style="color:inherit;">edit in Settings →</a>)</div>
-            <div class="config-grid">
-                <div class="config-group">
-                    <div class="config-group-header">Network & Engine</div>
-                    <table class="kv-table">
-                        <tr><td class="kv-key">grpc_host:port</td><td class="kv-val" id="cfgGrpc">-</td></tr>
-                        <tr><td class="kv-key">admin_host:port</td><td class="kv-val" id="cfgAdmin">-</td></tr>
-                        <tr><td class="kv-key">parakeet_backend</td><td class="kv-val" id="cfgBackendParakeet">-</td></tr>
-                        <tr><td class="kv-key">whisper_backend</td><td class="kv-val" id="cfgBackendWhisper">-</td></tr>
-                        <tr><td class="kv-key">parakeet_tdt_backend</td><td class="kv-val" id="cfgBackendParakeetTdt">-</td></tr>
-                        <tr><td class="kv-key">default_model</td><td class="kv-val" id="cfgModel">-</td></tr>
-                        <tr><td class="kv-key">diarization_model</td><td class="kv-val" id="cfgDiarizationModel">-</td></tr>
-                        <tr><td class="kv-key">tts_model</td><td class="kv-val" id="cfgTtsModel">-</td></tr>
-                        <tr><td class="kv-key">models_dir</td><td class="kv-val" id="cfgModelsDir">-</td></tr>
-                    </table>
-                </div>
-                <div class="config-group">
-                    <div class="config-group-header">Worker & Threading</div>
-                    <table class="kv-table">
-                        <tr><td class="kv-key">n_threads_per_worker</td><td class="kv-val" id="cfgThreads">-</td></tr>
-                        <tr><td class="kv-key">max_concurrent_calls</td><td class="kv-val" id="cfgMaxCalls">-</td></tr>
-                        <tr><td class="kv-key">reserve_slots</td><td class="kv-val" id="cfgReserve">-</td></tr>
-                        <tr><td class="kv-key">worker_rss_soft_kb</td><td class="kv-val" id="cfgRssSoft">-</td></tr>
-                        <tr><td class="kv-key">rotate_after_sec</td><td class="kv-val" id="cfgRotateAfter">-</td></tr>
-                    </table>
-                </div>
-                <div class="config-group">
-                    <div class="config-group-header">Timeouts & Safety</div>
-                    <table class="kv-table">
-                        <tr><td class="kv-key">queue_max_sec</td><td class="kv-val" id="cfgQueueMax">-</td></tr>
-                        <tr><td class="kv-key">ring_history_sec</td><td class="kv-val" id="cfgRingHist">-</td></tr>
-                        <tr><td class="kv-key">max_call_sec</td><td class="kv-val" id="cfgMaxCall">-</td></tr>
-                        <tr><td class="kv-key">idle_timeout_sec</td><td class="kv-val" id="cfgIdleTimeout">-</td></tr>
-                        <tr><td class="kv-key">drain_timeout_sec</td><td class="kv-val" id="cfgDrainTimeout">-</td></tr>
-                    </table>
-                </div>
-                <div class="config-group">
-                    <div class="config-group-header">Redaction & System</div>
-                    <table class="kv-table">
-                        <tr><td class="kv-key">transcript_log</td><td class="kv-val" id="cfgTranscriptLog">-</td></tr>
-                        <tr><td class="kv-key">audio_dump</td><td class="kv-val" id="cfgAudioDump">-</td></tr>
-                        <tr><td class="kv-key">allow_pii</td><td class="kv-val" id="cfgAllowPii">-</td></tr>
-                        <tr><td class="kv-key">build_version</td><td class="kv-val" id="verHash">-</td></tr>
-                        <tr><td class="kv-key">parakeet_ref</td><td class="kv-val" id="verParakeet">-</td></tr>
-                    </table>
+        <!-- TAB 3: CONFIGURATION & SETTINGS -->
+        <div id="tab-settings" class="tab-content">
+            <!-- Active Runtime Configuration Summary -->
+            <div class="section-card">
+                <div class="section-title">⚙️ Active Runtime Overview</div>
+                <div class="config-grid">
+                    <div class="config-group">
+                        <div class="config-group-header">Network & Engine</div>
+                        <table class="kv-table">
+                            <tr><td class="kv-key">grpc_host:port</td><td class="kv-val" id="cfgGrpc">-</td></tr>
+                            <tr><td class="kv-key">admin_host:port</td><td class="kv-val" id="cfgAdmin">-</td></tr>
+                            <tr><td class="kv-key">parakeet_backend</td><td class="kv-val" id="cfgBackendParakeet">-</td></tr>
+                            <tr><td class="kv-key">whisper_backend</td><td class="kv-val" id="cfgBackendWhisper">-</td></tr>
+                            <tr><td class="kv-key">parakeet_tdt_backend</td><td class="kv-val" id="cfgBackendParakeetTdt">-</td></tr>
+                            <tr><td class="kv-key">default_model</td><td class="kv-val" id="cfgModel">-</td></tr>
+                            <tr><td class="kv-key">diarization_model</td><td class="kv-val" id="cfgDiarizationModel">-</td></tr>
+                            <tr><td class="kv-key">tts_model</td><td class="kv-val" id="cfgTtsModel">-</td></tr>
+                            <tr><td class="kv-key">models_dir</td><td class="kv-val" id="cfgModelsDir">-</td></tr>
+                        </table>
+                    </div>
+                    <div class="config-group">
+                        <div class="config-group-header">Worker & Threading</div>
+                        <table class="kv-table">
+                            <tr><td class="kv-key">n_threads_per_worker</td><td class="kv-val" id="cfgThreads">-</td></tr>
+                            <tr><td class="kv-key">max_concurrent_calls</td><td class="kv-val" id="cfgMaxCalls">-</td></tr>
+                            <tr><td class="kv-key">reserve_slots</td><td class="kv-val" id="cfgReserve">-</td></tr>
+                            <tr><td class="kv-key">worker_rss_soft_kb</td><td class="kv-val" id="cfgRssSoft">-</td></tr>
+                            <tr><td class="kv-key">rotate_after_sec</td><td class="kv-val" id="cfgRotateAfter">-</td></tr>
+                        </table>
+                    </div>
+                    <div class="config-group">
+                        <div class="config-group-header">Timeouts & Safety</div>
+                        <table class="kv-table">
+                            <tr><td class="kv-key">queue_max_sec</td><td class="kv-val" id="cfgQueueMax">-</td></tr>
+                            <tr><td class="kv-key">ring_history_sec</td><td class="kv-val" id="cfgRingHist">-</td></tr>
+                            <tr><td class="kv-key">max_call_sec</td><td class="kv-val" id="cfgMaxCall">-</td></tr>
+                            <tr><td class="kv-key">idle_timeout_sec</td><td class="kv-val" id="cfgIdleTimeout">-</td></tr>
+                            <tr><td class="kv-key">drain_timeout_sec</td><td class="kv-val" id="cfgDrainTimeout">-</td></tr>
+                        </table>
+                    </div>
+                    <div class="config-group">
+                        <div class="config-group-header">Redaction & System</div>
+                        <table class="kv-table">
+                            <tr><td class="kv-key">transcript_log</td><td class="kv-val" id="cfgTranscriptLog">-</td></tr>
+                            <tr><td class="kv-key">audio_dump</td><td class="kv-val" id="cfgAudioDump">-</td></tr>
+                            <tr><td class="kv-key">allow_pii</td><td class="kv-val" id="cfgAllowPii">-</td></tr>
+                            <tr><td class="kv-key">build_version</td><td class="kv-val" id="verHash">-</td></tr>
+                            <tr><td class="kv-key">parakeet_ref</td><td class="kv-val" id="verParakeet">-</td></tr>
+                        </table>
+                    </div>
                 </div>
             </div>
-        </div>
 
-        <!-- API Links -->
-        <div class="section-card">
-            <div class="section-title">🔗 API & Telemetry Endpoints</div>
-            <div class="links-row">
-                <a href="/api/health" target="_blank" class="btn-link">🏥 /api/health</a>
-                <a href="/api/stats" target="_blank" class="btn-link">📈 /api/stats</a>
-                <a href="/api/config" target="_blank" class="btn-link">🛠️ /api/config</a>
-                <a href="/api/version" target="_blank" class="btn-link">ℹ️ /api/version</a>
-                <a href="/v1/models" target="_blank" class="btn-link">🧩 /v1/models</a>
-                <a href="/metrics" target="_blank" class="btn-link">📊 /metrics (Prometheus)</a>
+            <!-- Editable Settings Section -->
+            <div class="section-card">
+                <div class="settings-header-row">
+                    <div>
+                        <div class="section-title" style="border-bottom:none;margin-bottom:0.25rem;padding-bottom:0;">🛠️ Settings Configuration</div>
+                        <p style="color:var(--text-muted);font-size:0.85rem;">
+                            Fields badged <span class="badge hot" style="display:inline-flex;">hot</span> apply immediately on save.
+                            Fields badged <span class="badge restart" style="display:inline-flex;">restart required</span> persist to store and apply on next process start.
+                        </p>
+                    </div>
+                    <button id="saveBtn" disabled class="btn-primary">Save Changes</button>
+                </div>
+
+                <div id="banner"></div>
+
+                <div class="settings-toolbar">
+                    <div class="search-box">
+                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+                        <input type="text" id="settingsSearchInput" placeholder="Filter settings by name..." oninput="filterSettings()">
+                    </div>
+                    <div class="category-pills" id="categoryPills"></div>
+                </div>
+
+                <table class="settings-table">
+                    <thead>
+                        <tr>
+                            <th style="width:38%;">Setting</th>
+                            <th style="width:44%;">Value</th>
+                            <th style="width:18%;">Applies</th>
+                        </tr>
+                    </thead>
+                    <tbody id="settingsBody">
+                        <tr><td colspan="3" class="card-subtext">Loading settings...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Engine Backends -->
+            <div class="section-card">
+                <div class="section-title">🚀 Engine Backends</div>
+                <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:1rem;">
+                    Registered upstream artifacts (<code>live_stt/backends/registry.py</code>) and what is installed/activated on this process (<code>live_stt/backends/installer.py</code>).
+                </p>
+                <div id="backendsBanner"></div>
+                <table class="settings-table">
+                    <thead>
+                        <tr><th>Engine</th><th>Flavor</th><th>Registered tag</th><th>Wired</th><th>Installed versions</th><th>Actions</th></tr>
+                    </thead>
+                    <tbody id="backendsBody">
+                        <tr><td colspan="6" class="card-subtext">Loading backends...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Diarization Engines -->
+            <div class="section-card">
+                <div class="section-title">🎤 Diarization Engines</div>
+                <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:1rem;">
+                    Post-call speaker diarization dependency trees (pyannote.audio+torch, NVIDIA Sortformer). Install once per deployment under mounted data volume.
+                </p>
+                <div id="diarizationBanner"></div>
+                <table class="settings-table">
+                    <thead>
+                        <tr><th>Engine</th><th>Requirements file</th><th>Installed</th><th>Actions</th></tr>
+                    </thead>
+                    <tbody id="diarizationBody">
+                        <tr><td colspan="4" class="card-subtext">Loading diarization engines...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- TTS Engines -->
+            <div class="section-card">
+                <div class="section-title">🔊 Text-to-Speech Engines</div>
+                <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:1rem;">
+                    Text-to-speech engine dependency trees (kokoro, piper). Install once per deployment under mounted data volume.
+                </p>
+                <div id="ttsBanner"></div>
+                <table class="settings-table">
+                    <thead>
+                        <tr><th>Engine</th><th>Requirements file</th><th>Installed</th><th>Actions</th></tr>
+                    </thead>
+                    <tbody id="ttsBody">
+                        <tr><td colspan="4" class="card-subtext">Loading TTS engines...</td></tr>
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
@@ -676,8 +1031,45 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         const COPY_ICON_SVG = `<svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
         const CHECK_ICON_SVG = `<svg viewBox="0 0 24 24" style="stroke:var(--accent-green);"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
 
-        // Copy-to-clipboard for model names on the Supported Models by Service page
-        // so a full model key can be grabbed with one click.
+        // Tab Navigation
+        function switchTab(tabName) {
+            const tabs = ['status', 'models', 'settings'];
+            if (!tabs.includes(tabName)) tabName = 'status';
+
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.nav-tab').forEach(el => el.classList.remove('active'));
+
+            const targetContent = document.getElementById('tab-' + tabName);
+            const targetNav = document.getElementById('nav-' + tabName);
+            if (targetContent && targetNav) {
+                targetContent.classList.add('active');
+                targetNav.classList.add('active');
+                if (window.location.hash !== '#' + tabName) {
+                    history.replaceState(null, '', '#' + tabName);
+                }
+            }
+        }
+
+        function initTabs() {
+            let initialTab = 'status';
+            if (window.location.pathname === '/settings' || window.location.pathname.endsWith('/settings')) {
+                initialTab = 'settings';
+            }
+            const hash = (window.location.hash || '').replace('#', '');
+            if (['status', 'models', 'settings', 'config'].includes(hash)) {
+                initialTab = (hash === 'config') ? 'settings' : hash;
+            }
+            switchTab(initialTab);
+
+            window.addEventListener('hashchange', () => {
+                const h = (window.location.hash || '').replace('#', '');
+                if (['status', 'models', 'settings', 'config'].includes(h)) {
+                    switchTab((h === 'config') ? 'settings' : h);
+                }
+            });
+        }
+
+        // Copy-to-clipboard for model names
         function copyToClipboard(text, btn) {
             const done = () => {
                 btn.innerHTML = CHECK_ICON_SVG;
@@ -691,10 +1083,6 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         }
 
         function fallbackCopy(text, done) {
-            // Non-secure-context / older-browser fallback -- this admin
-            // dashboard is often reached over plain http:// on a home LAN,
-            // where navigator.clipboard is unavailable (Clipboard API is
-            // restricted to secure contexts).
             const ta = document.createElement('textarea');
             ta.value = text;
             ta.style.position = 'fixed';
@@ -756,6 +1144,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 document.getElementById('subActiveWorkers').innerText = 'Max Workers: ' + maxWorkers;
                 document.getElementById('subDraining').innerText = 'Draining: ' + (stats.draining ? 'True' : 'False');
 
+                const tabBadge = document.getElementById('tabBadgeCalls');
+                if (tabBadge) tabBadge.innerText = `${activeCalls} active`;
+
                 // Call Capacity Bar
                 const callPct = Math.min(100, Math.round((activeCalls / maxCalls) * 100));
                 document.getElementById('callUsageText').innerText = `${activeCalls} / ${maxCalls} (${callPct}%)`;
@@ -766,10 +1157,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 document.getElementById('workerUsageText').innerText = `${activeWorkers} / ${maxWorkers} (${workerPct}%)`;
                 document.getElementById('workerProgressBar').style.width = workerPct + '%';
 
-                // GPU / VRAM -- gpu.snapshot() is all-None together when
-                // nvidia-smi is unavailable (CPU backend / no GPU), never a
-                // mix of some real some None (see live_stt/gpu.py), so one
-                // null check covers the whole block.
+                // GPU / VRAM
                 const gpuInfo = stats.gpu || {};
                 const vramRow = document.getElementById('vramProgressRow');
                 if (gpuInfo.free_vram_mb != null && gpuInfo.total_vram_mb != null) {
@@ -792,11 +1180,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 document.getElementById('valGpuUtil').innerText =
                     gpuInfo.utilization_pct != null ? gpuInfo.utilization_pct + '%' : 'N/A';
 
-                // Diarization sessions -- see live_stt/diarize_sessions.py.
-                // Aggregate counters, plus a small live list of in-flight
-                // requests (opaque id / elapsed / device) -- a deliberate,
-                // narrow exception to "not a per-call registry" (see that
-                // module's docstring), not the full ASR-style registry.
+                // Diarization
                 const diar = stats.diarization || {};
                 document.getElementById('valDiarizeActive').innerText = diar.active ?? 0;
                 document.getElementById('valDiarizeTotals').innerText =
@@ -812,11 +1196,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     ).join('');
                 }
 
-                // Batch transcription requests -- see live_stt/transcribe_sessions.py.
-                // Same shape as diarization above (aggregate counters +
-                // small live list), plus a capacity-rejected count this
-                // path has and diarization doesn't (diarization has no
-                // WorkerBudget capacity gate, only VRAM).
+                // Batch transcription
                 const xscribe = stats.transcribe || {};
                 document.getElementById('valTranscribeActive').innerText = xscribe.active ?? 0;
                 document.getElementById('valTranscribeTotals').innerText =
@@ -832,7 +1212,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     ).join('');
                 }
 
-                // TTS synthesis requests -- see live_stt/tts_sessions.py.
+                // TTS synthesis
                 const tts = stats.tts || {};
                 document.getElementById('valTtsActive').innerText = tts.active ?? 0;
                 document.getElementById('valTtsTotals').innerText =
@@ -849,7 +1229,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 }
             }
 
-            // Config
+            // Config runtime overview
             if (config) {
                 document.getElementById('cfgGrpc').innerText = `${config.grpc_host}:${config.grpc_port}`;
                 document.getElementById('cfgAdmin').innerText = `${config.admin_host}:${config.admin_port}`;
@@ -865,7 +1245,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 document.getElementById('cfgMaxCalls').innerText = config.max_concurrent_calls ?? '-';
                 document.getElementById('cfgReserve').innerText = config.reserve_slots ?? '-';
                 document.getElementById('valReserveSlots').innerText = config.reserve_slots ?? '-';
-                
+
                 const softKb = config.worker_rss_soft_kb;
                 document.getElementById('cfgRssSoft').innerText = softKb ? `${Math.round(softKb / 1024)} MB` : '-';
                 document.getElementById('cfgRotateAfter').innerText = config.rotate_after_sec ? `${config.rotate_after_sec}s` : '-';
@@ -887,15 +1267,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 document.getElementById('verParakeet').innerText = version.parakeet_ref || 'dev';
             }
 
-            // Supported Models by Service -- derived from /v1/models
-            // (live_stt/models.py + live_stt/diarization_models.py, see
-            // admin_http.py's /v1/models handler), not a second hardcoded
-            // list: "Live Call" is ASR models with streaming_capable=true
-            // only (the gRPC Transcribe RPC rejects the rest -- see
-            // live_stt/servicer.py), "Batch Transcript" is EVERY ASR model
-            // (that endpoint is engine-agnostic, per-model capability
-            // doesn't matter there), "Diarization" is the separate
-            // diarization_models registry entirely.
+            // Supported Models
             const modelRow = (spec, badges) =>
                 `<tr><td class="kv-key"><span class="model-name-cell">${spec.id}${copyBtn(spec.id)}</span></td><td class="kv-val">${badges.filter(Boolean).join(', ') || '&mdash;'}</td></tr>`;
             const noModelsRow = '<tr><td class="card-subtext">No models registered</td></tr>';
@@ -950,121 +1322,84 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             }
         }
 
-        updateDashboard();
-        setInterval(updateDashboard, 3000);
-    </script>
-</body>
-</html>
-"""
+        // Settings Management
+        const SETTINGS_SECTIONS = [
+            {
+                id: "network",
+                name: "Network & Service Ports",
+                icon: "🌐",
+                keys: ["grpc_host", "grpc_port", "admin_host", "admin_port", "db_path"]
+            },
+            {
+                id: "asr",
+                name: "ASR Engines & Models",
+                icon: "🎙️",
+                keys: [
+                    "parakeet_backend", "whisper_backend", "parakeet_tdt_backend",
+                    "default_model", "models_dir",
+                    "worker_bin", "worker_ggml_lib_dir",
+                    "worker_bin_whisper", "worker_ggml_lib_dir_whisper",
+                    "worker_bin_parakeet_tdt", "worker_ggml_lib_dir_parakeet_tdt"
+                ]
+            },
+            {
+                id: "workers",
+                name: "Worker Pool & Concurrency",
+                icon: "⚡",
+                keys: [
+                    "n_threads_per_worker", "n_threads_whisper", "n_threads_parakeet_tdt",
+                    "max_concurrent_calls", "reserve_slots",
+                    "worker_rss_soft_kb", "rotate_after_sec", "rotation_overlap_sec"
+                ]
+            },
+            {
+                id: "gpu",
+                name: "GPU & VRAM Budgets",
+                icon: "🎮",
+                keys: ["vram_per_worker_mb", "vram_reserve_mb", "diarization_vram_mb", "tts_vram_mb"]
+            },
+            {
+                id: "timeouts",
+                name: "Timeouts & Lifecycle Safety",
+                icon: "⏱️",
+                keys: [
+                    "queue_max_sec", "ring_history_sec", "warn_behind_sec", "abort_behind_sec",
+                    "max_call_sec", "idle_timeout_sec", "finalize_timeout_sec", "drain_timeout_sec"
+                ]
+            },
+            {
+                id: "diarization",
+                name: "Speaker Diarization",
+                icon: "🎤",
+                keys: [
+                    "diarization_model", "diarization_device", "diarization_hf_token",
+                    "diarization_num_speakers", "diarization_min_speakers", "diarization_max_speakers",
+                    "diarize_in_subprocess", "diarization_deps_dir"
+                ]
+            },
+            {
+                id: "tts",
+                name: "Text-to-Speech (TTS)",
+                icon: "🔊",
+                keys: ["tts_model", "tts_voice", "tts_device", "tts_in_subprocess", "tts_deps_dir"]
+            },
+            {
+                id: "system",
+                name: "Redaction & Auto-Upgrade",
+                icon: "🔒",
+                keys: [
+                    "transcript_log", "audio_dump", "allow_pii",
+                    "auto_upgrade_enabled", "upgrade_check_interval_sec", "backends_dir"
+                ]
+            }
+        ];
 
-
-# LS-5: a deliberately generic (field-name, current-value) form rather than
-# a hand-crafted widget per Settings field -- Settings has 60+ fields and
-# hand-authoring each one would be a maintenance trap (a new field added to
-# live_stt/config.py would silently never appear here). Input type is
-# inferred client-side from the JSON value's JS type. Every field is shown
-# and editable; the badge communicates which of them actually take effect
-# immediately (HOT_RELOAD_FIELDS, live_stt/settings_store.py) vs. only on
-# the next process restart -- the store never pretends both are the same.
-HTML_SETTINGS_PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>⚙️ Live-STT Settings</title>
-    <style>
-        :root {
-            --bg-dark: #0f172a;
-            --panel-bg: #1e293b;
-            --panel-border: #334155;
-            --accent-blue: #38bdf8;
-            --accent-green: #10b981;
-            --accent-yellow: #f59e0b;
-            --accent-red: #ef4444;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-        }
-        body { background: var(--bg-dark); color: var(--text-main); font-family: -apple-system, sans-serif; margin: 0; padding: 24px; }
-        h1 { font-size: 1.4rem; }
-        a { color: var(--accent-blue); }
-        #banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; display: none; }
-        #banner.ok { display: block; background: rgba(16,185,129,0.15); border: 1px solid var(--accent-green); }
-        #banner.err { display: block; background: rgba(239,68,68,0.15); border: 1px solid var(--accent-red); }
-        table { width: 100%; border-collapse: collapse; background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 8px; overflow: hidden; }
-        th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--panel-border); font-size: 0.85rem; }
-        th { color: var(--text-muted); font-weight: 600; }
-        input[type=text], input[type=number] { background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--panel-border); border-radius: 4px; padding: 4px 8px; width: 100%; box-sizing: border-box; }
-        .badge { font-size: 0.7rem; padding: 2px 8px; border-radius: 999px; }
-        .badge.hot { background: rgba(16,185,129,0.2); color: var(--accent-green); }
-        .badge.restart { background: rgba(245,158,11,0.2); color: var(--accent-yellow); }
-        #saveBtn { margin-top: 16px; padding: 10px 20px; background: var(--accent-blue); color: #0f172a; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; }
-        #saveBtn:disabled { opacity: 0.5; cursor: default; }
-    </style>
-</head>
-<body>
-    <h1>⚙️ Live-STT Settings <a href="/">&larr; back to dashboard</a></h1>
-    <p style="color:var(--text-muted);">
-        Fields badged <span class="badge hot">hot</span> take effect immediately on save.
-        Fields badged <span class="badge restart">restart required</span> are persisted but
-        only take effect the next time this process starts (see live_stt/settings_store.py --
-        several fields are unsafe to change under a live worker pool).
-    </p>
-    <div id="banner"></div>
-    <table>
-        <thead><tr><th>Setting</th><th>Value</th><th>Applies</th></tr></thead>
-        <tbody id="settingsBody"><tr><td colspan="3">Loading...</td></tr></tbody>
-    </table>
-    <button id="saveBtn" disabled>Save Changes</button>
-
-    <h1 style="margin-top:32px;">Engine Backends</h1>
-    <p style="color:var(--text-muted);">
-        Registered upstream artifacts (live_stt/backends/registry.py) and what's
-        installed/activated on THIS process (live_stt/backends/installer.py) --
-        only "wired" engines actually change behavior when activated; see that
-        module's docstring.
-    </p>
-    <div id="backendsBanner"></div>
-    <table>
-        <thead><tr><th>Engine</th><th>Flavor</th><th>Registered tag</th><th>Wired</th><th>Installed versions</th><th>Actions</th></tr></thead>
-        <tbody id="backendsBody"><tr><td colspan="6">Loading...</td></tr></tbody>
-    </table>
-
-    <h1 style="margin-top:32px;">Diarization Engines</h1>
-    <p style="color:var(--text-muted);">
-        Post-call speaker diarization's heavy Python dependency trees (pyannote.audio+torch,
-        NVIDIA Sortformer/nemo_toolkit) -- deliberately NOT baked into this image (see
-        live_stt/diarization_installer.py's docstring). Install once per deployment; installs
-        persist under the mounted data volume and survive `docker recreate`, no restart needed --
-        an install takes effect on the very next diarization request.
-    </p>
-    <div id="diarizationBanner"></div>
-    <table>
-        <thead><tr><th>Engine</th><th>Requirements file</th><th>Installed</th><th>Actions</th></tr></thead>
-        <tbody id="diarizationBody"><tr><td colspan="4">Loading...</td></tr></tbody>
-    </table>
-
-    <h1 style="margin-top:32px;">TTS Engines</h1>
-    <p style="color:var(--text-muted);">
-        Text-to-speech's kokoro/piper dependency trees -- deliberately NOT baked into this
-        image (see live_stt/tts_installer.py's docstring). Install once per deployment; installs
-        persist under the mounted data volume and survive `docker recreate`, no restart needed --
-        an install takes effect on the very next /v1/audio/speech request. Before this UI existed,
-        an uninstalled engine silently returned a fake sine-wave tone instead of real speech with
-        no visible error -- that's fixed too (live_stt/tts.py now raises a clear error instead),
-        so a 502 here or a failed request elsewhere means exactly what it says.
-    </p>
-    <div id="ttsBanner"></div>
-    <table>
-        <thead><tr><th>Engine</th><th>Requirements file</th><th>Installed</th><th>Actions</th></tr></thead>
-        <tbody id="ttsBody"><tr><td colspan="4">Loading...</td></tr></tbody>
-    </table>
-
-    <script>
         let original = {};
         let hotFields = new Set();
         const dirty = {};
+        let activeCategory = 'all';
 
-        function cell(key, value) {
+        function cell(key, value, secId) {
             const isBool = (typeof value === 'boolean');
             const isNum = (typeof value === 'number');
             let input;
@@ -1078,7 +1413,7 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
             const badge = hotFields.has(key)
                 ? '<span class="badge hot">hot</span>'
                 : '<span class="badge restart">restart required</span>';
-            return `<tr><td>${key}</td><td>${input}</td><td>${badge}</td></tr>`;
+            return `<tr class="setting-row" data-key="${key}" data-section="${secId}"><td><code>${key}</code></td><td>${input}</td><td>${badge}</td></tr>`;
         }
 
         function markDirty(key, value) {
@@ -1093,23 +1428,90 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
         async function load() {
             const resp = await fetch('/api/settings');
             const doc = await resp.json();
-            original = doc.settings;
+            original = doc.settings || {};
             hotFields = new Set(doc.hot_reload_fields || []);
             const tbody = document.getElementById('settingsBody');
-            const keys = Object.keys(original).sort();
-            tbody.innerHTML = keys.map((k) => cell(k, original[k])).join('');
-            tbody.querySelectorAll('input').forEach((el) => {
+
+            const allKeys = new Set(Object.keys(original));
+            const assignedKeys = new Set();
+
+            let html = '';
+            for (const sec of SETTINGS_SECTIONS) {
+                const secKeys = sec.keys.filter(k => k in original);
+                secKeys.forEach(k => assignedKeys.add(k));
+                if (secKeys.length > 0) {
+                    html += `<tr class="section-divider-row" data-section="${sec.id}"><td colspan="3"><div class="section-divider-title">${sec.icon} ${sec.name}</div></td></tr>`;
+                    html += secKeys.map(k => cell(k, original[k], sec.id)).join('');
+                }
+            }
+
+            const remainingKeys = Array.from(allKeys).filter(k => !assignedKeys.has(k)).sort();
+            if (remainingKeys.length > 0) {
+                html += `<tr class="section-divider-row" data-section="other"><td colspan="3"><div class="section-divider-title">📦 Other Settings</div></td></tr>`;
+                html += remainingKeys.map(k => cell(k, original[k], 'other')).join('');
+            }
+
+            tbody.innerHTML = html || '<tr><td colspan="3" class="card-subtext">No settings found</td></tr>';
+
+            tbody.querySelectorAll('input').forEach(el => {
                 el.addEventListener('input', () => {
                     const key = el.dataset.key;
-                    let value = el.value;
-                    if (el.type === 'checkbox') value = el.checked;
-                    else if (el.type === 'number') value = value === '' ? null : Number(value);
-                    markDirty(key, value);
+                    let val = el.value;
+                    if (el.type === 'checkbox') val = el.checked;
+                    else if (el.type === 'number') val = val === '' ? null : Number(val);
+                    markDirty(key, val);
                 });
             });
+
+            renderCategoryPills(SETTINGS_SECTIONS, remainingKeys.length > 0);
+
             if (doc.store_available === false) {
                 showBanner('err', 'No settings store configured on this process -- changes cannot be saved (see live_stt/server.py).');
             }
+        }
+
+        function renderCategoryPills(sections, hasOther) {
+            const container = document.getElementById('categoryPills');
+            let pills = `<button class="cat-pill ${activeCategory === 'all' ? 'active' : ''}" onclick="setCategoryFilter('all', this)">All</button>`;
+            sections.forEach(s => {
+                pills += `<button class="cat-pill ${activeCategory === s.id ? 'active' : ''}" onclick="setCategoryFilter('${s.id}', this)">${s.icon} ${s.name.split(' ')[0]}</button>`;
+            });
+            if (hasOther) {
+                pills += `<button class="cat-pill ${activeCategory === 'other' ? 'active' : ''}" onclick="setCategoryFilter('other', this)">📦 Other</button>`;
+            }
+            container.innerHTML = pills;
+        }
+
+        function setCategoryFilter(cat, btn) {
+            activeCategory = cat;
+            document.querySelectorAll('.cat-pill').forEach(p => p.classList.remove('active'));
+            if (btn) btn.classList.add('active');
+            filterSettings();
+        }
+
+        function filterSettings() {
+            const query = (document.getElementById('settingsSearchInput').value || '').toLowerCase().trim();
+            const rows = document.querySelectorAll('#settingsBody tr.setting-row');
+            const secDividers = document.querySelectorAll('#settingsBody tr.section-divider-row');
+
+            const visibleSections = new Set();
+            rows.forEach(r => {
+                const key = r.dataset.key || '';
+                const sec = r.dataset.section || '';
+                const matchesCat = (activeCategory === 'all' || sec === activeCategory);
+                const matchesQuery = !query || key.toLowerCase().includes(query);
+                if (matchesCat && matchesQuery) {
+                    r.style.display = '';
+                    visibleSections.add(sec);
+                } else {
+                    r.style.display = 'none';
+                }
+            });
+
+            secDividers.forEach(d => {
+                const sec = d.dataset.section || '';
+                d.style.display = visibleSections.has(sec) ? '' : 'none';
+            });
         }
 
         function showBanner(kind, text) {
@@ -1179,11 +1581,11 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
             const doc = await resp.json();
             const tbody = document.getElementById('backendsBody');
             if (doc.store_available === false) {
-                tbody.innerHTML = '<tr><td colspan="6">No settings store configured on this process.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" class="card-subtext">No settings store configured on this process.</td></tr>';
                 return;
             }
-            const rows = doc.registered.map((spec) => {
-                const installedVersions = doc.installed.filter(
+            const rows = (doc.registered || []).map((spec) => {
+                const installedVersions = (doc.installed || []).filter(
                     (b) => b.engine === spec.engine && b.flavor === spec.flavor
                 );
                 const versionsText = installedVersions.length
@@ -1194,11 +1596,11 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
                     .filter((b) => !b.active)
                     .map((b) => `<button onclick="activateBackend('${spec.engine}','${spec.flavor}','${b.version}')">Activate ${b.version}</button>`)
                     .join(' ');
-                return `<tr><td>${spec.engine}</td><td>${spec.flavor}</td><td>${spec.tag}</td>` +
+                return `<tr><td><code>${spec.engine}</code></td><td>${spec.flavor}</td><td>${spec.tag}</td>` +
                     `<td>${spec.wired ? 'yes' : 'no (registered only)'}</td>` +
                     `<td>${versionsText}</td><td>${installBtn} ${activateBtns}</td></tr>`;
             });
-            tbody.innerHTML = rows.join('') || '<tr><td colspan="6">No backends registered.</td></tr>';
+            tbody.innerHTML = rows.join('') || '<tr><td colspan="6" class="card-subtext">No backends registered.</td></tr>';
         }
 
         function showDiarizationBanner(kind, text) {
@@ -1231,10 +1633,10 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
                 const installBtn = info.installed
                     ? ''
                     : `<button onclick="installDiarizationEngine('${engine}')">Install</button>`;
-                return `<tr><td>${engine}</td><td>${info.requirements_file}</td>` +
+                return `<tr><td><code>${engine}</code></td><td>${info.requirements_file}</td>` +
                     `<td>${info.installed ? 'yes' : 'no'}</td><td>${installBtn}</td></tr>`;
             });
-            tbody.innerHTML = rows.join('') || '<tr><td colspan="4">No diarization engines registered.</td></tr>';
+            tbody.innerHTML = rows.join('') || '<tr><td colspan="4" class="card-subtext">No diarization engines registered.</td></tr>';
         }
 
         function showTtsBanner(kind, text) {
@@ -1267,21 +1669,29 @@ HTML_SETTINGS_PAGE = """<!DOCTYPE html>
                 const installBtn = info.installed
                     ? ''
                     : `<button onclick="installTtsEngine('${engine}')">Install</button>`;
-                return `<tr><td>${engine}</td><td>${info.requirements_file}</td>` +
+                return `<tr><td><code>${engine}</code></td><td>${info.requirements_file}</td>` +
                     `<td>${info.installed ? 'yes' : 'no'}</td><td>${installBtn}</td></tr>`;
             });
-            tbody.innerHTML = rows.join('') || '<tr><td colspan="4">No TTS engines registered.</td></tr>';
+            tbody.innerHTML = rows.join('') || '<tr><td colspan="4" class="card-subtext">No TTS engines registered.</td></tr>';
         }
 
+        // Initialize UI
+        initTabs();
         document.getElementById('saveBtn').addEventListener('click', save);
+        updateDashboard();
         load();
         loadBackends();
         loadDiarizationEngines();
         loadTtsEngines();
+        setInterval(updateDashboard, 3000);
     </script>
 </body>
 </html>
 """
+
+# Settings page uses the unified multi-page dashboard UI, pre-routed to #settings
+HTML_SETTINGS_PAGE = HTML_STATS_PAGE
+
 
 
 def _settings_doc(state: ServerState) -> dict:

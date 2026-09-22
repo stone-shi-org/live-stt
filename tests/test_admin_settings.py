@@ -89,6 +89,35 @@ async def test_settings_page_includes_tts_engines_install_ui() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dashboard_ui_multi_tab_navigation_and_sectioned_settings() -> None:
+    # LS-6: Multi-page tabbed navigation (Running Status, Models & Endpoints,
+    # and Configuration & Settings) with search and sectioned categories.
+    server = serve_admin_http("127.0.0.1", 0, _state())
+    try:
+        port = server.server_address[1]
+        for path in ("/", "/dashboard", "/stats", "/settings"):
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as resp:
+                assert resp.status == 200
+                body = resp.read().decode()
+                # Menu tabs
+                assert 'id="nav-status"' in body
+                assert 'id="nav-models"' in body
+                assert 'id="nav-settings"' in body
+                assert "switchTab(" in body
+                # Tab content containers
+                assert 'id="tab-status"' in body
+                assert 'id="tab-models"' in body
+                assert 'id="tab-settings"' in body
+                # Settings toolbar & sectioned grouping
+                assert 'id="settingsSearchInput"' in body
+                assert 'id="categoryPills"' in body
+                assert "SETTINGS_SECTIONS" in body
+                assert "settingsBody" in body
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_get_api_settings_reports_store_unavailable_when_none_configured() -> None:
     server = serve_admin_http("127.0.0.1", 0, _state(settings_store=None))
     try:
