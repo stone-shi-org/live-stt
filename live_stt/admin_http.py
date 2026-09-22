@@ -83,7 +83,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         header {
             background: linear-gradient(135deg, #1e1b4b 0%, #0f172a 100%);
             border-bottom: 1px solid var(--panel-border);
-            padding: 1.25rem 2rem;
+            padding: 1.15rem 2rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -99,7 +99,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         .logo-icon {
             font-size: 1.85rem;
             background: rgba(99, 102, 241, 0.2);
-            padding: 0.5rem 0.6rem;
+            padding: 0.45rem 0.55rem;
             border-radius: 12px;
             border: 1px solid rgba(99, 102, 241, 0.4);
             display: inline-flex;
@@ -213,115 +213,403 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         .container {
             max-width: 1400px;
             width: 100%;
-            margin: 1.5rem auto 0 auto;
+            margin: 1.25rem auto 0 auto;
             padding: 0 1.5rem;
         }
 
         .tab-content {
             display: none;
             flex-direction: column;
-            gap: 1.5rem;
+            gap: 1.25rem;
         }
 
         .tab-content.active {
             display: flex;
         }
 
-        .grid-cards {
+        /* Compact KPI Strip */
+        .kpi-strip {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 1.25rem;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 0.85rem;
         }
 
-        .card {
-            background-color: var(--panel-bg);
+        .kpi-pill {
+            background: var(--panel-bg);
             border: 1px solid var(--panel-border);
-            border-radius: 14px;
-            padding: 1.25rem;
+            border-radius: 12px;
+            padding: 0.75rem 1rem;
             display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-            transition: transform 0.15s ease, border-color 0.15s ease;
+            align-items: center;
+            gap: 0.75rem;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            transition: border-color 0.15s;
         }
 
-        .card:hover {
+        .kpi-pill:hover {
             border-color: rgba(99, 102, 241, 0.35);
         }
 
-        .card-label {
-            font-size: 0.8rem;
+        .kpi-icon {
+            font-size: 1.35rem;
+            background: rgba(255,255,255,0.04);
+            padding: 0.4rem;
+            border-radius: 10px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .kpi-data {
+            display: flex;
+            flex-direction: column;
+            gap: 0.15rem;
+            min-width: 0;
+        }
+
+        .kpi-label {
+            font-size: 0.7rem;
             font-weight: 600;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.05em;
         }
 
-        .card-value {
-            font-size: 1.8rem;
+        .kpi-val {
+            font-size: 1.15rem;
             font-weight: 700;
             font-family: 'JetBrains Mono', monospace;
             color: var(--text-main);
+            display: flex;
+            align-items: baseline;
+            gap: 0.35rem;
         }
 
-        .card-subtext {
-            font-size: 0.8rem;
+        .kpi-sub {
+            font-size: 0.75rem;
             color: var(--text-muted);
+            font-weight: 400;
+        }
+
+        .kpi-badge {
+            margin-left: auto;
+            font-size: 0.7rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 9999px;
+            background: rgba(255,255,255,0.06);
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* Charts Grid */
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
+            gap: 1.25rem;
         }
 
         .section-card {
             background-color: var(--panel-bg);
             border: 1px solid var(--panel-border);
             border-radius: 16px;
-            padding: 1.5rem;
+            padding: 1.25rem;
             box-shadow: 0 4px 12px rgba(0,0,0,0.15);
         }
 
         .section-title {
-            font-size: 1.1rem;
+            font-size: 0.95rem;
             font-weight: 600;
-            margin-bottom: 1.25rem;
+            margin-bottom: 1rem;
             display: flex;
             align-items: center;
-            gap: 0.6rem;
+            justify-content: space-between;
             color: var(--accent-blue);
             border-bottom: 1px solid var(--panel-border);
-            padding-bottom: 0.75rem;
+            padding-bottom: 0.65rem;
         }
 
-        .progress-group {
+        .live-tag {
+            font-size: 0.7rem;
+            color: var(--accent-green);
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            font-weight: 600;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* Circular Gauges */
+        .gauges-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 0.85rem;
+            margin-bottom: 0.85rem;
+        }
+
+        .gauge-container {
             display: flex;
             flex-direction: column;
-            gap: 1rem;
+            align-items: center;
+            text-align: center;
+            background: rgba(15, 23, 42, 0.45);
+            border: 1px solid var(--panel-border);
+            border-radius: 12px;
+            padding: 0.85rem 0.5rem;
+            gap: 0.55rem;
         }
 
-        .progress-item {
+        .gauge-svg-wrap {
+            position: relative;
+            width: 82px;
+            height: 82px;
+        }
+
+        .gauge-svg {
+            width: 100%;
+            height: 100%;
+            transform: rotate(-90deg);
+        }
+
+        .gauge-track {
+            fill: none;
+            stroke: rgba(255, 255, 255, 0.06);
+            stroke-width: 8;
+        }
+
+        .gauge-fill {
+            fill: none;
+            stroke-width: 8;
+            stroke-linecap: round;
+            stroke-dasharray: 263.894;
+            stroke-dashoffset: 263.894;
+            transition: stroke-dashoffset 0.5s ease;
+        }
+
+        .calls-gauge { stroke: var(--accent-blue); background: var(--accent-blue); }
+        .workers-gauge { stroke: var(--accent-indigo); background: var(--accent-indigo); }
+        .vram-gauge { stroke: #a855f7; background: #a855f7; }
+
+        .gauge-center {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .gauge-pct {
+            font-size: 1.05rem;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-main);
+        }
+
+        .gauge-unit {
+            font-size: 0.65rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+
+        .gauge-info {
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+        }
+
+        .gauge-name {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--text-main);
+        }
+
+        .gauge-detail {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .mini-bar-bg {
+            height: 4px;
+            background: rgba(255,255,255,0.06);
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 0.2rem;
+        }
+
+        .mini-bar-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.4s ease;
+        }
+
+        /* Sparkline */
+        .sparkline-section {
+            background: rgba(15, 23, 42, 0.45);
+            border: 1px solid var(--panel-border);
+            border-radius: 12px;
+            padding: 0.85rem;
             display: flex;
             flex-direction: column;
             gap: 0.4rem;
         }
 
-        .progress-label-row {
+        .sparkline-header {
             display: flex;
             justify-content: space-between;
-            font-size: 0.85rem;
-            font-weight: 500;
+            align-items: center;
+            font-size: 0.75rem;
+            color: var(--text-muted);
         }
 
-        .progress-bar-bg {
-            height: 10px;
-            background-color: rgba(15, 23, 42, 0.8);
+        .sparkline-title {
+            font-weight: 600;
+        }
+
+        .sparkline-legend {
+            display: flex;
+            align-items: center;
+            font-size: 0.7rem;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .legend-dot {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            margin-right: 4px;
+        }
+
+        .sparkline-svg-wrap {
+            width: 100%;
+            height: 70px;
+        }
+
+        .sparkline-svg {
+            width: 100%;
+            height: 100%;
+            overflow: visible;
+        }
+
+        /* Outcome Distribution Bars */
+        .outcome-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        .outcome-box {
+            background: rgba(15, 23, 42, 0.45);
+            border: 1px solid var(--panel-border);
+            border-radius: 12px;
+            padding: 0.75rem 0.95rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
+        }
+
+        .outcome-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .outcome-name {
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text-main);
+        }
+
+        .outcome-name code {
+            font-size: 0.75rem;
+            background: rgba(255,255,255,0.06);
+            padding: 0.1rem 0.35rem;
+            border-radius: 4px;
+            color: var(--accent-blue);
+        }
+
+        .outcome-active-badge {
+            font-size: 0.75rem;
+            color: var(--accent-green);
+            background: rgba(16, 185, 129, 0.12);
+            border: 1px solid rgba(16, 185, 129, 0.25);
+            border-radius: 9999px;
+            padding: 0.15rem 0.6rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 600;
+        }
+
+        .stacked-bar {
+            height: 9px;
+            background: rgba(15, 23, 42, 0.8);
             border-radius: 6px;
             overflow: hidden;
+            display: flex;
             border: 1px solid var(--panel-border);
         }
 
-        .progress-bar-fill {
+        .bar-seg {
             height: 100%;
-            background: linear-gradient(90deg, var(--accent-indigo), var(--accent-blue));
-            width: 0%;
             transition: width 0.4s ease;
-            border-radius: 6px;
+        }
+
+        .seg-ok { background: var(--accent-green); }
+        .seg-fail { background: var(--accent-red); }
+        .seg-vram { background: var(--accent-yellow); }
+        .seg-cap { background: #c084fc; }
+
+        .outcome-metrics {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            font-size: 0.72rem;
+        }
+
+        .metric-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            color: var(--text-muted);
+        }
+
+        .metric-pill strong {
+            color: var(--text-main);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+        }
+        .dot.ok { background: var(--accent-green); }
+        .dot.fail { background: var(--accent-red); }
+        .dot.vram { background: var(--accent-yellow); }
+        .dot.cap { background: #c084fc; }
+
+        .raw-total-text {
+            margin-left: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            color: var(--text-muted);
+        }
+
+        /* Requests Grid at Bottom */
+        .requests-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+            gap: 1.25rem;
+        }
+
+        .request-table-card {
+            margin-bottom: 0;
         }
 
         .config-grid {
@@ -677,155 +965,276 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
     <div class="container">
         <!-- TAB 1: RUNNING STATUS -->
         <div id="tab-status" class="tab-content active">
-            <!-- Metric Cards -->
-            <div class="grid-cards">
-                <div class="card">
-                    <div class="card-label">Active Calls</div>
-                    <div class="card-value" id="valActiveCalls">0</div>
-                    <div class="card-subtext" id="subActiveCalls">Max Capacity: -</div>
-                </div>
-                <div class="card">
-                    <div class="card-label">Active Workers</div>
-                    <div class="card-value" id="valActiveWorkers">0</div>
-                    <div class="card-subtext" id="subActiveWorkers">Max Workers: -</div>
-                </div>
-                <div class="card">
-                    <div class="card-label">Reserve Slots</div>
-                    <div class="card-value" id="valReserveSlots">-</div>
-                    <div class="card-subtext">Reserved for Overlap Shadow</div>
-                </div>
-                <div class="card">
-                    <div class="card-label">Server State</div>
-                    <div class="card-value" id="valServerState" style="font-size:1.4rem;">OK</div>
-                    <div class="card-subtext" id="subDraining">Draining: False</div>
-                </div>
-            </div>
-
-            <!-- Connection & Capacity Progress -->
-            <div class="section-card">
-                <div class="section-title">📊 Capacity & Resource Usage</div>
-                <div class="progress-group">
-                    <div class="progress-item">
-                        <div class="progress-label-row">
-                            <span>Active Concurrent Calls</span>
-                            <span id="callUsageText">0 / 0 (0%)</span>
-                        </div>
-                        <div class="progress-bar-bg">
-                            <div class="progress-bar-fill" id="callProgressBar"></div>
-                        </div>
-                    </div>
-                    <div class="progress-item">
-                        <div class="progress-label-row">
-                            <span>Worker Pool Utilization</span>
-                            <span id="workerUsageText">0 / 0 (0%)</span>
-                        </div>
-                        <div class="progress-bar-bg">
-                            <div class="progress-bar-fill" id="workerProgressBar"></div>
-                        </div>
-                    </div>
-                    <div class="progress-item" id="vramProgressRow" style="display:none;">
-                        <div class="progress-label-row">
-                            <span>GPU VRAM Usage (whole card, all tenants)</span>
-                            <span id="vramUsageText">- / - (0%)</span>
-                        </div>
-                        <div class="progress-bar-bg">
-                            <div class="progress-bar-fill" id="vramProgressBar"></div>
-                        </div>
+            <!-- Compact KPI Strip -->
+            <div class="kpi-strip">
+                <div class="kpi-pill">
+                    <span class="kpi-icon">📞</span>
+                    <div class="kpi-data">
+                        <div class="kpi-label">Active Calls</div>
+                        <div class="kpi-val"><span id="valActiveCalls">0</span> <span class="kpi-sub" id="subActiveCalls">/ Max -</span></div>
                     </div>
                 </div>
-            </div>
-
-            <!-- Subsystem & GPU Telemetry Cards -->
-            <div class="grid-cards">
-                <div class="card">
-                    <div class="card-label">GPU VRAM Free</div>
-                    <div class="card-value" id="valGpuVramFree">-</div>
-                    <div class="card-subtext" id="subGpuVramTotal">of - total</div>
+                <div class="kpi-pill">
+                    <span class="kpi-icon">👷</span>
+                    <div class="kpi-data">
+                        <div class="kpi-label">Active Workers</div>
+                        <div class="kpi-val"><span id="valActiveWorkers">0</span> <span class="kpi-sub" id="subActiveWorkers">/ Max -</span></div>
+                    </div>
                 </div>
-                <div class="card">
-                    <div class="card-label">GPU Utilization</div>
-                    <div class="card-value" id="valGpuUtil">-</div>
-                    <div class="card-subtext">Compute, whole card</div>
+                <div class="kpi-pill">
+                    <span class="kpi-icon">🛡️</span>
+                    <div class="kpi-data">
+                        <div class="kpi-label">Reserve Slots</div>
+                        <div class="kpi-val" id="valReserveSlots">-</div>
+                    </div>
                 </div>
-                <div class="card">
-                    <div class="card-label">Diarization Sessions</div>
-                    <div class="card-value" id="valDiarizeActive">0</div>
-                    <div class="card-subtext">Currently running</div>
+                <div class="kpi-pill">
+                    <span class="kpi-icon">🖥️</span>
+                    <div class="kpi-data">
+                        <div class="kpi-label">Server State</div>
+                        <div class="kpi-val" id="valServerState">OK</div>
+                    </div>
+                    <span class="kpi-badge" id="subDraining">Draining: False</span>
                 </div>
-                <div class="card">
-                    <div class="card-label">Diarization Totals</div>
-                    <div class="card-value" id="valDiarizeTotals" style="font-size:1.1rem;">0 / 0 / 0</div>
-                    <div class="card-subtext">ok / failed / VRAM-rejected</div>
-                </div>
-                <div class="card">
-                    <div class="card-label">Transcript Requests</div>
-                    <div class="card-value" id="valTranscribeActive">0</div>
-                    <div class="card-subtext">Currently running (POST /v1/audio/transcriptions)</div>
-                </div>
-                <div class="card">
-                    <div class="card-label">Transcript Totals</div>
-                    <div class="card-value" id="valTranscribeTotals" style="font-size:1.1rem;">0 / 0 / 0 / 0</div>
-                    <div class="card-subtext">ok / fail / vram / cap</div>
-                </div>
-                <div class="card">
-                    <div class="card-label">TTS Requests</div>
-                    <div class="card-value" id="valTtsActive">0</div>
-                    <div class="card-subtext">Currently running (POST /v1/audio/speech)</div>
-                </div>
-                <div class="card">
-                    <div class="card-label">TTS Totals</div>
-                    <div class="card-value" id="valTtsTotals" style="font-size:1.1rem;">0 / 0 / 0 / 0</div>
-                    <div class="card-subtext">ok / fail / vram / cap</div>
+                <div class="kpi-pill" id="kpiGpuPill">
+                    <span class="kpi-icon">🎮</span>
+                    <div class="kpi-data">
+                        <div class="kpi-label">GPU Free VRAM</div>
+                        <div class="kpi-val"><span id="valGpuVramFree">-</span> <span class="kpi-sub" id="subGpuVramTotal">of -</span></div>
+                    </div>
+                    <span class="kpi-badge" id="valGpuUtil">-</span>
                 </div>
             </div>
 
-            <!-- Active In-Flight Requests -->
-            <div class="section-card">
-                <div class="section-title">🎤 Active Diarization Requests</div>
-                <table class="kv-table" id="diarizeActiveTable">
-                    <thead>
-                        <tr>
-                            <td class="kv-key col-id">ID</td>
-                            <td class="kv-key col-elapsed">Elapsed</td>
-                            <td class="kv-key col-info">Device</td>
-                        </tr>
-                    </thead>
-                    <tbody id="diarizeActiveTbody">
-                        <tr><td colspan="3" class="card-subtext">No active diarization requests</td></tr>
-                    </tbody>
-                </table>
+            <!-- Charts Section (2 Columns) -->
+            <div class="charts-grid">
+                <!-- Column 1: Resource Capacity Gauges & Sparkline -->
+                <div class="section-card">
+                    <div class="section-title">
+                        <span>📈 Resource Capacity & Real-Time Telemetry</span>
+                        <span class="live-tag"><span class="pulse-dot"></span> LIVE 3s</span>
+                    </div>
+
+                    <div class="gauges-row">
+                        <!-- Gauge 1: Calls -->
+                        <div class="gauge-container">
+                            <div class="gauge-svg-wrap">
+                                <svg viewBox="0 0 100 100" class="gauge-svg">
+                                    <circle cx="50" cy="50" r="42" class="gauge-track" />
+                                    <circle cx="50" cy="50" r="42" class="gauge-fill calls-gauge" id="gaugeCircleCalls" />
+                                </svg>
+                                <div class="gauge-center">
+                                    <span class="gauge-pct" id="gaugePctCalls">0%</span>
+                                    <span class="gauge-unit">Calls</span>
+                                </div>
+                            </div>
+                            <div class="gauge-info">
+                                <div class="gauge-name">Call Capacity</div>
+                                <div class="gauge-detail" id="callUsageText">0 / 0 (0%)</div>
+                                <div class="mini-bar-bg"><div class="mini-bar-fill calls-gauge" id="callProgressBar" style="width:0%"></div></div>
+                            </div>
+                        </div>
+
+                        <!-- Gauge 2: Workers -->
+                        <div class="gauge-container">
+                            <div class="gauge-svg-wrap">
+                                <svg viewBox="0 0 100 100" class="gauge-svg">
+                                    <circle cx="50" cy="50" r="42" class="gauge-track" />
+                                    <circle cx="50" cy="50" r="42" class="gauge-fill workers-gauge" id="gaugeCircleWorkers" />
+                                </svg>
+                                <div class="gauge-center">
+                                    <span class="gauge-pct" id="gaugePctWorkers">0%</span>
+                                    <span class="gauge-unit">Workers</span>
+                                </div>
+                            </div>
+                            <div class="gauge-info">
+                                <div class="gauge-name">Worker Pool</div>
+                                <div class="gauge-detail" id="workerUsageText">0 / 0 (0%)</div>
+                                <div class="mini-bar-bg"><div class="mini-bar-fill workers-gauge" id="workerProgressBar" style="width:0%"></div></div>
+                            </div>
+                        </div>
+
+                        <!-- Gauge 3: GPU VRAM -->
+                        <div class="gauge-container" id="vramProgressRow">
+                            <div class="gauge-svg-wrap">
+                                <svg viewBox="0 0 100 100" class="gauge-svg">
+                                    <circle cx="50" cy="50" r="42" class="gauge-track" />
+                                    <circle cx="50" cy="50" r="42" class="gauge-fill vram-gauge" id="gaugeCircleVram" />
+                                </svg>
+                                <div class="gauge-center">
+                                    <span class="gauge-pct" id="gaugePctVram">0%</span>
+                                    <span class="gauge-unit">VRAM</span>
+                                </div>
+                            </div>
+                            <div class="gauge-info">
+                                <div class="gauge-name">GPU VRAM</div>
+                                <div class="gauge-detail" id="vramUsageText">- / - (0%)</div>
+                                <div class="mini-bar-bg"><div class="mini-bar-fill vram-gauge" id="vramProgressBar" style="width:0%"></div></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Sparkline Live Trend -->
+                    <div class="sparkline-section">
+                        <div class="sparkline-header">
+                            <span class="sparkline-title">Real-Time Activity Stream Waveform (Last 90s)</span>
+                            <div class="sparkline-legend">
+                                <span class="legend-dot" style="background:var(--accent-blue);"></span> Calls
+                                <span class="legend-dot" style="background:var(--accent-indigo);margin-left:8px;"></span> Workers
+                            </div>
+                        </div>
+                        <div class="sparkline-svg-wrap">
+                            <svg id="activitySparkline" viewBox="0 0 400 70" preserveAspectRatio="none" class="sparkline-svg">
+                                <defs>
+                                    <linearGradient id="callsGrad" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="0%" stop-color="var(--accent-blue)" stop-opacity="0.35" />
+                                        <stop offset="100%" stop-color="var(--accent-blue)" stop-opacity="0.0" />
+                                    </linearGradient>
+                                </defs>
+                                <line x1="0" y1="35" x2="400" y2="35" stroke="rgba(255,255,255,0.06)" stroke-dasharray="3,3" />
+                                <path id="sparklineAreaCalls" d="" fill="url(#callsGrad)" />
+                                <path id="sparklinePathCalls" d="" fill="none" stroke="var(--accent-blue)" stroke-width="2" />
+                                <path id="sparklinePathWorkers" d="" fill="none" stroke="var(--accent-indigo)" stroke-width="1.8" stroke-dasharray="4,2" />
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Column 2: Service Request Outcome Distribution Charts -->
+                <div class="section-card">
+                    <div class="section-title">
+                        <span>📊 Request Outcome Distribution Charts</span>
+                    </div>
+
+                    <div class="outcome-list">
+                        <!-- Diarization -->
+                        <div class="outcome-box">
+                            <div class="outcome-top">
+                                <div class="outcome-name">
+                                    <span>🎤</span>
+                                    <span>Post-Call Diarization</span>
+                                </div>
+                                <span class="outcome-active-badge"><span id="valDiarizeActive">0</span> in-flight</span>
+                            </div>
+                            <div class="stacked-bar">
+                                <div class="bar-seg seg-ok" id="diarSegOk" style="width:0%"></div>
+                                <div class="bar-seg seg-fail" id="diarSegFail" style="width:0%"></div>
+                                <div class="bar-seg seg-vram" id="diarSegVram" style="width:0%"></div>
+                            </div>
+                            <div class="outcome-metrics">
+                                <div class="metric-pill"><span class="dot ok"></span> OK: <strong id="diarOkCount">0</strong></div>
+                                <div class="metric-pill"><span class="dot fail"></span> Failed: <strong id="diarFailCount">0</strong></div>
+                                <div class="metric-pill"><span class="dot vram"></span> VRAM Rej: <strong id="diarVramCount">0</strong></div>
+                                <span id="valDiarizeTotals" class="raw-total-text">0 / 0 / 0</span>
+                            </div>
+                        </div>
+
+                        <!-- Batch Transcribe -->
+                        <div class="outcome-box">
+                            <div class="outcome-top">
+                                <div class="outcome-name">
+                                    <span>📝</span>
+                                    <span>Batch Transcriptions (<code>/v1/audio/transcriptions</code>)</span>
+                                </div>
+                                <span class="outcome-active-badge"><span id="valTranscribeActive">0</span> in-flight</span>
+                            </div>
+                            <div class="stacked-bar">
+                                <div class="bar-seg seg-ok" id="xscribeSegOk" style="width:0%"></div>
+                                <div class="bar-seg seg-fail" id="xscribeSegFail" style="width:0%"></div>
+                                <div class="bar-seg seg-vram" id="xscribeSegVram" style="width:0%"></div>
+                                <div class="bar-seg seg-cap" id="xscribeSegCap" style="width:0%"></div>
+                            </div>
+                            <div class="outcome-metrics">
+                                <div class="metric-pill"><span class="dot ok"></span> OK: <strong id="xscribeOkCount">0</strong></div>
+                                <div class="metric-pill"><span class="dot fail"></span> Failed: <strong id="xscribeFailCount">0</strong></div>
+                                <div class="metric-pill"><span class="dot vram"></span> VRAM: <strong id="xscribeVramCount">0</strong></div>
+                                <div class="metric-pill"><span class="dot cap"></span> Capacity: <strong id="xscribeCapCount">0</strong></div>
+                                <span id="valTranscribeTotals" class="raw-total-text">0 / 0 / 0 / 0</span>
+                            </div>
+                        </div>
+
+                        <!-- Speech Synthesis (TTS) -->
+                        <div class="outcome-box">
+                            <div class="outcome-top">
+                                <div class="outcome-name">
+                                    <span>🔊</span>
+                                    <span>Speech Synthesis (<code>/v1/audio/speech</code>)</span>
+                                </div>
+                                <span class="outcome-active-badge"><span id="valTtsActive">0</span> in-flight</span>
+                            </div>
+                            <div class="stacked-bar">
+                                <div class="bar-seg seg-ok" id="ttsSegOk" style="width:0%"></div>
+                                <div class="bar-seg seg-fail" id="ttsSegFail" style="width:0%"></div>
+                                <div class="bar-seg seg-vram" id="ttsSegVram" style="width:0%"></div>
+                                <div class="bar-seg seg-cap" id="ttsSegCap" style="width:0%"></div>
+                            </div>
+                            <div class="outcome-metrics">
+                                <div class="metric-pill"><span class="dot ok"></span> OK: <strong id="ttsOkCount">0</strong></div>
+                                <div class="metric-pill"><span class="dot fail"></span> Failed: <strong id="ttsFailCount">0</strong></div>
+                                <div class="metric-pill"><span class="dot vram"></span> VRAM: <strong id="ttsVramCount">0</strong></div>
+                                <div class="metric-pill"><span class="dot cap"></span> Capacity: <strong id="ttsCapCount">0</strong></div>
+                                <span id="valTtsTotals" class="raw-total-text">0 / 0 / 0 / 0</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </div>
 
-            <div class="section-card">
-                <div class="section-title">📝 Active Transcript Requests</div>
-                <table class="kv-table" id="transcribeActiveTable">
-                    <thead>
-                        <tr>
-                            <td class="kv-key col-id">ID</td>
-                            <td class="kv-key col-elapsed">Elapsed</td>
-                            <td class="kv-key col-info">Model</td>
-                        </tr>
-                    </thead>
-                    <tbody id="transcribeActiveTbody">
-                        <tr><td colspan="3" class="card-subtext">No active transcript requests</td></tr>
-                    </tbody>
-                </table>
-            </div>
+            <!-- Bottom: Detailed Requests Info Tables -->
+            <div class="requests-grid">
+                <div class="section-card request-table-card">
+                    <div class="section-title">
+                        <span>🎤 Active Diarization Requests</span>
+                    </div>
+                    <table class="kv-table" id="diarizeActiveTable">
+                        <thead>
+                            <tr>
+                                <td class="kv-key col-id">ID</td>
+                                <td class="kv-key col-elapsed">Elapsed</td>
+                                <td class="kv-key col-info">Device</td>
+                            </tr>
+                        </thead>
+                        <tbody id="diarizeActiveTbody">
+                            <tr><td colspan="3" class="card-subtext">No active diarization requests</td></tr>
+                        </tbody>
+                    </table>
+                </div>
 
-            <div class="section-card">
-                <div class="section-title">🔊 Active Speech Synthesis Requests</div>
-                <table class="kv-table" id="ttsActiveTable">
-                    <thead>
-                        <tr>
-                            <td class="kv-key col-id">ID</td>
-                            <td class="kv-key col-elapsed">Elapsed</td>
-                            <td class="kv-key col-info">Model / Voice</td>
-                        </tr>
-                    </thead>
-                    <tbody id="ttsActiveTbody">
-                        <tr><td colspan="3" class="card-subtext">No active TTS requests</td></tr>
-                    </tbody>
-                </table>
+                <div class="section-card request-table-card">
+                    <div class="section-title">
+                        <span>📝 Active Transcript Requests</span>
+                    </div>
+                    <table class="kv-table" id="transcribeActiveTable">
+                        <thead>
+                            <tr>
+                                <td class="kv-key col-id">ID</td>
+                                <td class="kv-key col-elapsed">Elapsed</td>
+                                <td class="kv-key col-info">Model</td>
+                            </tr>
+                        </thead>
+                        <tbody id="transcribeActiveTbody">
+                            <tr><td colspan="3" class="card-subtext">No active transcript requests</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="section-card request-table-card">
+                    <div class="section-title">
+                        <span>🔊 Active Speech Synthesis Requests</span>
+                    </div>
+                    <table class="kv-table" id="ttsActiveTable">
+                        <thead>
+                            <tr>
+                                <td class="kv-key col-id">ID</td>
+                                <td class="kv-key col-elapsed">Elapsed</td>
+                                <td class="kv-key col-info">Model / Voice</td>
+                            </tr>
+                        </thead>
+                        <tbody id="ttsActiveTbody">
+                            <tr><td colspan="3" class="card-subtext">No active TTS requests</td></tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
 
@@ -833,7 +1242,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         <div id="tab-models" class="tab-content">
             <!-- Supported Models by Service -->
             <div class="section-card">
-                <div class="section-title">🧩 Supported Models by Service</div>
+                <div class="section-title">
+                    <span>🧩 Supported Models by Service</span>
+                </div>
                 <div class="config-grid">
                     <div class="config-group">
                         <div class="config-group-header">📞 Live Call &mdash; gRPC <code>Transcribe</code> (streaming)</div>
@@ -872,7 +1283,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
 
             <!-- API Links -->
             <div class="section-card">
-                <div class="section-title">🔗 API & Telemetry Endpoints</div>
+                <div class="section-title">
+                    <span>🔗 API & Telemetry Endpoints</span>
+                </div>
                 <div class="links-row">
                     <a href="/api/health" target="_blank" class="btn-link">🏥 /api/health</a>
                     <a href="/api/stats" target="_blank" class="btn-link">📈 /api/stats</a>
@@ -888,7 +1301,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         <div id="tab-settings" class="tab-content">
             <!-- Active Runtime Configuration Summary -->
             <div class="section-card">
-                <div class="section-title">⚙️ Active Runtime Overview</div>
+                <div class="section-title">
+                    <span>⚙️ Active Runtime Overview</span>
+                </div>
                 <div class="config-grid">
                     <div class="config-group">
                         <div class="config-group-header">Network & Engine</div>
@@ -976,7 +1391,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
 
             <!-- Engine Backends -->
             <div class="section-card">
-                <div class="section-title">🚀 Engine Backends</div>
+                <div class="section-title">
+                    <span>🚀 Engine Backends</span>
+                </div>
                 <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:1rem;">
                     Registered upstream artifacts (<code>live_stt/backends/registry.py</code>) and what is installed/activated on this process (<code>live_stt/backends/installer.py</code>).
                 </p>
@@ -993,7 +1410,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
 
             <!-- Diarization Engines -->
             <div class="section-card">
-                <div class="section-title">🎤 Diarization Engines</div>
+                <div class="section-title">
+                    <span>🎤 Diarization Engines</span>
+                </div>
                 <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:1rem;">
                     Post-call speaker diarization dependency trees (pyannote.audio+torch, NVIDIA Sortformer). Install once per deployment under mounted data volume.
                 </p>
@@ -1010,7 +1429,9 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
 
             <!-- TTS Engines -->
             <div class="section-card">
-                <div class="section-title">🔊 Text-to-Speech Engines</div>
+                <div class="section-title">
+                    <span>🔊 Text-to-Speech Engines</span>
+                </div>
                 <p style="color:var(--text-muted);font-size:0.85rem;margin-bottom:1rem;">
                     Text-to-speech engine dependency trees (kokoro, piper). Install once per deployment under mounted data volume.
                 </p>
@@ -1107,6 +1528,75 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             }
         }
 
+        // Real-Time Activity Waveform (Sparkline) Buffer
+        const sparkHistory = [];
+        const MAX_HISTORY = 30;
+
+        function updateSparkline(calls, workers, maxCalls) {
+            sparkHistory.push({ calls, workers });
+            if (sparkHistory.length > MAX_HISTORY) sparkHistory.shift();
+
+            const svgW = 400;
+            const svgH = 70;
+            const maxVal = Math.max(maxCalls || 1, 1, ...sparkHistory.map(d => Math.max(d.calls, d.workers)));
+            const n = sparkHistory.length;
+            if (n < 2) return;
+
+            const step = svgW / (MAX_HISTORY - 1);
+            const startX = svgW - (n - 1) * step;
+
+            const callsPts = sparkHistory.map((d, i) => {
+                const x = startX + i * step;
+                const y = svgH - 8 - ((d.calls / maxVal) * (svgH - 16));
+                return `${x.toFixed(1)},${y.toFixed(1)}`;
+            });
+
+            const workersPts = sparkHistory.map((d, i) => {
+                const x = startX + i * step;
+                const y = svgH - 8 - ((d.workers / maxVal) * (svgH - 16));
+                return `${x.toFixed(1)},${y.toFixed(1)}`;
+            });
+
+            const pathCalls = document.getElementById('sparklinePathCalls');
+            const areaCalls = document.getElementById('sparklineAreaCalls');
+            const pathWorkers = document.getElementById('sparklinePathWorkers');
+
+            if (pathCalls) pathCalls.setAttribute('d', 'M ' + callsPts.join(' L '));
+            if (pathWorkers) pathWorkers.setAttribute('d', 'M ' + workersPts.join(' L '));
+            if (areaCalls) {
+                const firstX = startX.toFixed(1);
+                const lastX = svgW.toFixed(1);
+                areaCalls.setAttribute('d', `M ${firstX},${svgH} L ${callsPts.join(' L ')} L ${lastX},${svgH} Z`);
+            }
+        }
+
+        function setGauge(circleId, pctId, pct) {
+            const circle = document.getElementById(circleId);
+            const text = document.getElementById(pctId);
+            const C = 263.894;
+            const p = Math.max(0, Math.min(100, Math.round(pct)));
+            if (circle) circle.style.strokeDashoffset = C * (1 - p / 100);
+            if (text) text.innerText = p + '%';
+        }
+
+        function updateStackedBar(segPrefix, ok, fail, vram, cap) {
+            const total = (ok + fail + vram + (cap || 0)) || 0;
+            const okPct = total ? (ok / total) * 100 : 0;
+            const failPct = total ? (fail / total) * 100 : 0;
+            const vramPct = total ? (vram / total) * 100 : 0;
+            const capPct = total && cap ? (cap / total) * 100 : 0;
+
+            const segOk = document.getElementById(segPrefix + 'SegOk');
+            const segFail = document.getElementById(segPrefix + 'SegFail');
+            const segVram = document.getElementById(segPrefix + 'SegVram');
+            const segCap = document.getElementById(segPrefix + 'SegCap');
+
+            if (segOk) segOk.style.width = okPct + '%';
+            if (segFail) segFail.style.width = failPct + '%';
+            if (segVram) segVram.style.width = vramPct + '%';
+            if (segCap) segCap.style.width = capPct + '%';
+        }
+
         async function updateDashboard() {
             const [health, stats, config, version, modelsResp] = await Promise.all([
                 fetchJSON('/api/health'),
@@ -1139,52 +1629,67 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 const maxWorkers = stats.max_workers ?? 1;
 
                 document.getElementById('valActiveCalls').innerText = activeCalls;
-                document.getElementById('subActiveCalls').innerText = 'Max Capacity: ' + maxCalls;
+                document.getElementById('subActiveCalls').innerText = '/ Max ' + maxCalls;
                 document.getElementById('valActiveWorkers').innerText = activeWorkers;
-                document.getElementById('subActiveWorkers').innerText = 'Max Workers: ' + maxWorkers;
+                document.getElementById('subActiveWorkers').innerText = '/ Max ' + maxWorkers;
                 document.getElementById('subDraining').innerText = 'Draining: ' + (stats.draining ? 'True' : 'False');
 
                 const tabBadge = document.getElementById('tabBadgeCalls');
                 if (tabBadge) tabBadge.innerText = `${activeCalls} active`;
 
-                // Call Capacity Bar
+                // Call Capacity Gauge & Bar
                 const callPct = Math.min(100, Math.round((activeCalls / maxCalls) * 100));
                 document.getElementById('callUsageText').innerText = `${activeCalls} / ${maxCalls} (${callPct}%)`;
                 document.getElementById('callProgressBar').style.width = callPct + '%';
+                setGauge('gaugeCircleCalls', 'gaugePctCalls', callPct);
 
-                // Worker Capacity Bar
+                // Worker Capacity Gauge & Bar
                 const workerPct = Math.min(100, Math.round((activeWorkers / maxWorkers) * 100));
                 document.getElementById('workerUsageText').innerText = `${activeWorkers} / ${maxWorkers} (${workerPct}%)`;
                 document.getElementById('workerProgressBar').style.width = workerPct + '%';
+                setGauge('gaugeCircleWorkers', 'gaugePctWorkers', workerPct);
+
+                // Update Sparkline Trend
+                updateSparkline(activeCalls, activeWorkers, maxCalls);
 
                 // GPU / VRAM
                 const gpuInfo = stats.gpu || {};
                 const vramRow = document.getElementById('vramProgressRow');
+                const kpiGpuPill = document.getElementById('kpiGpuPill');
                 if (gpuInfo.free_vram_mb != null && gpuInfo.total_vram_mb != null) {
                     const freeGb = (gpuInfo.free_vram_mb / 1024).toFixed(1);
                     const totalGb = (gpuInfo.total_vram_mb / 1024).toFixed(1);
                     document.getElementById('valGpuVramFree').innerText = freeGb + ' GB';
-                    document.getElementById('subGpuVramTotal').innerText = 'of ' + totalGb + ' GB total';
+                    document.getElementById('subGpuVramTotal').innerText = 'of ' + totalGb + ' GB';
 
                     const usedMb = gpuInfo.used_vram_mb ?? (gpuInfo.total_vram_mb - gpuInfo.free_vram_mb);
                     const vramPct = Math.min(100, Math.round((usedMb / gpuInfo.total_vram_mb) * 100));
                     document.getElementById('vramUsageText').innerText =
                         `${(usedMb / 1024).toFixed(1)} GB / ${totalGb} GB (${vramPct}%)`;
                     document.getElementById('vramProgressBar').style.width = vramPct + '%';
+                    setGauge('gaugeCircleVram', 'gaugePctVram', vramPct);
                     vramRow.style.display = '';
+                    if (kpiGpuPill) kpiGpuPill.style.display = '';
                 } else {
                     document.getElementById('valGpuVramFree').innerText = 'N/A';
                     document.getElementById('subGpuVramTotal').innerText = 'no GPU / nvidia-smi';
                     vramRow.style.display = 'none';
+                    setGauge('gaugeCircleVram', 'gaugePctVram', 0);
                 }
-                document.getElementById('valGpuUtil').innerText =
-                    gpuInfo.utilization_pct != null ? gpuInfo.utilization_pct + '%' : 'N/A';
+                const utilText = gpuInfo.utilization_pct != null ? gpuInfo.utilization_pct + '%' : 'N/A';
+                document.getElementById('valGpuUtil').innerText = utilText;
 
-                // Diarization
+                // Diarization Outcomes & Table
                 const diar = stats.diarization || {};
+                const diarOk = diar.completed_total ?? 0;
+                const diarFail = diar.failed_total ?? 0;
+                const diarVram = diar.rejected_vram_total ?? 0;
                 document.getElementById('valDiarizeActive').innerText = diar.active ?? 0;
-                document.getElementById('valDiarizeTotals').innerText =
-                    `${diar.completed_total ?? 0} / ${diar.failed_total ?? 0} / ${diar.rejected_vram_total ?? 0}`;
+                document.getElementById('valDiarizeTotals').innerText = `${diarOk} / ${diarFail} / ${diarVram}`;
+                document.getElementById('diarOkCount').innerText = diarOk;
+                document.getElementById('diarFailCount').innerText = diarFail;
+                document.getElementById('diarVramCount').innerText = diarVram;
+                updateStackedBar('diar', diarOk, diarFail, diarVram);
 
                 const activeRequests = diar.active_requests || [];
                 const diarizeTbody = document.getElementById('diarizeActiveTbody');
@@ -1196,11 +1701,19 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     ).join('');
                 }
 
-                // Batch transcription
+                // Batch Transcription Outcomes & Table
                 const xscribe = stats.transcribe || {};
+                const xOk = xscribe.completed_total ?? 0;
+                const xFail = xscribe.failed_total ?? 0;
+                const xVram = xscribe.rejected_vram_total ?? 0;
+                const xCap = xscribe.rejected_capacity_total ?? 0;
                 document.getElementById('valTranscribeActive').innerText = xscribe.active ?? 0;
-                document.getElementById('valTranscribeTotals').innerText =
-                    `${xscribe.completed_total ?? 0} / ${xscribe.failed_total ?? 0} / ${xscribe.rejected_vram_total ?? 0} / ${xscribe.rejected_capacity_total ?? 0}`;
+                document.getElementById('valTranscribeTotals').innerText = `${xOk} / ${xFail} / ${xVram} / ${xCap}`;
+                document.getElementById('xscribeOkCount').innerText = xOk;
+                document.getElementById('xscribeFailCount').innerText = xFail;
+                document.getElementById('xscribeVramCount').innerText = xVram;
+                document.getElementById('xscribeCapCount').innerText = xCap;
+                updateStackedBar('xscribe', xOk, xFail, xVram, xCap);
 
                 const activeTranscribeRequests = xscribe.active_requests || [];
                 const transcribeTbody = document.getElementById('transcribeActiveTbody');
@@ -1212,11 +1725,19 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     ).join('');
                 }
 
-                // TTS synthesis
+                // TTS Synthesis Outcomes & Table
                 const tts = stats.tts || {};
+                const tOk = tts.completed_total ?? 0;
+                const tFail = tts.failed_total ?? 0;
+                const tVram = tts.rejected_vram_total ?? 0;
+                const tCap = tts.rejected_capacity_total ?? 0;
                 document.getElementById('valTtsActive').innerText = tts.active ?? 0;
-                document.getElementById('valTtsTotals').innerText =
-                    `${tts.completed_total ?? 0} / ${tts.failed_total ?? 0} / ${tts.rejected_vram_total ?? 0} / ${tts.rejected_capacity_total ?? 0}`;
+                document.getElementById('valTtsTotals').innerText = `${tOk} / ${tFail} / ${tVram} / ${tCap}`;
+                document.getElementById('ttsOkCount').innerText = tOk;
+                document.getElementById('ttsFailCount').innerText = tFail;
+                document.getElementById('ttsVramCount').innerText = tVram;
+                document.getElementById('ttsCapCount').innerText = tCap;
+                updateStackedBar('tts', tOk, tFail, tVram, tCap);
 
                 const activeTtsRequests = tts.active_requests || [];
                 const ttsTbody = document.getElementById('ttsActiveTbody');

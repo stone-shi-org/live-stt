@@ -187,6 +187,15 @@ async def test_stats_web_page_endpoint() -> None:
                 assert 'function copyToClipboard(' in html_body
                 assert 'class="copy-btn"' in html_body
                 assert 'function copyBtn(' in html_body
+                # LS-6: Compact charts and visual metrics
+                assert 'class="kpi-strip"' in html_body
+                assert 'id="gaugeCircleCalls"' in html_body
+                assert 'id="gaugeCircleWorkers"' in html_body
+                assert 'id="gaugeCircleVram"' in html_body
+                assert 'id="activitySparkline"' in html_body
+                assert 'id="diarSegOk"' in html_body
+                assert 'id="xscribeSegOk"' in html_body
+                assert 'id="ttsSegOk"' in html_body
     finally:
         server.shutdown()
 
