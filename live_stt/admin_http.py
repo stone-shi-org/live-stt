@@ -625,6 +625,243 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             padding: 1rem 1.25rem;
         }
 
+        
+        /* Models & Endpoints: Row Layout Styles */
+        .service-row-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            margin-bottom: 1.25rem;
+            overflow: hidden;
+            box-shadow: var(--shadow-sm);
+            transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+        }
+
+        .service-row-card:hover {
+            border-color: rgba(99, 102, 241, 0.4);
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+        }
+
+        .service-row-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1rem 1.25rem;
+            background: rgba(15, 23, 42, 0.6);
+            border-bottom: 1px solid var(--border-color);
+            flex-wrap: wrap;
+            gap: 0.75rem;
+        }
+
+        .service-row-title {
+            display: flex;
+            align-items: center;
+            gap: 0.85rem;
+        }
+
+        .service-icon {
+            font-size: 1.35rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 38px;
+            height: 38px;
+            background: rgba(99, 102, 241, 0.12);
+            border-radius: 8px;
+            border: 1px solid rgba(99, 102, 241, 0.25);
+        }
+
+        .service-title-text {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .service-name {
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text-main);
+        }
+
+        .service-endpoint-desc {
+            font-size: 0.78rem;
+            color: var(--text-muted);
+        }
+
+        .service-row-badges {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .endpoint-chip {
+            font-family: monospace;
+            font-size: 0.8rem;
+            padding: 0.25rem 0.65rem;
+            border-radius: 6px;
+            border: 1px solid transparent;
+        }
+
+        .chip-grpc {
+            background: rgba(14, 165, 233, 0.12);
+            color: var(--accent-cyan);
+            border-color: rgba(14, 165, 233, 0.3);
+        }
+
+        .chip-http {
+            background: rgba(99, 102, 241, 0.12);
+            color: var(--accent-indigo);
+            border-color: rgba(99, 102, 241, 0.3);
+        }
+
+        .tag-chip {
+            font-size: 0.72rem;
+            font-weight: 600;
+            padding: 0.25rem 0.55rem;
+            border-radius: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+
+        .tag-streaming {
+            background: rgba(16, 185, 129, 0.12);
+            color: var(--accent-green);
+            border: 1px solid rgba(16, 185, 129, 0.25);
+        }
+
+        .tag-http {
+            background: rgba(59, 130, 246, 0.12);
+            color: var(--accent-blue);
+            border: 1px solid rgba(59, 130, 246, 0.25);
+        }
+
+        .tag-vram {
+            background: rgba(245, 158, 11, 0.12);
+            color: var(--accent-amber);
+            border: 1px solid rgba(245, 158, 11, 0.25);
+        }
+
+        .tag-tts {
+            background: rgba(168, 85, 247, 0.12);
+            color: #c084fc;
+            border: 1px solid rgba(168, 85, 247, 0.25);
+        }
+
+        .service-table-wrap {
+            padding: 0;
+            overflow-x: auto;
+        }
+
+        .service-models-table {
+            width: 100%;
+            margin-bottom: 0;
+        }
+
+        .service-models-table thead th {
+            background: rgba(15, 23, 42, 0.4);
+            font-size: 0.74rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            padding: 0.65rem 1.25rem;
+            border-bottom: 1px solid var(--border-color);
+            text-align: left;
+        }
+
+        .service-models-table td {
+            padding: 0.8rem 1.25rem;
+        }
+
+        .service-models-table tr:not(:last-child) td {
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+        }
+
+        /* Attribute Badges */
+        .model-badge {
+            display: inline-block;
+            font-size: 0.72rem;
+            font-weight: 500;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            margin-right: 0.4rem;
+            line-height: 1.3;
+        }
+
+        .badge-def {
+            background: rgba(99, 102, 241, 0.18);
+            color: #a5b4fc;
+            border: 1px solid rgba(99, 102, 241, 0.35);
+            font-weight: 600;
+        }
+
+        .badge-feat {
+            background: rgba(16, 185, 129, 0.14);
+            color: #6ee7b7;
+            border: 1px solid rgba(16, 185, 129, 0.25);
+        }
+
+        .badge-warn {
+            background: rgba(245, 158, 11, 0.14);
+            color: #fcd34d;
+            border: 1px solid rgba(245, 158, 11, 0.25);
+        }
+
+        /* Endpoints Table */
+        .endpoints-table thead th {
+            background: rgba(15, 23, 42, 0.4);
+            font-size: 0.74rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            padding: 0.65rem 1.25rem;
+            border-bottom: 1px solid var(--border-color);
+            text-align: left;
+        }
+
+        .endpoints-table td {
+            padding: 0.8rem 1.25rem;
+            vertical-align: middle;
+        }
+
+        .endpoints-table tr:not(:last-child) td {
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+        }
+
+        .method-tag {
+            font-size: 0.72rem;
+            font-weight: 700;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            letter-spacing: 0.04em;
+        }
+
+        .method-get {
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--accent-green);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .btn-endpoint-open {
+            display: inline-flex;
+            align-items: center;
+            font-size: 0.78rem;
+            color: var(--accent-blue);
+            text-decoration: none;
+            padding: 0.25rem 0.65rem;
+            border-radius: 6px;
+            background: rgba(59, 130, 246, 0.08);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+            transition: all var(--transition-fast);
+        }
+
+        .btn-endpoint-open:hover {
+            background: rgba(59, 130, 246, 0.2);
+            border-color: var(--accent-blue);
+            color: #fff;
+        }
+
         .config-group-header {
             font-size: 0.9rem;
             font-weight: 600;
@@ -1240,59 +1477,194 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
 
         <!-- TAB 2: MODELS & ENDPOINTS -->
         <div id="tab-models" class="tab-content">
-            <!-- Supported Models by Service -->
-            <div class="section-card">
-                <div class="section-title">
-                    <span>🧩 Supported Models by Service</span>
+            <!-- Row 1: Live Call (gRPC Transcribe) -->
+            <div class="service-row-card">
+                <div class="service-row-header">
+                    <div class="service-row-title">
+                        <span class="service-icon">📞</span>
+                        <div class="service-title-text">
+                            <span class="service-name">Live Call (Streaming ASR)</span>
+                            <span class="service-endpoint-desc">Low-latency bidirectional streaming speech-to-text</span>
+                        </div>
+                    </div>
+                    <div class="service-row-badges">
+                        <code class="endpoint-chip chip-grpc">gRPC Transcribe</code>
+                        <span class="tag-chip tag-streaming">Streaming Capable</span>
+                    </div>
                 </div>
-                <div class="config-grid">
-                    <div class="config-group">
-                        <div class="config-group-header">📞 Live Call &mdash; gRPC <code>Transcribe</code> (streaming)</div>
-                        <table class="kv-table" id="svcLiveCallTable">
-                            <tbody id="svcLiveCallTbody">
-                                <tr><td class="card-subtext">Loading...</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                    <div class="config-group">
-                        <div class="config-group-header">📝 Batch Transcript &mdash; <code>POST /v1/audio/transcriptions</code></div>
-                        <table class="kv-table" id="svcTranscriptTable">
-                            <tbody id="svcTranscriptTbody">
-                                <tr><td class="card-subtext">Loading...</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                    <div class="config-group">
-                        <div class="config-group-header">🎤 Diarization &mdash; <code>POST /v1/audio/diarization</code></div>
-                        <table class="kv-table" id="svcDiarizationTable">
-                            <tbody id="svcDiarizationTbody">
-                                <tr><td class="card-subtext">Loading...</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                    <div class="config-group">
-                        <div class="config-group-header">🔊 Text-to-Speech &mdash; <code>POST /v1/audio/speech</code></div>
-                        <table class="kv-table" id="svcTtsTable">
-                            <tbody id="svcTTSTbody">
-                                <tr><td class="card-subtext">Loading...</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
+                <div class="service-table-wrap">
+                    <table class="kv-table service-models-table" id="svcLiveCallTable">
+                        <thead>
+                            <tr>
+                                <th style="width: 55%;">Model Identifier</th>
+                                <th style="width: 45%;">Attributes & Capabilities</th>
+                            </tr>
+                        </thead>
+                        <tbody id="svcLiveCallTbody">
+                            <tr><td colspan="2" class="card-subtext">Loading...</td></tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
 
-            <!-- API Links -->
-            <div class="section-card">
-                <div class="section-title">
-                    <span>🔗 API & Telemetry Endpoints</span>
+            <!-- Row 2: Batch Transcript (HTTP POST /v1/audio/transcriptions) -->
+            <div class="service-row-card">
+                <div class="service-row-header">
+                    <div class="service-row-title">
+                        <span class="service-icon">📝</span>
+                        <div class="service-title-text">
+                            <span class="service-name">Batch Audio Transcription</span>
+                            <span class="service-endpoint-desc">OpenAI-compatible file upload & transcription pipeline</span>
+                        </div>
+                    </div>
+                    <div class="service-row-badges">
+                        <code class="endpoint-chip chip-http">POST /v1/audio/transcriptions</code>
+                        <span class="tag-chip tag-http">HTTP REST</span>
+                    </div>
                 </div>
-                <div class="links-row">
-                    <a href="/api/health" target="_blank" class="btn-link">🏥 /api/health</a>
-                    <a href="/api/stats" target="_blank" class="btn-link">📈 /api/stats</a>
-                    <a href="/api/config" target="_blank" class="btn-link">🛠️ /api/config</a>
-                    <a href="/api/version" target="_blank" class="btn-link">ℹ️ /api/version</a>
-                    <a href="/v1/models" target="_blank" class="btn-link">🧩 /v1/models</a>
-                    <a href="/metrics" target="_blank" class="btn-link">📊 /metrics (Prometheus)</a>
+                <div class="service-table-wrap">
+                    <table class="kv-table service-models-table" id="svcTranscriptTable">
+                        <thead>
+                            <tr>
+                                <th style="width: 55%;">Model Identifier</th>
+                                <th style="width: 45%;">Attributes & Capabilities</th>
+                            </tr>
+                        </thead>
+                        <tbody id="svcTranscriptTbody">
+                            <tr><td colspan="2" class="card-subtext">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Row 3: Diarization (HTTP POST /v1/audio/diarization) -->
+            <div class="service-row-card">
+                <div class="service-row-header">
+                    <div class="service-row-title">
+                        <span class="service-icon">🎤</span>
+                        <div class="service-title-text">
+                            <span class="service-name">Speaker Diarization</span>
+                            <span class="service-endpoint-desc">Multi-speaker segmentation & speaker clustering</span>
+                        </div>
+                    </div>
+                    <div class="service-row-badges">
+                        <code class="endpoint-chip chip-http">POST /v1/audio/diarization</code>
+                        <span class="tag-chip tag-vram">VRAM Gated</span>
+                    </div>
+                </div>
+                <div class="service-table-wrap">
+                    <table class="kv-table service-models-table" id="svcDiarizationTable">
+                        <thead>
+                            <tr>
+                                <th style="width: 55%;">Model Identifier</th>
+                                <th style="width: 45%;">Attributes & Capabilities</th>
+                            </tr>
+                        </thead>
+                        <tbody id="svcDiarizationTbody">
+                            <tr><td colspan="2" class="card-subtext">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Row 4: Text-to-Speech (HTTP POST /v1/audio/speech) -->
+            <div class="service-row-card">
+                <div class="service-row-header">
+                    <div class="service-row-title">
+                        <span class="service-icon">🔊</span>
+                        <div class="service-title-text">
+                            <span class="service-name">Text-to-Speech (TTS)</span>
+                            <span class="service-endpoint-desc">OpenAI-compatible speech synthesis & audio streaming</span>
+                        </div>
+                    </div>
+                    <div class="service-row-badges">
+                        <code class="endpoint-chip chip-http">POST /v1/audio/speech</code>
+                        <span class="tag-chip tag-tts">TTS Engine</span>
+                    </div>
+                </div>
+                <div class="service-table-wrap">
+                    <table class="kv-table service-models-table" id="svcTtsTable">
+                        <thead>
+                            <tr>
+                                <th style="width: 55%;">Model Identifier</th>
+                                <th style="width: 45%;">Attributes & Capabilities</th>
+                            </tr>
+                        </thead>
+                        <tbody id="svcTTSTbody">
+                            <tr><td colspan="2" class="card-subtext">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Row 5: API & Telemetry Endpoints Table -->
+            <div class="service-row-card">
+                <div class="service-row-header">
+                    <div class="service-row-title">
+                        <span class="service-icon">🔗</span>
+                        <div class="service-title-text">
+                            <span class="service-name">API & Telemetry Endpoints</span>
+                            <span class="service-endpoint-desc">System health probes, configuration, and monitoring feeds</span>
+                        </div>
+                    </div>
+                    <div class="links-row" style="margin: 0;">
+                        <a href="/api/health" target="_blank" class="btn-link">🏥 /api/health</a>
+                        <a href="/api/stats" target="_blank" class="btn-link">📈 /api/stats</a>
+                        <a href="/api/config" target="_blank" class="btn-link">🛠️ /api/config</a>
+                        <a href="/api/version" target="_blank" class="btn-link">ℹ️ /api/version</a>
+                        <a href="/v1/models" target="_blank" class="btn-link">🧩 /v1/models</a>
+                        <a href="/metrics" target="_blank" class="btn-link">📊 /metrics</a>
+                    </div>
+                </div>
+                <div class="service-table-wrap">
+                    <table class="kv-table endpoints-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 10%;">Method</th>
+                                <th style="width: 25%;">Endpoint Path</th>
+                                <th style="width: 53%;">Description</th>
+                                <th style="width: 12%; text-align: right;">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td><span class="method-tag method-get">GET</span></td>
+                                <td><code>/api/health</code></td>
+                                <td class="card-subtext">Liveness probe and worker admission capacity check (HTTP 200 / 503)</td>
+                                <td style="text-align: right;"><a href="/api/health" target="_blank" class="btn-endpoint-open">Open ↗</a></td>
+                            </tr>
+                            <tr>
+                                <td><span class="method-tag method-get">GET</span></td>
+                                <td><code>/api/stats</code></td>
+                                <td class="card-subtext">Real-time JSON stats for calls, workers, diarization, batch transcription & TTS</td>
+                                <td style="text-align: right;"><a href="/api/stats" target="_blank" class="btn-endpoint-open">Open ↗</a></td>
+                            </tr>
+                            <tr>
+                                <td><span class="method-tag method-get">GET</span></td>
+                                <td><code>/api/config</code></td>
+                                <td class="card-subtext">Active configuration, worker concurrency limits, timeouts, and engine settings</td>
+                                <td style="text-align: right;"><a href="/api/config" target="_blank" class="btn-endpoint-open">Open ↗</a></td>
+                            </tr>
+                            <tr>
+                                <td><span class="method-tag method-get">GET</span></td>
+                                <td><code>/api/version</code></td>
+                                <td class="card-subtext">Git commit hash and Parakeet runtime engine build reference</td>
+                                <td style="text-align: right;"><a href="/api/version" target="_blank" class="btn-endpoint-open">Open ↗</a></td>
+                            </tr>
+                            <tr>
+                                <td><span class="method-tag method-get">GET</span></td>
+                                <td><code>/v1/models</code></td>
+                                <td class="card-subtext">OpenAI-compatible registry of all available ASR, diarization & TTS models</td>
+                                <td style="text-align: right;"><a href="/v1/models" target="_blank" class="btn-endpoint-open">Open ↗</a></td>
+                            </tr>
+                            <tr>
+                                <td><span class="method-tag method-get">GET</span></td>
+                                <td><code>/metrics</code></td>
+                                <td class="card-subtext">Prometheus format metrics exporter for Prometheus/Grafana scrapers</td>
+                                <td style="text-align: right;"><a href="/metrics" target="_blank" class="btn-endpoint-open">Open ↗</a></td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         </div>
@@ -1789,9 +2161,21 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             }
 
             // Supported Models
-            const modelRow = (spec, badges) =>
-                `<tr><td class="kv-key"><span class="model-name-cell">${spec.id}${copyBtn(spec.id)}</span></td><td class="kv-val">${badges.filter(Boolean).join(', ') || '&mdash;'}</td></tr>`;
-            const noModelsRow = '<tr><td class="card-subtext">No models registered</td></tr>';
+            const badgePill = (b) => {
+                if (!b) return '';
+                let cls = 'badge-feat';
+                if (b === 'default') cls = 'badge-def';
+                else if (b === 'gated') cls = 'badge-warn';
+                return `<span class="model-badge ${cls}">${b}</span>`;
+            };
+            const modelRow = (spec, badges) => {
+                const validBadges = badges.filter(Boolean);
+                const badgeHtml = validBadges.length
+                    ? validBadges.map(badgePill).join('')
+                    : '<span class="card-subtext">&mdash;</span>';
+                return `<tr><td class="kv-key"><span class="model-name-cell">${spec.id}${copyBtn(spec.id)}</span></td><td class="kv-val">${badgeHtml}</td></tr>`;
+            };
+            const noModelsRow = '<tr><td colspan="2" class="card-subtext">No models registered</td></tr>';
 
             if (modelsResp && modelsResp.data) {
                 const asrModels = modelsResp.data.filter(m => m.type === 'asr');

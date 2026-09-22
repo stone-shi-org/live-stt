@@ -113,6 +113,9 @@ async def test_dashboard_ui_multi_tab_navigation_and_sectioned_settings() -> Non
                 assert 'id="categoryPills"' in body
                 assert "SETTINGS_SECTIONS" in body
                 assert "settingsBody" in body
+                # Models & Endpoints row layout (LS-6)
+                assert 'class="service-row-card"' in body
+                assert 'endpoints-table' in body
     finally:
         server.shutdown()
 
