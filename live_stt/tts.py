@@ -6,6 +6,7 @@ Provides both full batch synthesis and low-latency sentence-chunked streaming sy
 
 from __future__ import annotations
 
+import atexit
 import io
 import json
 import os
@@ -13,6 +14,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import wave
 from pathlib import Path
 from typing import Iterator
@@ -84,19 +87,63 @@ def _ensure_deps_on_path(deps_dir: str, engine: str) -> None:
         sys.path.insert(0, engine_dir)
 
 
-# Process-lifetime caches, keyed by what actually determines a loaded
-# object's identity -- avoids reloading a real ~82M-param torch model (or
-# a piper .onnx model) on every SENTENCE CHUNK within one synthesize()
-# call, let alone every call. Correct to share across calls within one
-# process: kokoro's KPipeline/piper's PiperVoice are read-only inference
-# objects once constructed, nothing here mutates them per-call. Empty at
-# the start of every `live_stt.tts_worker` subprocess (a fresh process
-# each time, by design -- see that module's docstring on why: 100% VRAM
-# reclamation), so this only helps the tts_in_subprocess=False /
-# direct-fallback path, which is the path the offline test suite and any
-# CPU-only deployment actually exercises repeatedly.
-_KOKORO_PIPELINE_CACHE: dict[tuple[str, str | None], object] = {}
-_PIPER_VOICE_CACHE: dict[tuple[str, bool], object] = {}
+# Process-lifetime caches with idle timeout eviction (LS-9), keyed by what
+# actually determines a loaded object's identity. Values are (object, last_used_monotonic).
+# Warmed-up pipelines/voices are preserved across calls within the idle timeout window,
+# avoiding reloading ~82M parameters on every request, and are evicted once idle.
+_IN_PROCESS_LOCK = threading.RLock()
+_KOKORO_PIPELINE_CACHE: dict[tuple[str, str | None], tuple[object, float]] = {}
+_PIPER_VOICE_CACHE: dict[tuple[str, bool], tuple[object, float]] = {}
+_IN_PROCESS_IDLE_TIMER: threading.Timer | None = None
+
+
+def evict_idle_tts_caches(idle_timeout_sec: float) -> int:
+    """Evict in-process cached TTS pipelines/voices that have been idle for > idle_timeout_sec.
+
+    Returns the number of evicted entries.
+    """
+    now = time.monotonic()
+    evicted = 0
+    with _IN_PROCESS_LOCK:
+        for key, (obj, last_used) in list(_KOKORO_PIPELINE_CACHE.items()):
+            if idle_timeout_sec > 0 and (now - last_used) > idle_timeout_sec:
+                _KOKORO_PIPELINE_CACHE.pop(key, None)
+                del obj
+                evicted += 1
+        for key, (obj, last_used) in list(_PIPER_VOICE_CACHE.items()):
+            if idle_timeout_sec > 0 and (now - last_used) > idle_timeout_sec:
+                _PIPER_VOICE_CACHE.pop(key, None)
+                del obj
+                evicted += 1
+    if evicted:
+        import gc
+
+        gc.collect()
+    return evicted
+
+
+def clear_tts_caches() -> None:
+    """Immediately clears all cached pipelines and voices in-process."""
+    with _IN_PROCESS_LOCK:
+        _KOKORO_PIPELINE_CACHE.clear()
+        _PIPER_VOICE_CACHE.clear()
+    import gc
+
+    gc.collect()
+
+
+def _schedule_in_process_reaper(idle_timeout_sec: float) -> None:
+    global _IN_PROCESS_IDLE_TIMER
+    with _IN_PROCESS_LOCK:
+        if _IN_PROCESS_IDLE_TIMER is not None:
+            _IN_PROCESS_IDLE_TIMER.cancel()
+            _IN_PROCESS_IDLE_TIMER = None
+        if idle_timeout_sec > 0:
+            _IN_PROCESS_IDLE_TIMER = threading.Timer(
+                idle_timeout_sec, lambda: evict_idle_tts_caches(idle_timeout_sec)
+            )
+            _IN_PROCESS_IDLE_TIMER.daemon = True
+            _IN_PROCESS_IDLE_TIMER.start()
 
 
 def resolve_voice(voice: str | None, settings: Settings, model_spec: TTSModelSpec) -> str:
@@ -171,6 +218,7 @@ def _synthesize_chunk_direct(
     device: str = "cpu",
     models_dir: str = "/models",
     deps_dir: str = "/app/data/tts-deps",
+    idle_timeout_sec: float = 600.0,
 ) -> bytes:
     """Direct in-process synthesis of a single text chunk to raw int16 PCM
     bytes. Raises TTSUnavailableError (never silently substitutes fake
@@ -198,10 +246,26 @@ def _synthesize_chunk_direct(
                 "or install requirements-tts-kokoro.txt yourself for local/manual use."
             ) from exc
 
+        now = time.monotonic()
         lang_code = _kokoro_lang_code(voice)
         pipeline_device = "cuda" if device == "cuda" else None  # None = kokoro's own CPU default
         cache_key = (lang_code, pipeline_device)
-        pipeline = _KOKORO_PIPELINE_CACHE.get(cache_key)
+        pipeline = None
+
+        with _IN_PROCESS_LOCK:
+            cached = _KOKORO_PIPELINE_CACHE.get(cache_key)
+            if cached is not None:
+                pipeline_obj, last_used = cached
+                if idle_timeout_sec > 0 and (now - last_used) > idle_timeout_sec:
+                    _KOKORO_PIPELINE_CACHE.pop(cache_key, None)
+                    del pipeline_obj
+                    import gc
+
+                    gc.collect()
+                else:
+                    pipeline = pipeline_obj
+                    _KOKORO_PIPELINE_CACHE[cache_key] = (pipeline, now)
+
         if pipeline is None:
             try:
                 pipeline = KPipeline(lang_code=lang_code, device=pipeline_device)
@@ -209,7 +273,10 @@ def _synthesize_chunk_direct(
                 raise TTSUnavailableError(
                     f"failed to load kokoro pipeline (lang_code={lang_code!r}): {exc}"
                 ) from exc
-            _KOKORO_PIPELINE_CACHE[cache_key] = pipeline
+            if idle_timeout_sec > 0:
+                with _IN_PROCESS_LOCK:
+                    _KOKORO_PIPELINE_CACHE[cache_key] = (pipeline, now)
+                    _schedule_in_process_reaper(idle_timeout_sec)
 
         import numpy as np
 
@@ -255,14 +322,33 @@ def _synthesize_chunk_direct(
             except ImportError:
                 pass
 
+        now = time.monotonic()
         piper_cache_key = (str(model_path), use_cuda)
-        piper_voice = _PIPER_VOICE_CACHE.get(piper_cache_key)
+        piper_voice = None
+
+        with _IN_PROCESS_LOCK:
+            cached_piper = _PIPER_VOICE_CACHE.get(piper_cache_key)
+            if cached_piper is not None:
+                voice_obj, last_used = cached_piper
+                if idle_timeout_sec > 0 and (now - last_used) > idle_timeout_sec:
+                    _PIPER_VOICE_CACHE.pop(piper_cache_key, None)
+                    del voice_obj
+                    import gc
+
+                    gc.collect()
+                else:
+                    piper_voice = voice_obj
+                    _PIPER_VOICE_CACHE[piper_cache_key] = (piper_voice, now)
+
         if piper_voice is None:
             try:
                 piper_voice = PiperVoice.load(str(model_path), use_cuda=use_cuda)
             except Exception as exc:  # noqa: BLE001 -- surfaced as one clear error type
                 raise TTSUnavailableError(f"failed to load piper voice {model_path}: {exc}") from exc
-            _PIPER_VOICE_CACHE[piper_cache_key] = piper_voice
+            if idle_timeout_sec > 0:
+                with _IN_PROCESS_LOCK:
+                    _PIPER_VOICE_CACHE[piper_cache_key] = (piper_voice, now)
+                    _schedule_in_process_reaper(idle_timeout_sec)
 
         # length_scale is piper's inverse-of-speed knob (2.0 == twice as
         # slow) -- confirmed against the real upstream Python API docs.
@@ -320,7 +406,7 @@ def pcm_to_format(
         raise TTSBadRequestError(f"unsupported response_format: {response_format!r}")
 
 
-def _synthesize_in_subprocess(
+def _synthesize_in_subprocess_oneshot(
     text: str,
     *,
     model_spec: TTSModelSpec,
@@ -330,7 +416,7 @@ def _synthesize_in_subprocess(
     models_dir: str,
     deps_dir: str,
 ) -> bytes:
-    """Run synthesis in an isolated subprocess worker so GPU VRAM is 100% reclaimed."""
+    """Run synthesis in an isolated one-shot subprocess worker."""
     with tempfile.TemporaryDirectory(prefix="lstt-tts-") as tmpdir:
         tmp_path = Path(tmpdir)
         req_file = tmp_path / "request.json"
@@ -389,6 +475,223 @@ def _synthesize_in_subprocess(
         return b""
 
 
+class TTSWorkerManager:
+    """Manages the persistent warm TTS worker subprocess (LS-9).
+
+    When tts_idle_timeout_sec > 0, keeps a worker process alive across requests
+    so that model weights (Kokoro-82M ~82M parameters) stay warm in memory,
+    eliminating the ~5s cold start on subsequent requests.
+    When idle beyond tts_idle_timeout_sec, the worker automatically terminates,
+    allowing the OS to reclaim 100% of VRAM and host RAM.
+    """
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.RLock()
+        self._last_active: float = 0.0
+        self._idle_timer: threading.Timer | None = None
+        self._current_timeout: float = 600.0
+
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._proc is not None and self._proc.poll() is None
+
+    def synthesize(
+        self,
+        text: str,
+        *,
+        model_spec: TTSModelSpec,
+        voice: str,
+        speed: float = 1.0,
+        device: str = "cpu",
+        models_dir: str = "/models",
+        deps_dir: str = "/app/data/tts-deps",
+        idle_timeout_sec: float = 600.0,
+    ) -> bytes:
+        with self._lock:
+            if idle_timeout_sec <= 0:
+                self.stop()
+                return _synthesize_in_subprocess_oneshot(
+                    text,
+                    model_spec=model_spec,
+                    voice=voice,
+                    speed=speed,
+                    device=device,
+                    models_dir=models_dir,
+                    deps_dir=deps_dir,
+                )
+
+            now = time.monotonic()
+            if self._proc is not None:
+                if self._proc.poll() is not None or (
+                    idle_timeout_sec > 0 and (now - self._last_active) > idle_timeout_sec
+                ):
+                    self.stop()
+
+            if self._proc is None or self._proc.poll() is not None:
+                self._current_timeout = idle_timeout_sec
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "live_stt.tts_worker",
+                    "--server",
+                    "--idle-timeout",
+                    str(idle_timeout_sec),
+                ]
+                self._proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+
+            with tempfile.TemporaryDirectory(prefix="lstt-tts-out-") as tmpdir:
+                out_pcm_file = Path(tmpdir) / "output.pcm"
+                req_payload = {
+                    "text": text,
+                    "model_key": model_spec.key,
+                    "voice": voice,
+                    "speed": speed,
+                    "device": device,
+                    "models_dir": models_dir,
+                    "deps_dir": deps_dir,
+                    "idle_timeout_sec": idle_timeout_sec,
+                    "out_pcm_path": str(out_pcm_file),
+                }
+
+                try:
+                    assert self._proc.stdin is not None
+                    assert self._proc.stdout is not None
+                    self._proc.stdin.write(json.dumps(req_payload) + "\n")
+                    self._proc.stdin.flush()
+                    res_line = self._proc.stdout.readline()
+                except Exception as exc:
+                    self.stop()
+                    raise TTSError(f"TTS persistent worker communication failed: {exc}") from exc
+
+                if not res_line:
+                    stderr_msg = ""
+                    if self._proc.stderr:
+                        try:
+                            stderr_msg = self._proc.stderr.read()
+                        except Exception:
+                            pass
+                    self.stop()
+                    raise TTSError(f"TTS persistent worker exited unexpectedly: {stderr_msg.strip()}")
+
+                try:
+                    res_data = json.loads(res_line)
+                except Exception as exc:
+                    self.stop()
+                    raise TTSError(f"Failed to parse TTS worker response: {exc}") from exc
+
+                if not res_data.get("ok"):
+                    err_msg = res_data.get("error", "Unknown error in TTS worker")
+                    err_type = res_data.get("error_type", "TTSError")
+                    if err_type == "TTSBadRequestError":
+                        raise TTSBadRequestError(err_msg)
+                    elif err_type == "TTSUnavailableError":
+                        self.stop()
+                        raise TTSUnavailableError(err_msg)
+                    raise TTSError(err_msg)
+
+                self._last_active = time.monotonic()
+                self._schedule_idle_reaper(idle_timeout_sec)
+                if out_pcm_file.exists():
+                    return out_pcm_file.read_bytes()
+                return b""
+
+    def _schedule_idle_reaper(self, idle_timeout_sec: float) -> None:
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+        if idle_timeout_sec > 0:
+            self._idle_timer = threading.Timer(idle_timeout_sec + 0.5, self._on_idle_timeout)
+            self._idle_timer.daemon = True
+            self._idle_timer.start()
+
+    def _on_idle_timeout(self) -> None:
+        with self._lock:
+            if self._proc is not None:
+                now = time.monotonic()
+                if (now - self._last_active) >= self._current_timeout:
+                    self.stop()
+
+    def stop(self) -> None:
+        with self._lock:
+            if self._idle_timer is not None:
+                self._idle_timer.cancel()
+                self._idle_timer = None
+            if self._proc is not None:
+                try:
+                    if self._proc.stdin and not self._proc.stdin.closed:
+                        self._proc.stdin.close()
+                    if self._proc.poll() is None:
+                        self._proc.terminate()
+                        try:
+                            self._proc.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            self._proc.kill()
+                            self._proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+                finally:
+                    self._proc = None
+
+
+_TTS_WORKER_MANAGER = TTSWorkerManager()
+
+
+def stop_tts_worker() -> None:
+    """Stop the persistent warm TTS worker subprocess if running."""
+    _TTS_WORKER_MANAGER.stop()
+
+
+atexit.register(stop_tts_worker)
+
+
+def _synthesize_in_subprocess(
+    text: str,
+    *,
+    model_spec: TTSModelSpec,
+    voice: str,
+    speed: float = 1.0,
+    device: str = "cpu",
+    models_dir: str = "/models",
+    deps_dir: str = "/app/data/tts-deps",
+    idle_timeout_sec: float = 600.0,
+) -> bytes:
+    """Run synthesis in an isolated subprocess worker.
+
+    When idle_timeout_sec > 0, reuses a warm persistent worker so cold starts (~5s for Kokoro)
+    only happen once, and terminates the worker when idle to reclaim 100% of VRAM/memory.
+    When idle_timeout_sec <= 0, executes in one-shot mode.
+    """
+    if idle_timeout_sec <= 0:
+        return _synthesize_in_subprocess_oneshot(
+            text,
+            model_spec=model_spec,
+            voice=voice,
+            speed=speed,
+            device=device,
+            models_dir=models_dir,
+            deps_dir=deps_dir,
+        )
+
+    return _TTS_WORKER_MANAGER.synthesize(
+        text,
+        model_spec=model_spec,
+        voice=voice,
+        speed=speed,
+        device=device,
+        models_dir=models_dir,
+        deps_dir=deps_dir,
+        idle_timeout_sec=idle_timeout_sec,
+    )
+
+
 def synthesize(
     text: str,
     *,
@@ -407,6 +710,7 @@ def synthesize(
     model_spec = tts_models.resolve(model_key)
     selected_voice = resolve_voice(voice, resolved_settings, model_spec)
     device = resolved_settings.tts_device
+    idle_timeout_sec = resolved_settings.tts_idle_timeout_sec
 
     # Synthesize all chunks
     chunks = chunk_text(text)
@@ -422,6 +726,7 @@ def synthesize(
                 device=device,
                 models_dir=resolved_settings.models_dir,
                 deps_dir=resolved_settings.tts_deps_dir,
+                idle_timeout_sec=idle_timeout_sec,
             )
             pcm_accumulator.extend(raw_pcm)
         except (TTSUnavailableError, TTSBadRequestError):
@@ -445,6 +750,7 @@ def synthesize(
                         device=device,
                         models_dir=resolved_settings.models_dir,
                         deps_dir=resolved_settings.tts_deps_dir,
+                        idle_timeout_sec=idle_timeout_sec,
                     )
                 )
     else:
@@ -458,6 +764,7 @@ def synthesize(
                     device=device,
                     models_dir=resolved_settings.models_dir,
                     deps_dir=resolved_settings.tts_deps_dir,
+                    idle_timeout_sec=idle_timeout_sec,
                 )
             )
 
@@ -482,6 +789,7 @@ def synthesize_stream(
     model_spec = tts_models.resolve(model_key)
     selected_voice = resolve_voice(voice, resolved_settings, model_spec)
     device = resolved_settings.tts_device
+    idle_timeout_sec = resolved_settings.tts_idle_timeout_sec
 
     chunks = chunk_text(text)
     for chunk in chunks:
@@ -493,6 +801,7 @@ def synthesize_stream(
             device=device,
             models_dir=resolved_settings.models_dir,
             deps_dir=resolved_settings.tts_deps_dir,
+            idle_timeout_sec=idle_timeout_sec,
         )
         if chunk_pcm:
             chunk_audio, _ = pcm_to_format(chunk_pcm, model_spec.sample_rate, response_format)

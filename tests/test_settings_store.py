@@ -87,6 +87,21 @@ def test_apply_update_allows_audio_dump_when_allow_pii_already_true() -> None:
     assert validated.audio_dump == "always"
 
 
+def test_hot_reload_fields_includes_tts_idle_timeout_sec() -> None:
+    assert "tts_idle_timeout_sec" in HOT_RELOAD_FIELDS
+
+
+def test_apply_update_updates_tts_idle_timeout_sec() -> None:
+    store = _store()
+    settings = Settings(_env_file=None)
+    validated = apply_update(store, settings, {"tts_idle_timeout_sec": 300.0})
+    assert validated.tts_idle_timeout_sec == 300.0
+    assert store.load_overrides() == {"tts_idle_timeout_sec": 300.0}
+
+    with pytest.raises(ValueError, match="tts_idle_timeout_sec must be non-negative"):
+        apply_update(store, settings, {"tts_idle_timeout_sec": -5.0})
+
+
 def test_hot_reload_fields_excludes_allow_pii() -> None:
     # Deliberate: see settings_store.py's HOT_RELOAD_FIELDS docstring --
     # flipping the PII-logging gate live is excluded on purpose.
@@ -99,3 +114,4 @@ def test_hot_reload_fields_excludes_process_lifetime_fields() -> None:
     # worker pool -- must stay restart-required.
     for field in ("max_concurrent_calls", "worker_bin", "rotate_after_sec", "vram_per_worker_mb"):
         assert field not in HOT_RELOAD_FIELDS
+

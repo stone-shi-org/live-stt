@@ -17,6 +17,7 @@ def test_defaults_load_without_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.tts_voice == "af_heart"
     assert settings.tts_device == "cpu"
     assert settings.tts_vram_mb == 1500
+    assert settings.tts_idle_timeout_sec == 600.0
 
 
 def test_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -24,10 +25,17 @@ def test_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     # whole point of replacing the old single LSTT_BACKEND switch.
     monkeypatch.setenv("LSTT_PARAKEET_BACKEND", "cuda")
     monkeypatch.setenv("LSTT_MAX_CONCURRENT_CALLS", "8")
+    monkeypatch.setenv("LSTT_TTS_IDLE_TIMEOUT_SEC", "120.0")
     settings = Settings(_env_file=None)
     assert settings.parakeet_backend == "cuda"
     assert settings.whisper_backend == "cpu"  # untouched, independent of parakeet_backend
     assert settings.max_concurrent_calls == 8
+    assert settings.tts_idle_timeout_sec == 120.0
+
+
+def test_tts_idle_timeout_must_be_non_negative() -> None:
+    with pytest.raises(ValueError, match="tts_idle_timeout_sec must be non-negative"):
+        Settings(_env_file=None, tts_idle_timeout_sec=-1.0)
 
 
 def test_finalize_timeout_may_not_exceed_drain_timeout() -> None:
@@ -38,3 +46,4 @@ def test_finalize_timeout_may_not_exceed_drain_timeout() -> None:
 def test_finalize_timeout_equal_to_drain_timeout_is_allowed() -> None:
     settings = Settings(_env_file=None, finalize_timeout_sec=300.0, drain_timeout_sec=300.0)
     assert settings.finalize_timeout_sec == 300.0
+

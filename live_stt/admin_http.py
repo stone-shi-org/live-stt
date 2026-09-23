@@ -2286,7 +2286,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 id: "tts",
                 name: "Text-to-Speech (TTS)",
                 icon: "🔊",
-                keys: ["tts_model", "tts_voice", "tts_device", "tts_in_subprocess", "tts_deps_dir"]
+                keys: ["tts_model", "tts_voice", "tts_device", "tts_idle_timeout_sec", "tts_in_subprocess", "tts_deps_dir"]
             },
             {
                 id: "system",

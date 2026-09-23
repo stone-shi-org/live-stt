@@ -9,6 +9,7 @@ import grpc
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
+from live_stt import tts
 from live_stt.admin_http import serve_admin_http
 from live_stt.admission import WorkerBudget
 from live_stt.backends.upgrade_checker import run_periodic_upgrade_check
@@ -105,6 +106,7 @@ async def serve(settings: Settings | None = None) -> None:
     await stop_event.wait()
     await server.stop(grace=settings.drain_timeout_sec)
     admin_http.shutdown()
+    tts.stop_tts_worker()
     if upgrade_check_task is not None:
         upgrade_check_task.cancel()
 

@@ -11,9 +11,13 @@ from live_stt.config import Settings
 from live_stt.tts import (
     TTSBadRequestError,
     TTSUnavailableError,
+    _KOKORO_PIPELINE_CACHE,
     chunk_text,
+    clear_tts_caches,
+    evict_idle_tts_caches,
     pcm_to_format,
     pcm_to_wav,
+    stop_tts_worker,
     synthesize,
     synthesize_stream,
 )
@@ -392,3 +396,148 @@ class TestResolveVoiceCrossEngineBug:
         assert status == 503
         assert b"en_US-lessac-medium" in body
         assert b"af_heart" not in body
+
+
+class TestTTSIdleTimeoutAndCaching:
+    """LS-9: Engine cache idle timeout tests for Kokoro and Piper."""
+
+    def test_in_process_cache_reuses_warmed_pipeline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_fake_kokoro(monkeypatch)
+        clear_tts_caches()
+
+        settings = Settings(_env_file=None, tts_in_subprocess=False, tts_idle_timeout_sec=600.0)
+        synthesize("First sentence.", model="kokoro-82m-v1", voice="af_heart", settings=settings)
+
+        # Cache should now hold the loaded pipeline
+        assert len(_KOKORO_PIPELINE_CACHE) == 1
+        pipeline_instance, first_used = next(iter(_KOKORO_PIPELINE_CACHE.values()))
+
+        # Second synthesis within idle timeout reuses the same pipeline object (no reload)
+        synthesize("Second sentence.", model="kokoro-82m-v1", voice="af_heart", settings=settings)
+        assert len(_KOKORO_PIPELINE_CACHE) == 1
+        pipeline_instance_2, second_used = next(iter(_KOKORO_PIPELINE_CACHE.values()))
+        assert pipeline_instance_2 is pipeline_instance
+        assert second_used >= first_used
+
+    def test_in_process_cache_evicts_after_idle_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time
+
+        _install_fake_kokoro(monkeypatch)
+        clear_tts_caches()
+
+        fake_time = 1000.0
+        monkeypatch.setattr(time, "monotonic", lambda: fake_time)
+
+        settings = Settings(_env_file=None, tts_in_subprocess=False, tts_idle_timeout_sec=10.0)
+        synthesize("First sentence.", model="kokoro-82m-v1", voice="af_heart", settings=settings)
+        assert len(_KOKORO_PIPELINE_CACHE) == 1
+        initial_pipeline = next(iter(_KOKORO_PIPELINE_CACHE.values()))[0]
+
+        # Advance time by 15 seconds (exceeding 10s idle timeout)
+        fake_time = 1015.0
+
+        # Eviction function purges the idle pipeline
+        evicted = evict_idle_tts_caches(10.0)
+        assert evicted == 1
+        assert len(_KOKORO_PIPELINE_CACHE) == 0
+
+        # Next synthesis reloads a new pipeline
+        synthesize("Third sentence.", model="kokoro-82m-v1", voice="af_heart", settings=settings)
+        assert len(_KOKORO_PIPELINE_CACHE) == 1
+        new_pipeline = next(iter(_KOKORO_PIPELINE_CACHE.values()))[0]
+        assert new_pipeline is not initial_pipeline
+
+    def test_in_process_zero_idle_timeout_does_not_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_fake_kokoro(monkeypatch)
+        clear_tts_caches()
+
+        settings = Settings(_env_file=None, tts_in_subprocess=False, tts_idle_timeout_sec=0.0)
+        synthesize("Sentence.", model="kokoro-82m-v1", voice="af_heart", settings=settings)
+        # With idle_timeout_sec=0 (one-shot mode), pipeline is not cached
+        assert len(_KOKORO_PIPELINE_CACHE) == 0
+
+    def test_clear_tts_caches_empties_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_fake_kokoro(monkeypatch)
+        settings = Settings(_env_file=None, tts_in_subprocess=False, tts_idle_timeout_sec=600.0)
+        synthesize("Sentence.", model="kokoro-82m-v1", voice="af_heart", settings=settings)
+        assert len(_KOKORO_PIPELINE_CACHE) > 0
+        clear_tts_caches()
+        assert len(_KOKORO_PIPELINE_CACHE) == 0
+
+
+class TestTTSWorkerPersistentServer:
+    """LS-9: Persistent warm TTS worker tests."""
+
+    def test_process_request_success(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        from live_stt.tts_worker import process_request
+
+        _install_fake_kokoro(monkeypatch)
+        out_pcm = tmp_path / "out.pcm"
+        req = {
+            "text": "Hello world.",
+            "model_key": "kokoro-82m-v1",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "device": "cpu",
+            "models_dir": str(tmp_path),
+            "deps_dir": str(tmp_path),
+            "idle_timeout_sec": 600.0,
+            "out_pcm_path": str(out_pcm),
+        }
+        ok, res = process_request(req)
+        assert ok is True
+        assert res["ok"] is True
+        assert out_pcm.is_file()
+        assert len(out_pcm.read_bytes()) > 0
+
+    def test_process_request_missing_engine(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        from live_stt.tts_worker import process_request
+
+        monkeypatch.setitem(sys.modules, "kokoro", None)
+        out_pcm = tmp_path / "out.pcm"
+        req = {
+            "text": "Hello world.",
+            "model_key": "kokoro-82m-v1",
+            "voice": "af_heart",
+            "speed": 1.0,
+            "device": "cpu",
+            "models_dir": str(tmp_path),
+            "deps_dir": str(tmp_path),
+            "idle_timeout_sec": 600.0,
+            "out_pcm_path": str(out_pcm),
+        }
+        ok, res = process_request(req)
+        assert ok is False
+        assert res["error_type"] == "TTSUnavailableError"
+        assert "kokoro is not installed" in res["error"]
+
+    def test_tts_worker_manager_stop(self) -> None:
+        from live_stt.tts import _TTS_WORKER_MANAGER
+
+        # stop() is idempotent and safe to call when not running
+        _TTS_WORKER_MANAGER.stop()
+        assert _TTS_WORKER_MANAGER.is_running() is False
+        stop_tts_worker()
+        assert _TTS_WORKER_MANAGER.is_running() is False
+
+    def test_server_idle_timeout_clean_exit(self) -> None:
+        import subprocess
+        import sys
+
+        cmd = [sys.executable, "-m", "live_stt.tts_worker", "--server", "--idle-timeout", "0.5"]
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        # Without any input, select.select times out after 0.5s and worker exits cleanly (returncode 0)
+        try:
+            returncode = proc.wait(timeout=3.0)
+            assert returncode == 0
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+

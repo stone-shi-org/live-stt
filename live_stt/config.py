@@ -298,6 +298,13 @@ class Settings(BaseSettings):
     tts_device: str = "cpu"  # "cpu" | "cuda"
     tts_vram_mb: int = 1500  # admission gate when tts_device is "cuda"
     tts_in_subprocess: bool = True
+    # Warmed-up engine cache idle timeout in seconds (LS-9).
+    # When > 0, the loaded engine / worker process is kept warm across requests
+    # and automatically unloaded/terminated after this many seconds of inactivity,
+    # eliminating cold starts (~5s for Kokoro) on subsequent requests while
+    # still reclaiming 100% of memory/VRAM once idle. When 0, the engine/worker
+    # is unloaded immediately after each request (one-shot).
+    tts_idle_timeout_sec: float = 600.0
     # Runtime-installed TTS engine dependency trees (live_stt/tts_installer.py),
     # same "one image, install what you need" mechanism as
     # diarization_deps_dir above -- kokoro/piper are deliberately NOT baked
@@ -311,6 +318,8 @@ class Settings(BaseSettings):
     def _check_grace_period(self) -> "Settings":
         if self.finalize_timeout_sec > self.drain_timeout_sec:
             raise ValueError("finalize_timeout_sec must not exceed drain_timeout_sec")
+        if self.tts_idle_timeout_sec < 0:
+            raise ValueError("tts_idle_timeout_sec must be non-negative")
         return self
 
 

@@ -56,6 +56,7 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset(
         "diarization_max_speakers",
         "diarization_vram_mb",
         "tts_voice",
+        "tts_idle_timeout_sec",
         "transcript_log",
         "audio_dump",
         # LS-5 Phase 7c: a policy toggle for a periodic BACKGROUND check
