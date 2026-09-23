@@ -239,22 +239,21 @@ def _synthesize_chunk_direct(
             ) from exc
 
         model_path = _resolve_piper_voice_model(models_dir, voice, deps_dir)
-        use_cuda = device == "cuda"
-        if use_cuda:
+        use_cuda = False
+        if device == "cuda":
             try:
                 import onnxruntime  # type: ignore[import-not-found]
 
-                if "CUDAExecutionProvider" not in onnxruntime.get_available_providers():
-                    raise TTSUnavailableError(
-                        "tts_device=cuda for the piper engine, but the installed "
-                        "onnxruntime has no CUDAExecutionProvider -- piper-tts's own "
-                        "pip dependency is CPU-only onnxruntime; install "
-                        "onnxruntime-gpu (in place of plain onnxruntime) to actually "
-                        "get GPU acceleration, or set tts_device=cpu to match what's "
-                        "really installed."
+                if "CUDAExecutionProvider" in onnxruntime.get_available_providers():
+                    use_cuda = True
+                else:
+                    logger.info(
+                        "tts_device=cuda requested for piper engine, but installed onnxruntime "
+                        "has no CUDAExecutionProvider (piper-tts ships CPU-only onnxruntime); "
+                        "falling back to CPU"
                     )
-            except ImportError as exc:
-                raise TTSUnavailableError("onnxruntime is not importable despite piper being installed") from exc
+            except ImportError:
+                pass
 
         piper_cache_key = (str(model_path), use_cuda)
         piper_voice = _PIPER_VOICE_CACHE.get(piper_cache_key)

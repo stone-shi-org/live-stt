@@ -115,6 +115,38 @@ def test_cuda_vram_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
     assert tracker.rejected_vram_total == 1
 
 
+def test_cuda_vram_rejection_skipped_for_zero_vram_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    # LS-8: piper-en-us has measured_peak_vram_mb=0 and runs on CPU (or falls back to CPU).
+    # Even if tts_device="cuda" and free VRAM is below tts_vram_mb, piper requests
+    # must not be rejected by the VRAM admission gate.
+    fake_piper = types.ModuleType("piper")
+    fake_piper.PiperVoice = type("PiperVoice", (), {})
+    monkeypatch.setitem(sys.modules, "piper", fake_piper)
+
+    settings = Settings(
+        _env_file=None,
+        tts_device="cuda",
+        tts_vram_mb=5000,
+        models_dir=str(tmp_path),
+    )
+    tracker = TTSSessionTracker()
+
+    monkeypatch.setattr(gpu, "free_vram_mb", lambda: 1000)
+
+    status, body, ct, _ = tts_http.handle_speech_request(
+        content_type="application/json",
+        body=json.dumps({"input": "Hello", "model": "piper-en-us"}).encode(),
+        settings=settings,
+        tracker=tracker,
+    )
+    # Gating should NOT have rejected with 503 "insufficient free VRAM".
+    # It reaches voice model loading (which raises 503 voice model not found since tmp_path has no voice).
+    assert b"insufficient free VRAM" not in body
+    assert tracker.rejected_vram_total == 0
+
+
 def test_missing_engine_returns_503_not_a_silent_fake_tone(monkeypatch: pytest.MonkeyPatch) -> None:
     # Real bug, found against actual production (see live_stt/tts.py's
     # module docstring): before this fix, a missing kokoro/piper made this

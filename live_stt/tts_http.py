@@ -101,8 +101,8 @@ def handle_speech_request(
     # duplicating (and re-breaking) it.
     voice = tts.resolve_voice(payload.get("voice"), settings, model_spec)
 
-    # VRAM Gate for CUDA
-    if settings.tts_device == "cuda":
+    # VRAM Gate for CUDA: only enforce VRAM budget for models requiring GPU VRAM
+    if settings.tts_device == "cuda" and (model_spec.measured_peak_vram_mb or 0) > 0:
         free_vram = gpu.free_vram_mb()
         if free_vram is not None and free_vram < settings.tts_vram_mb:
             tracker.record_rejected_vram()

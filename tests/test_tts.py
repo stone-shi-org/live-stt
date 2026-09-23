@@ -240,6 +240,92 @@ class TestMissingEngineRaisesClearly:
             )
 
 
+class TestPiperDeviceFallback:
+    """LS-8: piper-tts packages only CPU onnxruntime by default. When
+    tts_device="cuda" is configured (e.g. for Kokoro), Piper synthesis
+    must gracefully fall back to CPU rather than raising TTSUnavailableError,
+    or use CUDA if CUDAExecutionProvider is actually available.
+    """
+
+    def test_piper_cuda_device_falls_back_to_cpu_when_no_cuda_provider(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        fake_piper = types.ModuleType("piper")
+        load_calls = []
+
+        class FakePiperVoice:
+            @classmethod
+            def load(cls, model_path: str, use_cuda: bool = False):
+                load_calls.append({"model_path": model_path, "use_cuda": use_cuda})
+                return cls()
+
+            def synthesize(self, text, syn_config=None):
+                return [types.SimpleNamespace(audio_int16_bytes=b"\x00" * 3200)]
+
+        fake_piper.PiperVoice = FakePiperVoice
+        monkeypatch.setitem(sys.modules, "piper", fake_piper)
+
+        fake_onnxruntime = types.ModuleType("onnxruntime")
+        fake_onnxruntime.get_available_providers = lambda: ["CPUExecutionProvider"]
+        monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnxruntime)
+
+        model_file = tmp_path / "en_US-lessac-medium.onnx"
+        model_file.write_bytes(b"dummy")
+
+        settings = Settings(
+            _env_file=None,
+            tts_in_subprocess=False,
+            tts_device="cuda",
+            models_dir=str(tmp_path),
+        )
+        audio_bytes, ct = synthesize(
+            "Hello world", model="piper-en-us", response_format="wav", settings=settings
+        )
+        assert audio_bytes
+        assert ct == "audio/wav"
+        assert len(load_calls) == 1
+        assert load_calls[0]["use_cuda"] is False
+
+    def test_piper_cuda_device_uses_cuda_when_cuda_provider_is_available(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        fake_piper = types.ModuleType("piper")
+        load_calls = []
+
+        class FakePiperVoice:
+            @classmethod
+            def load(cls, model_path: str, use_cuda: bool = False):
+                load_calls.append({"model_path": model_path, "use_cuda": use_cuda})
+                return cls()
+
+            def synthesize(self, text, syn_config=None):
+                return [types.SimpleNamespace(audio_int16_bytes=b"\x00" * 3200)]
+
+        fake_piper.PiperVoice = FakePiperVoice
+        monkeypatch.setitem(sys.modules, "piper", fake_piper)
+
+        fake_onnxruntime = types.ModuleType("onnxruntime")
+        fake_onnxruntime.get_available_providers = lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        monkeypatch.setitem(sys.modules, "onnxruntime", fake_onnxruntime)
+
+        model_file = tmp_path / "en_US-lessac-medium.onnx"
+        model_file.write_bytes(b"dummy")
+
+        settings = Settings(
+            _env_file=None,
+            tts_in_subprocess=False,
+            tts_device="cuda",
+            models_dir=str(tmp_path),
+        )
+        audio_bytes, ct = synthesize(
+            "Hello world", model="piper-en-us", response_format="wav", settings=settings
+        )
+        assert audio_bytes
+        assert ct == "audio/wav"
+        assert len(load_calls) == 1
+        assert load_calls[0]["use_cuda"] is True
+
+
 class TestResolveVoiceCrossEngineBug:
     """Real bug, found for real against a running container while
     verifying the fixes above: Settings.tts_voice defaults to "af_heart"
