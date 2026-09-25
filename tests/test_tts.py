@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+import time
 import types
 import wave
 import pytest
@@ -464,6 +465,20 @@ class TestTTSIdleTimeoutAndCaching:
         clear_tts_caches()
         assert len(_KOKORO_PIPELINE_CACHE) == 0
 
+    def test_cache_hit_reschedules_in_process_reaper(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _install_fake_kokoro(monkeypatch)
+        clear_tts_caches()
+
+        reaper_calls = []
+        monkeypatch.setattr("live_stt.tts._schedule_in_process_reaper", lambda t: reaper_calls.append(t))
+
+        settings = Settings(_env_file=None, tts_in_subprocess=False, tts_idle_timeout_sec=600.0)
+        synthesize("First sentence.", model="kokoro-82m-v1", voice="af_heart", settings=settings)
+        assert len(reaper_calls) == 1
+
+        synthesize("Second sentence.", model="kokoro-82m-v1", voice="af_heart", settings=settings)
+        assert len(reaper_calls) == 2
+
 
 class TestTTSWorkerPersistentServer:
     """LS-9: Persistent warm TTS worker tests."""
@@ -539,5 +554,60 @@ class TestTTSWorkerPersistentServer:
         finally:
             if proc.poll() is None:
                 proc.kill()
+
+    def test_manager_tolerates_non_json_warning_lines(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        from live_stt import tts_models
+        from live_stt.tts import TTSWorkerManager
+
+        manager = TTSWorkerManager()
+        fake_out_file = tmp_path / "output.pcm"
+        fake_out_file.write_bytes(b"\x00\x00" * 100)
+
+        class FakeProc:
+            def __init__(self):
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(
+                    "WARNING: Defaulting repo_id to hexgrad/Kokoro-82M. Pass repo_id='hexgrad/Kokoro-82M' to suppress this warning.\n"
+                    "UserWarning: some other warning\n"
+                    + json.dumps({"ok": True})
+                    + "\n"
+                )
+                self.stderr = io.StringIO()
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        fake_proc = FakeProc()
+        manager._proc = fake_proc
+        manager._last_active = time.monotonic()
+
+        class DummyTmpDir:
+            def __enter__(self):
+                return str(tmp_path)
+
+            def __exit__(self, *args):
+                pass
+
+        monkeypatch.setattr("tempfile.TemporaryDirectory", lambda prefix=None: DummyTmpDir())
+
+        model_spec = tts_models.resolve("kokoro-82m-v1")
+        pcm = manager.synthesize(
+            "Hello",
+            model_spec=model_spec,
+            voice="af_heart",
+            idle_timeout_sec=600.0,
+        )
+        assert len(pcm) == 200
+        assert manager.is_running() is True
+        manager.stop()
 
 

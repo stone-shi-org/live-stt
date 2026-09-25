@@ -119,6 +119,13 @@ def evict_idle_tts_caches(idle_timeout_sec: float) -> int:
         import gc
 
         gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
     return evicted
 
 
@@ -130,6 +137,13 @@ def clear_tts_caches() -> None:
     import gc
 
     gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _schedule_in_process_reaper(idle_timeout_sec: float) -> None:
@@ -262,13 +276,25 @@ def _synthesize_chunk_direct(
                     import gc
 
                     gc.collect()
+                    try:
+                        import torch
+
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
                 else:
                     pipeline = pipeline_obj
                     _KOKORO_PIPELINE_CACHE[cache_key] = (pipeline, now)
+                    if idle_timeout_sec > 0:
+                        _schedule_in_process_reaper(idle_timeout_sec)
 
         if pipeline is None:
             try:
-                pipeline = KPipeline(lang_code=lang_code, device=pipeline_device)
+                try:
+                    pipeline = KPipeline(lang_code=lang_code, repo_id="hexgrad/Kokoro-82M", device=pipeline_device)
+                except TypeError:
+                    pipeline = KPipeline(lang_code=lang_code, device=pipeline_device)
             except Exception as exc:  # noqa: BLE001 -- surfaced as one clear error type
                 raise TTSUnavailableError(
                     f"failed to load kokoro pipeline (lang_code={lang_code!r}): {exc}"
@@ -339,6 +365,8 @@ def _synthesize_chunk_direct(
                 else:
                     piper_voice = voice_obj
                     _PIPER_VOICE_CACHE[piper_cache_key] = (piper_voice, now)
+                    if idle_timeout_sec > 0:
+                        _schedule_in_process_reaper(idle_timeout_sec)
 
         if piper_voice is None:
             try:
@@ -530,6 +558,7 @@ class TTSWorkerManager:
 
             if self._proc is None or self._proc.poll() is not None:
                 self._current_timeout = idle_timeout_sec
+                self._last_active = now
                 cmd = [
                     sys.executable,
                     "-m",
@@ -566,7 +595,18 @@ class TTSWorkerManager:
                     assert self._proc.stdout is not None
                     self._proc.stdin.write(json.dumps(req_payload) + "\n")
                     self._proc.stdin.flush()
-                    res_line = self._proc.stdout.readline()
+                    res_line = ""
+                    while True:
+                        line = self._proc.stdout.readline()
+                        if not line:
+                            break
+                        line_stripped = line.strip()
+                        if not line_stripped:
+                            continue
+                        if line_stripped.startswith("{") and line_stripped.endswith("}"):
+                            res_line = line_stripped
+                            break
+                        logger.warning("TTS worker non-JSON output on stdout: %s", line_stripped)
                 except Exception as exc:
                     self.stop()
                     raise TTSError(f"TTS persistent worker communication failed: {exc}") from exc
@@ -793,16 +833,43 @@ def synthesize_stream(
 
     chunks = chunk_text(text)
     for chunk in chunks:
-        chunk_pcm = _synthesize_chunk_direct(
-            chunk,
-            model_spec=model_spec,
-            voice=selected_voice,
-            speed=speed,
-            device=device,
-            models_dir=resolved_settings.models_dir,
-            deps_dir=resolved_settings.tts_deps_dir,
-            idle_timeout_sec=idle_timeout_sec,
-        )
+        chunk_pcm = b""
+        if resolved_settings.tts_in_subprocess and not os.getenv("PYTEST_CURRENT_TEST"):
+            try:
+                chunk_pcm = _synthesize_in_subprocess(
+                    chunk,
+                    model_spec=model_spec,
+                    voice=selected_voice,
+                    speed=speed,
+                    device=device,
+                    models_dir=resolved_settings.models_dir,
+                    deps_dir=resolved_settings.tts_deps_dir,
+                    idle_timeout_sec=idle_timeout_sec,
+                )
+            except (TTSUnavailableError, TTSBadRequestError):
+                raise
+            except Exception:
+                chunk_pcm = _synthesize_chunk_direct(
+                    chunk,
+                    model_spec=model_spec,
+                    voice=selected_voice,
+                    speed=speed,
+                    device=device,
+                    models_dir=resolved_settings.models_dir,
+                    deps_dir=resolved_settings.tts_deps_dir,
+                    idle_timeout_sec=idle_timeout_sec,
+                )
+        else:
+            chunk_pcm = _synthesize_chunk_direct(
+                chunk,
+                model_spec=model_spec,
+                voice=selected_voice,
+                speed=speed,
+                device=device,
+                models_dir=resolved_settings.models_dir,
+                deps_dir=resolved_settings.tts_deps_dir,
+                idle_timeout_sec=idle_timeout_sec,
+            )
         if chunk_pcm:
             chunk_audio, _ = pcm_to_format(chunk_pcm, model_spec.sample_rate, response_format)
             yield chunk_audio

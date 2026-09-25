@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import select
 import sys
 from pathlib import Path
@@ -96,47 +97,66 @@ def run_server(idle_timeout_sec: float) -> None:
 
     Exits automatically when idle for longer than idle_timeout_sec.
     """
+    # Isolate IPC protocol stdout from library prints and C-level stdout.
+    # Duplicating stdout gives us a dedicated file descriptor for IPC communication.
+    # Redirecting fd 1 and sys.stdout to sys.stderr ensures that any third-party
+    # print statements, warnings (e.g. Kokoro repo_id warning), or C extensions
+    # write to stderr without corrupting the NDJSON protocol stream.
+    ipc_stdout_fd = os.dup(sys.stdout.fileno())
+    ipc_stdout = os.fdopen(ipc_stdout_fd, "w", encoding="utf-8", buffering=1)
+    try:
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    except Exception:
+        pass
+    sys.stdout = sys.stderr
+
     logger.info("TTS persistent worker started (idle_timeout_sec=%.1f)", idle_timeout_sec)
     current_timeout = idle_timeout_sec
-    while True:
-        if current_timeout > 0:
-            ready, _, _ = select.select([sys.stdin], [], [], current_timeout)
-            if not ready:
-                logger.info(
-                    "TTS persistent worker idle timeout (%.1fs) expired. Exiting cleanly.",
-                    current_timeout,
-                )
+    try:
+        while True:
+            if current_timeout > 0:
+                ready, _, _ = select.select([sys.stdin], [], [], current_timeout)
+                if not ready:
+                    logger.info(
+                        "TTS persistent worker idle timeout (%.1fs) expired. Exiting cleanly.",
+                        current_timeout,
+                    )
+                    break
+
+            line = sys.stdin.readline()
+            if not line:
+                # EOF on stdin (parent closed pipe)
                 break
+            line = line.strip()
+            if not line:
+                continue
 
-        line = sys.stdin.readline()
-        if not line:
-            # EOF on stdin (parent closed pipe)
-            break
-        line = line.strip()
-        if not line:
-            continue
-
-        try:
-            req_data = json.loads(line)
-        except Exception as exc:
-            res_obj = {
-                "ok": False,
-                "error_type": "TTSBadRequestError",
-                "error": f"Invalid JSON request: {exc}",
-            }
-            sys.stdout.write(json.dumps(res_obj) + "\n")
-            sys.stdout.flush()
-            continue
-
-        if "idle_timeout_sec" in req_data:
             try:
-                current_timeout = float(req_data["idle_timeout_sec"])
-            except (ValueError, TypeError):
-                pass
+                req_data = json.loads(line)
+            except Exception as exc:
+                res_obj = {
+                    "ok": False,
+                    "error_type": "TTSBadRequestError",
+                    "error": f"Invalid JSON request: {exc}",
+                }
+                ipc_stdout.write(json.dumps(res_obj) + "\n")
+                ipc_stdout.flush()
+                continue
 
-        ok, res_obj = process_request(req_data)
-        sys.stdout.write(json.dumps(res_obj) + "\n")
-        sys.stdout.flush()
+            if "idle_timeout_sec" in req_data:
+                try:
+                    current_timeout = float(req_data["idle_timeout_sec"])
+                except (ValueError, TypeError):
+                    pass
+
+            ok, res_obj = process_request(req_data)
+            ipc_stdout.write(json.dumps(res_obj) + "\n")
+            ipc_stdout.flush()
+    finally:
+        try:
+            ipc_stdout.close()
+        except Exception:
+            pass
 
 
 def main() -> None:
