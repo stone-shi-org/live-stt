@@ -180,7 +180,9 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
                 )
                 return
 
-            session = CallSession(self._settings, spec, config, self._budget)
+            session = CallSession(
+                self._settings, spec, config, self._budget, worker_pool=self._state.worker_pool
+            )
             try:
                 ready_event = await session.start()
             except WorkerError as exc:

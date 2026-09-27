@@ -17,6 +17,8 @@ import os
 import signal
 import socket
 import subprocess
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +79,135 @@ async def _read_json_frame(reader: asyncio.StreamReader) -> tuple[FrameType, dic
     return frame_type, doc
 
 
+def _read_exact_sync(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("socket closed before reading requested bytes")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _read_frame_sync(sock: socket.socket) -> tuple[FrameType, bytes]:
+    header = _read_exact_sync(sock, HEADER_SIZE)
+    payload_len, frame_type = parse_header(header)
+    payload = _read_exact_sync(sock, payload_len) if payload_len else b""
+    return frame_type, payload
+
+
+def _read_json_frame_sync(sock: socket.socket) -> tuple[FrameType, dict[str, Any]]:
+    frame_type, payload = _read_frame_sync(sock)
+    doc = json.loads(payload.decode()) if payload else {}
+    return frame_type, doc
+
+
+@dataclass(frozen=True, slots=True)
+class StandbyKey:
+    worker_bin: str
+    gguf_path: str
+    language: str
+    n_threads: int
+    ggml_lib_dir: str | None = None
+    ggml_backend_path: str | None = None
+    use_gpu: bool = False
+    model_key: str = ""
+
+
+@dataclass
+class StandbyWorker:
+    proc: subprocess.Popen
+    sock: socket.socket
+    ready: dict[str, Any]
+    key: StandbyKey
+    idle_since: float
+
+    def kill(self) -> None:
+        try:
+            self.proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def spawn_standby_sync(
+    *,
+    worker_bin: Path,
+    gguf_path: str,
+    language: str,
+    n_threads: int,
+    ggml_lib_dir: Path | None = None,
+    ggml_backend_path: Path | None = None,
+    use_gpu: bool = False,
+    model_key: str = "",
+) -> StandbyWorker:
+    parent_sock, child_sock = socket.socketpair()
+    child_fd = child_sock.fileno()
+    env = dict(os.environ)
+    if ggml_lib_dir is not None:
+        env["LD_LIBRARY_PATH"] = str(ggml_lib_dir)
+    if ggml_backend_path is not None:
+        env["GGML_BACKEND_PATH"] = str(ggml_backend_path)
+    try:
+        proc = subprocess.Popen(
+            [str(worker_bin)],
+            pass_fds=(child_fd, 3),
+            env=env,
+            preexec_fn=lambda: _harden_child(child_fd),
+        )
+    finally:
+        child_sock.close()
+
+    config = json.dumps(
+        {
+            "gguf_path": gguf_path,
+            "language": language,
+            "n_threads": n_threads,
+            "use_gpu": use_gpu,
+        }
+    )
+    try:
+        parent_sock.settimeout(30.0)
+        parent_sock.sendall(pack(FrameType.CONFIG, config.encode()))
+        frame_type, doc = _read_json_frame_sync(parent_sock)
+    except Exception as exc:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        parent_sock.close()
+        raise WorkerError(f"worker died before CONFIG completed: {exc}") from exc
+
+    if frame_type != FrameType.READY:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        parent_sock.close()
+        raise WorkerError(f"worker CONFIG failed: {doc}")
+
+    key = StandbyKey(
+        worker_bin=str(worker_bin),
+        gguf_path=str(gguf_path),
+        language=language,
+        n_threads=n_threads,
+        ggml_lib_dir=str(ggml_lib_dir) if ggml_lib_dir else None,
+        ggml_backend_path=str(ggml_backend_path) if ggml_backend_path else None,
+        use_gpu=use_gpu,
+        model_key=model_key,
+    )
+    return StandbyWorker(
+        proc=proc,
+        sock=parent_sock,
+        ready=doc,
+        key=key,
+        idle_since=time.monotonic(),
+    )
+
+
 class WorkerHandle:
     def __init__(
         self, proc: subprocess.Popen, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -85,6 +216,14 @@ class WorkerHandle:
         self._reader = reader
         self._writer = writer
         self.ready: dict[str, Any] = {}
+
+    @classmethod
+    async def from_standby(cls, standby: StandbyWorker) -> "WorkerHandle":
+        standby.sock.setblocking(False)
+        reader, writer = await asyncio.open_connection(sock=standby.sock)
+        handle = cls(standby.proc, reader, writer)
+        handle.ready = standby.ready
+        return handle
 
     @classmethod
     async def spawn(

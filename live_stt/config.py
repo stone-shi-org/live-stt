@@ -145,6 +145,14 @@ class Settings(BaseSettings):
     # somewhere to put its overlap shadow. Never hand the reserve to a call.
     reserve_slots: int = 1
 
+    # Warmed-up STT engine idle timeout in seconds (LS-10).
+    # When > 0, pre-warmed standby workers and loaded models are kept warm across
+    # requests and automatically terminated/unloaded after this many seconds of
+    # inactivity, eliminating cold starts (~0.5s-5s) on subsequent streaming gRPC
+    # calls and batch HTTP requests while reclaiming 100% of host RAM and GPU VRAM
+    # once idle. When 0, standby caching is disabled (one-shot mode).
+    stt_idle_timeout_sec: float = 600.0
+
     # Rotation triggers (see live_stt/pool/supervisor.py). RSS is primary and
     # backend-agnostic; audio_cap is the deterministic fallback.
     #
@@ -320,6 +328,8 @@ class Settings(BaseSettings):
             raise ValueError("finalize_timeout_sec must not exceed drain_timeout_sec")
         if self.tts_idle_timeout_sec < 0:
             raise ValueError("tts_idle_timeout_sec must be non-negative")
+        if self.stt_idle_timeout_sec < 0:
+            raise ValueError("stt_idle_timeout_sec must be non-negative")
         return self
 
 

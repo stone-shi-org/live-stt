@@ -35,7 +35,8 @@ from live_stt.events import worker_json_to_events
 from live_stt.logging_config import get_logger
 from live_stt.models import ModelSpec, strip_language_tag
 from live_stt.pb.livestt.v1 import asr_pb2
-from live_stt.worker import WorkerError, WorkerHandle
+from live_stt.worker import StandbyKey, WorkerError, WorkerHandle
+from live_stt.worker_pool import STTWorkerPool
 
 logger = get_logger("session")
 
@@ -51,11 +52,13 @@ class CallSession:
         model_spec: ModelSpec,
         config: asr_pb2.StreamConfig,
         budget: WorkerBudget,
+        worker_pool: STTWorkerPool | None = None,
     ) -> None:
         self._settings = settings
         self._model_spec = model_spec
         self._config = config
         self._budget = budget
+        self._worker_pool = worker_pool
 
         self._worker: WorkerHandle | None = None
         self._fed_samples = 0
@@ -133,12 +136,8 @@ class CallSession:
             )
         return fallback_lib_dir
 
-    async def _spawn_worker(self) -> WorkerHandle:
+    def _resolve_spawn_params(self) -> tuple[Path, str, str, int, Path | None, Path | None, bool, str]:
         gguf_path = str(Path(self._settings.models_dir) / self._model_spec.gguf_filename)
-        # Engine-based dispatch: which binary/lib-dir/thread-count pair to
-        # use. WorkerHandle.spawn() itself is engine-agnostic (it just execs
-        # whatever worker_bin it's given and speaks the same IPC framing
-        # either way) -- this is the one place that decides WHICH binary.
         if self._model_spec.engine == "whisper":
             worker_bin = Path(self._settings.worker_bin_whisper)
             engine_backend = self._settings.whisper_backend
@@ -149,24 +148,10 @@ class CallSession:
             )
             ggml_lib_dir = self._resolve_lib_dir("whisper", engine_backend, fallback_lib_dir)
             n_threads = self._settings.n_threads_whisper
-            # Whisper's worker is the one engine whose main() calls ggml's
-            # own ggml_backend_load_all() (see main_whisper.cpp's comment) --
-            # a dynamic-discovery mechanism that does NOT consult
-            # LD_LIBRARY_PATH (confirmed by reading the vendored
-            # ggml-backend-reg.cpp; see WorkerHandle.spawn()'s own comment
-            # on ggml_backend_path for the full story). A cuda flavor
-            # installed+activated at RUNTIME (as opposed to baked into the
-            # image at build time) therefore needs its libggml-cuda.so
-            # pointed at explicitly via GGML_BACKEND_PATH, or the worker
-            # silently falls back to CPU while still logging
-            # `whisper_backend_init_gpu: no GPU found` -- found for real
-            # against the actual 10.100.0.50 deployment. Only relevant for
-            # cuda: the baked-in CPU flavor's per-microarch .so's already
-            # resolve correctly via the worker binary's OWN directory,
-            # ggml_backend_load_all()'s other (always-searched) path.
             ggml_backend_path = (
                 ggml_lib_dir / "libggml-cuda.so" if engine_backend == "cuda" and ggml_lib_dir else None
             )
+            use_gpu = engine_backend == "cuda"
         elif self._model_spec.engine == "parakeet_tdt":
             worker_bin = Path(self._settings.worker_bin_parakeet_tdt)
             engine_backend = self._settings.parakeet_tdt_backend
@@ -179,22 +164,10 @@ class CallSession:
                     else None
                 )
             )
-            # registry_engine="parakeet", not "parakeet_tdt": this worker
-            # binary links the exact same `parakeet` CMake target as the
-            # streaming engine (see live_stt/backends/registry.py's
-            # ENGINE_ALIASES) -- installer.get_active_backend already
-            # applies the alias, but passing the canonical name here too
-            # keeps this call site self-explanatory without relying on
-            # that being remembered.
             ggml_lib_dir = self._resolve_lib_dir("parakeet", engine_backend, fallback_lib_dir)
             n_threads = self._settings.n_threads_parakeet_tdt
-            # Parakeet TDT's worker never calls ggml_backend_load_all() --
-            # its ggml backends are ordinary DT_NEEDED shared-library
-            # dependencies, resolved via LD_LIBRARY_PATH ($ORIGIN rpath +
-            # ggml_lib_dir) same as the streaming engine below -- see
-            # CLAUDE.md's parakeet.cpp build notes. No GGML_BACKEND_PATH
-            # needed or meaningful here.
             ggml_backend_path = None
+            use_gpu = engine_backend == "cuda"
         else:
             worker_bin = Path(self._settings.worker_bin)
             engine_backend = self._settings.parakeet_backend
@@ -205,30 +178,70 @@ class CallSession:
             )
             ggml_lib_dir = self._resolve_lib_dir("parakeet", engine_backend, fallback_lib_dir)
             n_threads = self._settings.n_threads_per_worker
-            ggml_backend_path = None  # see the parakeet_tdt branch's comment above
+            ggml_backend_path = None
+            use_gpu = engine_backend == "cuda"
+
+        return worker_bin, gguf_path, self._config.language, n_threads, ggml_lib_dir, ggml_backend_path, use_gpu, engine_backend
+
+    def _resolve_standby_key(self) -> StandbyKey:
+        worker_bin, gguf_path, language, n_threads, ggml_lib_dir, ggml_backend_path, use_gpu, _ = (
+            self._resolve_spawn_params()
+        )
+        return StandbyKey(
+            worker_bin=str(worker_bin),
+            gguf_path=gguf_path,
+            language=language,
+            n_threads=n_threads,
+            ggml_lib_dir=str(ggml_lib_dir) if ggml_lib_dir else None,
+            ggml_backend_path=str(ggml_backend_path) if ggml_backend_path else None,
+            use_gpu=use_gpu,
+            model_key=self._model_spec.key,
+        )
+
+    async def _spawn_worker(self) -> WorkerHandle:
+        worker_bin, gguf_path, language, n_threads, ggml_lib_dir, ggml_backend_path, use_gpu, engine_backend = (
+            self._resolve_spawn_params()
+        )
+        # LS-10: check if a warmed-up standby worker is already waiting in memory/GPU
+        if self._worker_pool is not None and self._settings.stt_idle_timeout_sec > 0:
+            key = StandbyKey(
+                worker_bin=str(worker_bin),
+                gguf_path=gguf_path,
+                language=language,
+                n_threads=n_threads,
+                ggml_lib_dir=str(ggml_lib_dir) if ggml_lib_dir else None,
+                ggml_backend_path=str(ggml_backend_path) if ggml_backend_path else None,
+                use_gpu=use_gpu,
+                model_key=self._model_spec.key,
+            )
+            standby = self._worker_pool.acquire(key)
+            if standby is not None:
+                metrics.stt_standby_workers_active.set(self._worker_pool.count())
+                handle = await WorkerHandle.from_standby(standby)
+                metrics.model_load_duration_seconds.observe(0.0)
+                version = __about__.info()
+                metrics.set_build_info(
+                    version=version["hash"],
+                    parakeet_ref=version["parakeet_ref"],
+                    backend=engine_backend,
+                    model=self._model_spec.key,
+                    n_threads=n_threads,
+                    ggml_features=handle.ready.get("ggml_features", ""),
+                )
+                return handle
+
         start = time.monotonic()
         handle = await WorkerHandle.spawn(
             worker_bin=worker_bin,
             gguf_path=gguf_path,
-            language=self._config.language,
+            language=language,
             n_threads=n_threads,
             ggml_lib_dir=ggml_lib_dir,
             ggml_backend_path=ggml_backend_path,
-            # Per-engine backend choice (LS-5) -- each of parakeet_backend/
-            # whisper_backend/parakeet_tdt_backend is independent, so one
-            # deployment can genuinely run the live stream on GPU while
-            # another engine stays on CPU (or vice versa), replacing the old
-            # single image-wide Settings.backend switch.
-            use_gpu=engine_backend == "cuda",
+            use_gpu=use_gpu,
         )
         metrics.model_load_duration_seconds.observe(time.monotonic() - start)
         version = __about__.info()
-        # NOTE: set_build_info is one process-wide Prometheus Info metric --
-        # its "backend" label reflects whichever engine spawned (or
-        # rotated) a worker most recently, not a per-engine breakdown. That
-        # limitation pre-dates LS-5 (it was already true with a single
-        # global backend); a real per-engine metrics breakdown is a
-        # reasonable follow-up but out of scope here.
         metrics.set_build_info(
             version=version["hash"],
             parakeet_ref=version["parakeet_ref"],
@@ -543,3 +556,13 @@ class CallSession:
                 await self._worker.wait_closed()
             except Exception:
                 logger.warning("worker did not report an exit code during close()")
+
+        if self._worker_pool is not None and self._settings.stt_idle_timeout_sec > 0:
+            try:
+                key = self._resolve_standby_key()
+                self._worker_pool.maintain_warm_async(
+                    key=key,
+                    timeout_sec=self._settings.stt_idle_timeout_sec,
+                )
+            except Exception as exc:
+                logger.debug("could not maintain warm worker for pool: %s", exc)

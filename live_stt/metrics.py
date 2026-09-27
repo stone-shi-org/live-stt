@@ -98,6 +98,10 @@ tts_chars_total = Counter(
     "live_stt_tts_chars_total",
     "Total characters synthesized via TTS",
 )
+stt_standby_workers_active = Gauge(
+    "live_stt_stt_standby_workers_active",
+    "Pre-warmed STT standby workers currently idle in memory",
+)
 
 
 def set_build_info(

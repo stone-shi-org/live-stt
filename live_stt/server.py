@@ -20,6 +20,7 @@ from live_stt.redaction import validate as validate_redaction_config
 from live_stt.servicer import StreamingASRServicer
 from live_stt.settings_store import SettingsStore, load_effective_settings
 from live_stt.state import ServerState
+from live_stt import worker_pool
 
 logger = get_logger("server")
 
@@ -98,6 +99,7 @@ async def serve(settings: Settings | None = None) -> None:
         logger.info("SIGTERM received, draining (up to %.0fs)", settings.drain_timeout_sec)
         health_servicer.set("livestt.v1.StreamingASR", health_pb2.HealthCheckResponse.NOT_SERVING)
         state.draining = True
+        worker_pool.stop_worker_pool()
         stop_event.set()
 
     loop = asyncio.get_running_loop()
@@ -107,6 +109,7 @@ async def serve(settings: Settings | None = None) -> None:
     await server.stop(grace=settings.drain_timeout_sec)
     admin_http.shutdown()
     tts.stop_tts_worker()
+    worker_pool.stop_worker_pool()
     if upgrade_check_task is not None:
         upgrade_check_task.cancel()
 

@@ -2253,7 +2253,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 icon: "⚡",
                 keys: [
                     "n_threads_per_worker", "n_threads_whisper", "n_threads_parakeet_tdt",
-                    "max_concurrent_calls", "reserve_slots",
+                    "max_concurrent_calls", "reserve_slots", "stt_idle_timeout_sec",
                     "worker_rss_soft_kb", "rotate_after_sec", "rotation_overlap_sec"
                 ]
             },
@@ -2923,6 +2923,10 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                             "rejected_capacity_total": state.tts_sessions.rejected_capacity_total,
                             "active_requests": state.tts_sessions.snapshot_active(),
                         },
+                        "stt_worker_pool": {
+                            "standby_workers": state.worker_pool.snapshot(),
+                            "standby_count": state.worker_pool.count(),
+                        },
                     },
                 )
             elif self.path == "/api/config":
@@ -3020,6 +3024,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         budget=state.budget,
                         draining=state.draining,
                         tracker=state.transcribe_sessions,
+                        worker_pool=state.worker_pool,
                     )
                 )
                 self._write(status, response_body, content_type)

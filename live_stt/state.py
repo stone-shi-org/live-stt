@@ -16,6 +16,7 @@ from live_stt.diarize_sessions import DiarizationSessionTracker
 from live_stt.settings_store import SettingsStore
 from live_stt.transcribe_sessions import TranscribeSessionTracker
 from live_stt.tts_sessions import TTSSessionTracker
+from live_stt.worker_pool import STTWorkerPool, get_worker_pool
 
 
 @dataclass
@@ -49,6 +50,9 @@ class ServerState:
 
     # TTS synthesis (POST /v1/audio/speech) session tracker.
     tts_sessions: TTSSessionTracker = field(default_factory=TTSSessionTracker)
+
+    # Standby worker pool for warmed-up STT engine caching (LS-10).
+    worker_pool: STTWorkerPool = field(default_factory=get_worker_pool)
 
     # Set once, immediately, on SIGTERM -- before grpc.aio's own drain grace
     # period even starts. New calls are rejected from this instant.

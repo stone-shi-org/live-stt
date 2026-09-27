@@ -66,3 +66,12 @@ def _offline_safety(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture()
 def fixtures_dir() -> str:
     return os.path.join(os.path.dirname(__file__), "fixtures")
+
+
+@pytest.fixture(autouse=True)
+def _clear_worker_pool_fixture():
+    from live_stt.worker_pool import clear_worker_pool
+
+    clear_worker_pool()
+    yield
+    clear_worker_pool()

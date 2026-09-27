@@ -91,6 +91,10 @@ def test_hot_reload_fields_includes_tts_idle_timeout_sec() -> None:
     assert "tts_idle_timeout_sec" in HOT_RELOAD_FIELDS
 
 
+def test_hot_reload_fields_includes_stt_idle_timeout_sec() -> None:
+    assert "stt_idle_timeout_sec" in HOT_RELOAD_FIELDS
+
+
 def test_apply_update_updates_tts_idle_timeout_sec() -> None:
     store = _store()
     settings = Settings(_env_file=None)
@@ -100,6 +104,17 @@ def test_apply_update_updates_tts_idle_timeout_sec() -> None:
 
     with pytest.raises(ValueError, match="tts_idle_timeout_sec must be non-negative"):
         apply_update(store, settings, {"tts_idle_timeout_sec": -5.0})
+
+
+def test_apply_update_updates_stt_idle_timeout_sec() -> None:
+    store = _store()
+    settings = Settings(_env_file=None)
+    validated = apply_update(store, settings, {"stt_idle_timeout_sec": 450.0})
+    assert validated.stt_idle_timeout_sec == 450.0
+    assert store.load_overrides() == {"stt_idle_timeout_sec": 450.0}
+
+    with pytest.raises(ValueError, match="stt_idle_timeout_sec must be non-negative"):
+        apply_update(store, settings, {"stt_idle_timeout_sec": -5.0})
 
 
 def test_hot_reload_fields_excludes_allow_pii() -> None:

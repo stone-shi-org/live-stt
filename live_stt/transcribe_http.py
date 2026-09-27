@@ -70,6 +70,7 @@ from live_stt.pb.livestt.v1 import asr_pb2
 from live_stt.session import CallSession
 from live_stt.transcribe_sessions import TranscribeSessionTracker
 from live_stt.worker import WorkerError
+from live_stt.worker_pool import STTWorkerPool
 
 logger = get_logger("transcribe_http")
 
@@ -132,6 +133,7 @@ async def _run_transcription(
     spec: models.ModelSpec,
     language: str | None,
     budget: WorkerBudget,
+    worker_pool: STTWorkerPool | None = None,
 ) -> tuple[str, list[asr_pb2.Word], float, int]:
     config = asr_pb2.StreamConfig(
         call_id=f"http-transcribe-{uuid.uuid4().hex[:12]}",
@@ -140,7 +142,7 @@ async def _run_transcription(
         model=spec.key,
         language=language or "",
     )
-    session = CallSession(settings, spec, config, budget)
+    session = CallSession(settings, spec, config, budget, worker_pool=worker_pool)
     try:
         await session.start()
     except WorkerError as exc:
@@ -179,6 +181,7 @@ async def handle_transcribe_request(
     budget: WorkerBudget,
     draining: bool,
     tracker: TranscribeSessionTracker,
+    worker_pool: STTWorkerPool | None = None,
 ) -> tuple[int, bytes, str]:
     """Pure(ish) request handler -- no socket coupling beyond what's already
     unavoidable (spawning a real worker process). Returns
@@ -265,8 +268,11 @@ async def handle_transcribe_request(
     request_id = tracker.start(model=spec.key)
     metrics.transcribe_sessions_active.inc()
     try:
+        run_kwargs: dict[str, Any] = {}
+        if worker_pool is not None:
+            run_kwargs["worker_pool"] = worker_pool
         text, words, total_audio_sec, worker_generations = await _run_transcription(
-            pcm, settings=settings, spec=spec, language=language, budget=budget
+            pcm, settings=settings, spec=spec, language=language, budget=budget, **run_kwargs
         )
     except TranscribeUnavailableError as exc:
         tracker.finish(request_id, ok=False)
