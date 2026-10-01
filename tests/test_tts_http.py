@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import sys
+import time
 import types
 import urllib.error
 import urllib.request
@@ -227,3 +229,69 @@ async def test_live_http_server_speech_endpoint(monkeypatch: pytest.MonkeyPatch)
             assert data.startswith(b"RIFF")
     finally:
         server.shutdown()
+
+
+def test_consecutive_speech_requests_reuse_worker_pid(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from live_stt.tts import _TTS_WORKER_MANAGER
+
+    fake_out = tmp_path / "output.pcm"
+    fake_out.write_bytes(b"\x00\x00" * 100)
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO(json.dumps({"ok": True}) + "\n" + json.dumps({"ok": True}) + "\n")
+            self.stderr = io.StringIO()
+            self.pid = 54321
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    fake_proc = FakeProc()
+    _TTS_WORKER_MANAGER.stop()
+    _TTS_WORKER_MANAGER._proc = fake_proc
+    _TTS_WORKER_MANAGER._last_active = time.monotonic()
+
+    class DummyTmpDir:
+        def __enter__(self):
+            return str(tmp_path)
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr("tempfile.TemporaryDirectory", lambda prefix=None: DummyTmpDir())
+    monkeypatch.setenv("FORCE_TTS_SUBPROCESS", "1")
+
+    settings = Settings(_env_file=None, tts_in_subprocess=True, tts_idle_timeout_sec=600.0)
+    tracker = TTSSessionTracker()
+
+    status1, body1, ct1, _ = tts_http.handle_speech_request(
+        content_type="application/json",
+        body=json.dumps({"input": "Sentence one.", "response_format": "wav"}).encode(),
+        settings=settings,
+        tracker=tracker,
+    )
+    assert status1 == 200
+    pid1 = _TTS_WORKER_MANAGER.pid
+    assert pid1 == 54321
+
+    status2, body2, ct2, _ = tts_http.handle_speech_request(
+        content_type="application/json",
+        body=json.dumps({"input": "Sentence two.", "response_format": "wav"}).encode(),
+        settings=settings,
+        tracker=tracker,
+    )
+    assert status2 == 200
+    pid2 = _TTS_WORKER_MANAGER.pid
+    assert pid2 == pid1
+    assert _TTS_WORKER_MANAGER.is_running() is True
+    _TTS_WORKER_MANAGER.stop()

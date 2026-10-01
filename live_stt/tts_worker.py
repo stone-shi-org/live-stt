@@ -18,6 +18,22 @@ import select
 import sys
 from pathlib import Path
 
+# Isolate IPC protocol stdout from library prints and C-level stdout before any
+# heavy module imports (PyTorch, Kokoro, Hugging Face, etc.).
+# Duplicating stdout gives us a dedicated file descriptor for IPC communication.
+# Redirecting fd 1 and sys.stdout to sys.stderr ensures that any third-party
+# print statements, warnings (e.g. Kokoro repo_id warning), or C extensions
+# write to stderr without corrupting the NDJSON protocol stream.
+_IPC_STDOUT = None
+if "--server" in sys.argv:
+    try:
+        _ipc_stdout_fd = os.dup(sys.stdout.fileno())
+        _IPC_STDOUT = os.fdopen(_ipc_stdout_fd, "w", encoding="utf-8", buffering=1)
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+        sys.stdout = sys.stderr
+    except Exception:
+        _IPC_STDOUT = sys.stdout
+
 from live_stt import tts_models
 from live_stt.logging_config import get_logger
 from live_stt.tts import (
@@ -97,18 +113,16 @@ def run_server(idle_timeout_sec: float) -> None:
 
     Exits automatically when idle for longer than idle_timeout_sec.
     """
-    # Isolate IPC protocol stdout from library prints and C-level stdout.
-    # Duplicating stdout gives us a dedicated file descriptor for IPC communication.
-    # Redirecting fd 1 and sys.stdout to sys.stderr ensures that any third-party
-    # print statements, warnings (e.g. Kokoro repo_id warning), or C extensions
-    # write to stderr without corrupting the NDJSON protocol stream.
-    ipc_stdout_fd = os.dup(sys.stdout.fileno())
-    ipc_stdout = os.fdopen(ipc_stdout_fd, "w", encoding="utf-8", buffering=1)
-    try:
-        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-    except Exception:
-        pass
-    sys.stdout = sys.stderr
+    global _IPC_STDOUT
+    if _IPC_STDOUT is None:
+        try:
+            ipc_stdout_fd = os.dup(sys.stdout.fileno())
+            _IPC_STDOUT = os.fdopen(ipc_stdout_fd, "w", encoding="utf-8", buffering=1)
+            os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+            sys.stdout = sys.stderr
+        except Exception:
+            _IPC_STDOUT = sys.stdout
+    ipc_stdout = _IPC_STDOUT
 
     logger.info("TTS persistent worker started (idle_timeout_sec=%.1f)", idle_timeout_sec)
     current_timeout = idle_timeout_sec

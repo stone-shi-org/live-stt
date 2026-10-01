@@ -610,4 +610,137 @@ class TestTTSWorkerPersistentServer:
         assert manager.is_running() is True
         manager.stop()
 
+    def test_manager_tolerates_invalid_json_with_braces(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        from live_stt import tts_models
+        from live_stt.tts import TTSWorkerManager
+
+        manager = TTSWorkerManager()
+        fake_out_file = tmp_path / "output.pcm"
+        fake_out_file.write_bytes(b"\x00\x00" * 50)
+
+        class FakeProc:
+            def __init__(self):
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(
+                    "{invalid json with braces}\n"
+                    "WARNING: non-json line\n"
+                    + json.dumps({"ok": True})
+                    + "\n"
+                )
+                self.stderr = io.StringIO()
+                self.pid = 99999
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        fake_proc = FakeProc()
+        manager._proc = fake_proc
+        manager._last_active = time.monotonic()
+
+        class DummyTmpDir:
+            def __enter__(self):
+                return str(tmp_path)
+
+            def __exit__(self, *args):
+                pass
+
+        monkeypatch.setattr("tempfile.TemporaryDirectory", lambda prefix=None: DummyTmpDir())
+
+        model_spec = tts_models.resolve("kokoro-82m-v1")
+        pcm = manager.synthesize(
+            "Hello",
+            model_spec=model_spec,
+            voice="af_heart",
+            idle_timeout_sec=600.0,
+        )
+        assert len(pcm) == 100
+        assert manager.is_running() is True
+        assert manager.pid == 99999
+        manager.stop()
+
+    def test_manager_pid_reused_across_consecutive_calls(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        from live_stt import tts_models
+        from live_stt.tts import TTSWorkerManager
+
+        manager = TTSWorkerManager()
+        fake_out_file = tmp_path / "output.pcm"
+        fake_out_file.write_bytes(b"\x00\x00" * 50)
+
+        class FakeProc:
+            def __init__(self):
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(
+                    json.dumps({"ok": True}) + "\n" + json.dumps({"ok": True}) + "\n"
+                )
+                self.stderr = io.StringIO()
+                self.pid = 12345
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        fake_proc = FakeProc()
+        manager._proc = fake_proc
+        manager._last_active = time.monotonic()
+
+        class DummyTmpDir:
+            def __enter__(self):
+                return str(tmp_path)
+
+            def __exit__(self, *args):
+                pass
+
+        monkeypatch.setattr("tempfile.TemporaryDirectory", lambda prefix=None: DummyTmpDir())
+
+        model_spec = tts_models.resolve("kokoro-82m-v1")
+        pcm1 = manager.synthesize("Call 1", model_spec=model_spec, voice="af_heart", idle_timeout_sec=600.0)
+        pid1 = manager.pid
+        assert pid1 == 12345
+
+        pcm2 = manager.synthesize("Call 2", model_spec=model_spec, voice="af_heart", idle_timeout_sec=600.0)
+        pid2 = manager.pid
+        assert pid2 == pid1
+        assert manager.is_running() is True
+        manager.stop()
+
+    def test_configure_hf_offline(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import os
+        import types
+        from live_stt.tts import _configure_hf_offline
+
+        fake_hf = types.ModuleType("huggingface_hub")
+        fake_cache = {
+            ("hexgrad/Kokoro-82M", "config.json"): "/cache/config.json",
+            ("hexgrad/Kokoro-82M", "kokoro-v1_0.pth"): "/cache/kokoro.pth",
+            ("hexgrad/Kokoro-82M", "voices/af_heart.pt"): "/cache/af_heart.pt",
+        }
+        fake_hf.try_to_load_from_cache = lambda repo, fn: fake_cache.get((repo, fn))  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hf)
+
+        _configure_hf_offline("hexgrad/Kokoro-82M", "af_heart")
+        assert os.environ.get("HF_HUB_OFFLINE") == "1"
+        assert os.environ.get("HF_HUB_OFFLINE_AUTO") == "1"
+
+        # Case 2: Voice missing from cache -> unsets HF_HUB_OFFLINE
+        _configure_hf_offline("hexgrad/Kokoro-82M", "missing_voice")
+        assert "HF_HUB_OFFLINE" not in os.environ
+        assert "HF_HUB_OFFLINE_AUTO" not in os.environ
+
 

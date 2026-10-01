@@ -223,6 +223,29 @@ def _resolve_piper_voice_model(models_dir: str, voice: str, deps_dir: str) -> Pa
     return model_path
 
 
+def _configure_hf_offline(repo_id: str, voice: str) -> None:
+    """If Kokoro model weights and the requested voice file already exist in the
+    local Hugging Face hub cache, set HF_HUB_OFFLINE=1 to prevent hf_hub_download
+    from making outbound HTTP HEAD requests to huggingface.co on every synthesis call.
+    If the requested voice is missing from the cache, unset HF_HUB_OFFLINE (if previously
+    set automatically) so it can be fetched from Hugging Face.
+    """
+    try:
+        from huggingface_hub import try_to_load_from_cache  # type: ignore[import-not-found]
+
+        config_cached = try_to_load_from_cache(repo_id, "config.json")
+        model_cached = try_to_load_from_cache(repo_id, "kokoro-v1_0.pth")
+        voice_cached = True if voice.endswith(".pt") else bool(try_to_load_from_cache(repo_id, f"voices/{voice}.pt"))
+        if config_cached and model_cached and voice_cached:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["HF_HUB_OFFLINE_AUTO"] = "1"
+        elif os.environ.get("HF_HUB_OFFLINE_AUTO") == "1":
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            os.environ.pop("HF_HUB_OFFLINE_AUTO", None)
+    except Exception:
+        pass
+
+
 def _synthesize_chunk_direct(
     text_chunk: str,
     *,
@@ -248,6 +271,7 @@ def _synthesize_chunk_direct(
 
     if model_spec.engine == "kokoro":
         _ensure_deps_on_path(deps_dir, "kokoro")
+        _configure_hf_offline("hexgrad/Kokoro-82M", voice)
         try:
             from kokoro import KPipeline  # type: ignore[import-not-found]
         except ImportError as exc:
@@ -524,6 +548,11 @@ class TTSWorkerManager:
         with self._lock:
             return self._proc is not None and self._proc.poll() is None
 
+    @property
+    def pid(self) -> int | None:
+        with self._lock:
+            return self._proc.pid if self._proc is not None and self._proc.poll() is None else None
+
     def synthesize(
         self,
         text: str,
@@ -595,7 +624,7 @@ class TTSWorkerManager:
                     assert self._proc.stdout is not None
                     self._proc.stdin.write(json.dumps(req_payload) + "\n")
                     self._proc.stdin.flush()
-                    res_line = ""
+                    res_data = None
                     while True:
                         line = self._proc.stdout.readline()
                         if not line:
@@ -603,15 +632,16 @@ class TTSWorkerManager:
                         line_stripped = line.strip()
                         if not line_stripped:
                             continue
-                        if line_stripped.startswith("{") and line_stripped.endswith("}"):
-                            res_line = line_stripped
+                        try:
+                            res_data = json.loads(line_stripped)
                             break
-                        logger.warning("TTS worker non-JSON output on stdout: %s", line_stripped)
+                        except Exception:
+                            logger.warning("TTS worker non-JSON output on stdout: %s", line_stripped)
                 except Exception as exc:
                     self.stop()
                     raise TTSError(f"TTS persistent worker communication failed: {exc}") from exc
 
-                if not res_line:
+                if res_data is None:
                     stderr_msg = ""
                     if self._proc.stderr:
                         try:
@@ -620,12 +650,6 @@ class TTSWorkerManager:
                             pass
                     self.stop()
                     raise TTSError(f"TTS persistent worker exited unexpectedly: {stderr_msg.strip()}")
-
-                try:
-                    res_data = json.loads(res_line)
-                except Exception as exc:
-                    self.stop()
-                    raise TTSError(f"Failed to parse TTS worker response: {exc}") from exc
 
                 if not res_data.get("ok"):
                     err_msg = res_data.get("error", "Unknown error in TTS worker")
@@ -756,7 +780,7 @@ def synthesize(
     chunks = chunk_text(text)
     pcm_accumulator = bytearray()
 
-    if resolved_settings.tts_in_subprocess and not os.getenv("PYTEST_CURRENT_TEST"):
+    if (resolved_settings.tts_in_subprocess and not os.getenv("PYTEST_CURRENT_TEST")) or os.getenv("FORCE_TTS_SUBPROCESS"):
         try:
             raw_pcm = _synthesize_in_subprocess(
                 text,
@@ -834,7 +858,7 @@ def synthesize_stream(
     chunks = chunk_text(text)
     for chunk in chunks:
         chunk_pcm = b""
-        if resolved_settings.tts_in_subprocess and not os.getenv("PYTEST_CURRENT_TEST"):
+        if (resolved_settings.tts_in_subprocess and not os.getenv("PYTEST_CURRENT_TEST")) or os.getenv("FORCE_TTS_SUBPROCESS"):
             try:
                 chunk_pcm = _synthesize_in_subprocess(
                     chunk,
