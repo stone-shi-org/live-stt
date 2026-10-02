@@ -15,6 +15,7 @@ from live_stt.config import Settings
 from live_stt.diarize_sessions import DiarizationSessionTracker
 from live_stt.settings_store import SettingsStore
 from live_stt.transcribe_sessions import TranscribeSessionTracker
+from live_stt.tts import TTSWorkerManager, get_tts_worker_manager
 from live_stt.tts_sessions import TTSSessionTracker
 from live_stt.worker_pool import STTWorkerPool, get_worker_pool
 
@@ -53,6 +54,9 @@ class ServerState:
 
     # Standby worker pool for warmed-up STT engine caching (LS-10).
     worker_pool: STTWorkerPool = field(default_factory=get_worker_pool)
+
+    # Persistent warm worker manager for TTS (LS-9, LS-12).
+    tts_worker_manager: TTSWorkerManager = field(default_factory=get_tts_worker_manager)
 
     # Set once, immediately, on SIGTERM -- before grpc.aio's own drain grace
     # period even starts. New calls are rejected from this instant.

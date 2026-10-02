@@ -178,6 +178,10 @@ async def test_stats_web_page_endpoint() -> None:
                 assert 'id="svcTranscriptTbody"' in html_body
                 assert 'id="svcDiarizationTbody"' in html_body
                 assert 'id="svcTTSTbody"' in html_body
+                # Warmed / Standby Workers table and KPI pill (LS-12)
+                assert 'id="warmedWorkersTbody"' in html_body
+                assert 'id="valWarmedWorkersTotal"' in html_body
+                assert 'id="valWarmedWorkersCount"' in html_body
                 # Copy-to-clipboard buttons next to model names -- the
                 # helper function, the CSS class, and the two static
                 # default_model/diarization_model config rows all get one;
@@ -277,7 +281,14 @@ async def test_stats_json_endpoint_includes_gpu_and_diarization() -> None:
             "rejected_vram_total": 0,
             "rejected_capacity_total": 0,
             "active_requests": [],
+            "warm_worker": None,
         }
+        # Warmed / standby workers (LS-12)
+        assert doc["stt_worker_pool"] == {
+            "standby_workers": [],
+            "standby_count": 0,
+        }
+        assert doc["warmed_workers"] == []
     finally:
         server.shutdown()
 
@@ -426,5 +437,84 @@ async def test_v1_models_endpoint_lists_asr_and_diarization_and_tts_models() -> 
             assert entry["default"] == (key == settings.tts_model)
         assert sum(e["default"] for e in by_id.values() if e["type"] == "tts") == 1
     finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stats_json_and_dashboard_reflects_warmed_workers() -> None:
+    import json
+    import time
+
+    settings = Settings(_env_file=None)
+    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+
+    # Mock an STT standby worker in worker_pool
+    class DummyStandbyWorker:
+        class Key:
+            model_key = "parakeet-tdt-1.1b"
+            gguf_path = "/fake/parakeet.gguf"
+            use_gpu = True
+        key = Key()
+
+        class Proc:
+            pid = 4321
+
+            def poll(self):
+                return None
+
+        proc = Proc()
+        idle_since = time.monotonic() - 10.0
+
+    state.worker_pool._workers[DummyStandbyWorker.key] = DummyStandbyWorker()  # type: ignore[assignment]
+
+    # Mock a TTS warm worker in tts_worker_manager
+    class DummyProc:
+        pid = 8765
+
+        def poll(self):
+            return None
+
+    state.tts_worker_manager._proc = DummyProc()  # type: ignore[assignment]
+    state.tts_worker_manager._current_model = "kokoro-82m-v1"
+    state.tts_worker_manager._current_device = "cpu"
+    state.tts_worker_manager._last_active = time.monotonic() - 25.0
+
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=5) as resp:
+            assert resp.status == 200
+            doc = json.loads(resp.read().decode())
+
+        # STT pool snapshot
+        assert doc["stt_worker_pool"]["standby_count"] == 1
+        stt_snap = doc["stt_worker_pool"]["standby_workers"][0]
+        assert stt_snap["model"] == "parakeet-tdt-1.1b"
+        assert stt_snap["pid"] == 4321
+        assert stt_snap["use_gpu"] is True
+
+        # TTS warm worker snapshot
+        tts_warm = doc["tts"]["warm_worker"]
+        assert tts_warm is not None
+        assert tts_warm["model"] == "kokoro-82m-v1"
+        assert tts_warm["pid"] == 8765
+        assert tts_warm["device"] == "cpu"
+        assert tts_warm["busy"] is False
+
+        # Unified warmed_workers
+        warmed = doc["warmed_workers"]
+        assert len(warmed) == 2
+        stt_entry = next(w for w in warmed if w["service"] == "STT Standby")
+        assert stt_entry["model"] == "parakeet-tdt-1.1b"
+        assert stt_entry["pid"] == 4321
+        assert stt_entry["device"] == "GPU"
+
+        tts_entry = next(w for w in warmed if w["service"] == "TTS Warm")
+        assert tts_entry["model"] == "kokoro-82m-v1"
+        assert tts_entry["pid"] == 8765
+        assert tts_entry["device"] == "CPU"
+    finally:
+        state.worker_pool._workers.clear()
+        state.tts_worker_manager.stop()
         server.shutdown()
 

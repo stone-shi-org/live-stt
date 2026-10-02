@@ -543,6 +543,9 @@ class TTSWorkerManager:
         self._last_active: float = 0.0
         self._idle_timer: threading.Timer | None = None
         self._current_timeout: float = 600.0
+        self._current_model: str | None = None
+        self._current_device: str | None = None
+        self._is_busy: bool = False
 
     def is_running(self) -> bool:
         with self._lock:
@@ -552,6 +555,25 @@ class TTSWorkerManager:
     def pid(self) -> int | None:
         with self._lock:
             return self._proc.pid if self._proc is not None and self._proc.poll() is None else None
+
+    def snapshot(self) -> dict[str, Any] | None:
+        """Returns diagnostic snapshot of the warm TTS worker if running."""
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None:
+                return None
+            now = time.monotonic()
+            idle_sec = (
+                0.0
+                if self._is_busy or self._last_active <= 0
+                else max(0.0, round(now - self._last_active, 2))
+            )
+            return {
+                "model": self._current_model or "unknown",
+                "pid": self._proc.pid,
+                "idle_sec": idle_sec,
+                "device": self._current_device or "cpu",
+                "busy": self._is_busy,
+            }
 
     def synthesize(
         self,
@@ -578,94 +600,101 @@ class TTSWorkerManager:
                     deps_dir=deps_dir,
                 )
 
-            now = time.monotonic()
-            if self._proc is not None:
-                if self._proc.poll() is not None or (
-                    idle_timeout_sec > 0 and (now - self._last_active) > idle_timeout_sec
-                ):
-                    self.stop()
-
-            if self._proc is None or self._proc.poll() is not None:
-                self._current_timeout = idle_timeout_sec
-                self._last_active = now
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "live_stt.tts_worker",
-                    "--server",
-                    "--idle-timeout",
-                    str(idle_timeout_sec),
-                ]
-                self._proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                )
-
-            with tempfile.TemporaryDirectory(prefix="lstt-tts-out-") as tmpdir:
-                out_pcm_file = Path(tmpdir) / "output.pcm"
-                req_payload = {
-                    "text": text,
-                    "model_key": model_spec.key,
-                    "voice": voice,
-                    "speed": speed,
-                    "device": device,
-                    "models_dir": models_dir,
-                    "deps_dir": deps_dir,
-                    "idle_timeout_sec": idle_timeout_sec,
-                    "out_pcm_path": str(out_pcm_file),
-                }
-
-                try:
-                    assert self._proc.stdin is not None
-                    assert self._proc.stdout is not None
-                    self._proc.stdin.write(json.dumps(req_payload) + "\n")
-                    self._proc.stdin.flush()
-                    res_data = None
-                    while True:
-                        line = self._proc.stdout.readline()
-                        if not line:
-                            break
-                        line_stripped = line.strip()
-                        if not line_stripped:
-                            continue
-                        try:
-                            res_data = json.loads(line_stripped)
-                            break
-                        except Exception:
-                            logger.warning("TTS worker non-JSON output on stdout: %s", line_stripped)
-                except Exception as exc:
-                    self.stop()
-                    raise TTSError(f"TTS persistent worker communication failed: {exc}") from exc
-
-                if res_data is None:
-                    stderr_msg = ""
-                    if self._proc.stderr:
-                        try:
-                            stderr_msg = self._proc.stderr.read()
-                        except Exception:
-                            pass
-                    self.stop()
-                    raise TTSError(f"TTS persistent worker exited unexpectedly: {stderr_msg.strip()}")
-
-                if not res_data.get("ok"):
-                    err_msg = res_data.get("error", "Unknown error in TTS worker")
-                    err_type = res_data.get("error_type", "TTSError")
-                    if err_type == "TTSBadRequestError":
-                        raise TTSBadRequestError(err_msg)
-                    elif err_type == "TTSUnavailableError":
+            self._is_busy = True
+            try:
+                now = time.monotonic()
+                if self._proc is not None:
+                    if self._proc.poll() is not None or (
+                        idle_timeout_sec > 0 and (now - self._last_active) > idle_timeout_sec
+                    ):
                         self.stop()
-                        raise TTSUnavailableError(err_msg)
-                    raise TTSError(err_msg)
 
-                self._last_active = time.monotonic()
-                self._schedule_idle_reaper(idle_timeout_sec)
-                if out_pcm_file.exists():
-                    return out_pcm_file.read_bytes()
-                return b""
+                if self._proc is None or self._proc.poll() is not None:
+                    self._current_timeout = idle_timeout_sec
+                    self._last_active = now
+                    cmd = [
+                        sys.executable,
+                        "-m",
+                        "live_stt.tts_worker",
+                        "--server",
+                        "--idle-timeout",
+                        str(idle_timeout_sec),
+                    ]
+                    self._proc = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1,
+                    )
+
+                self._current_model = model_spec.key
+                self._current_device = device
+
+                with tempfile.TemporaryDirectory(prefix="lstt-tts-out-") as tmpdir:
+                    out_pcm_file = Path(tmpdir) / "output.pcm"
+                    req_payload = {
+                        "text": text,
+                        "model_key": model_spec.key,
+                        "voice": voice,
+                        "speed": speed,
+                        "device": device,
+                        "models_dir": models_dir,
+                        "deps_dir": deps_dir,
+                        "idle_timeout_sec": idle_timeout_sec,
+                        "out_pcm_path": str(out_pcm_file),
+                    }
+
+                    try:
+                        assert self._proc.stdin is not None
+                        assert self._proc.stdout is not None
+                        self._proc.stdin.write(json.dumps(req_payload) + "\n")
+                        self._proc.stdin.flush()
+                        res_data = None
+                        while True:
+                            line = self._proc.stdout.readline()
+                            if not line:
+                                break
+                            line_stripped = line.strip()
+                            if not line_stripped:
+                                continue
+                            try:
+                                res_data = json.loads(line_stripped)
+                                break
+                            except Exception:
+                                logger.warning("TTS worker non-JSON output on stdout: %s", line_stripped)
+                    except Exception as exc:
+                        self.stop()
+                        raise TTSError(f"TTS persistent worker communication failed: {exc}") from exc
+
+                    if res_data is None:
+                        stderr_msg = ""
+                        if self._proc.stderr:
+                            try:
+                                stderr_msg = self._proc.stderr.read()
+                            except Exception:
+                                pass
+                        self.stop()
+                        raise TTSError(f"TTS persistent worker exited unexpectedly: {stderr_msg.strip()}")
+
+                    if not res_data.get("ok"):
+                        err_msg = res_data.get("error", "Unknown error in TTS worker")
+                        err_type = res_data.get("error_type", "TTSError")
+                        if err_type == "TTSBadRequestError":
+                            raise TTSBadRequestError(err_msg)
+                        elif err_type == "TTSUnavailableError":
+                            self.stop()
+                            raise TTSUnavailableError(err_msg)
+                        raise TTSError(err_msg)
+
+                    self._last_active = time.monotonic()
+                    self._schedule_idle_reaper(idle_timeout_sec)
+                    if out_pcm_file.exists():
+                        return out_pcm_file.read_bytes()
+                    return b""
+            finally:
+                self._is_busy = False
 
     def _schedule_idle_reaper(self, idle_timeout_sec: float) -> None:
         if self._idle_timer is not None:
@@ -703,9 +732,18 @@ class TTSWorkerManager:
                     pass
                 finally:
                     self._proc = None
+                    self._current_model = None
+                    self._current_device = None
+                    self._last_active = 0.0
+                    self._is_busy = False
 
 
 _TTS_WORKER_MANAGER = TTSWorkerManager()
+
+
+def get_tts_worker_manager() -> TTSWorkerManager:
+    """Returns the process-wide TTSWorkerManager singleton."""
+    return _TTS_WORKER_MANAGER
 
 
 def stop_tts_worker() -> None:

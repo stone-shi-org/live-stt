@@ -747,6 +747,24 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             border: 1px solid rgba(168, 85, 247, 0.25);
         }
 
+        .tag-stt {
+            background: rgba(14, 165, 233, 0.12);
+            color: var(--accent-cyan);
+            border: 1px solid rgba(14, 165, 233, 0.25);
+        }
+
+        .tag-gpu {
+            background: rgba(16, 185, 129, 0.12);
+            color: var(--accent-green);
+            border: 1px solid rgba(16, 185, 129, 0.25);
+        }
+
+        .tag-cpu {
+            background: rgba(148, 163, 184, 0.12);
+            color: #cbd5e1;
+            border: 1px solid rgba(148, 163, 184, 0.25);
+        }
+
         .service-table-wrap {
             padding: 0;
             overflow-x: auto;
@@ -906,6 +924,11 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         .col-id { width: 100px; }
         .col-elapsed { width: 120px; }
         .col-info { width: auto; }
+        .col-service { width: 140px; }
+        .col-model { width: auto; }
+        .col-pid { width: 100px; }
+        .col-idle { width: 130px; }
+        .col-device { width: 100px; }
 
         .model-name-cell {
             display: inline-flex;
@@ -1219,6 +1242,14 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     </div>
                 </div>
                 <div class="kpi-pill">
+                    <span class="kpi-icon">🔥</span>
+                    <div class="kpi-data">
+                        <div class="kpi-label">Warmed Workers</div>
+                        <div class="kpi-val" id="valWarmedWorkersTotal">0</div>
+                    </div>
+                    <span class="kpi-badge" id="subWarmedWorkers">Standby</span>
+                </div>
+                <div class="kpi-pill">
                     <span class="kpi-icon">🛡️</span>
                     <div class="kpi-data">
                         <div class="kpi-label">Reserve Slots</div>
@@ -1472,6 +1503,28 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                         </tbody>
                     </table>
                 </div>
+            </div>
+
+            <!-- Bottom: Warmed / Standby Workers Table (LS-12) -->
+            <div class="section-card request-table-card" style="margin-top: 1.25rem;">
+                <div class="section-title">
+                    <span>🔥 Warmed / Standby Workers (Idle Cache)</span>
+                    <span class="outcome-active-badge"><span id="valWarmedWorkersCount">0</span> idle</span>
+                </div>
+                <table class="kv-table" id="warmedWorkersTable">
+                    <thead>
+                        <tr>
+                            <td class="kv-key col-service">Service</td>
+                            <td class="kv-key col-model">Model</td>
+                            <td class="kv-key col-pid">PID</td>
+                            <td class="kv-key col-idle">Idle Time</td>
+                            <td class="kv-key col-device">Device</td>
+                        </tr>
+                    </thead>
+                    <tbody id="warmedWorkersTbody">
+                        <tr><td colspan="5" class="card-subtext">No idled workers currently warmed</td></tr>
+                    </tbody>
+                </table>
             </div>
         </div>
 
@@ -2119,6 +2172,35 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     ttsTbody.innerHTML = activeTtsRequests.map(r =>
                         `<tr><td class="kv-val col-id">#${r.id}</td><td class="kv-val col-elapsed">${r.elapsed_sec.toFixed(1)}s</td><td class="kv-val col-info">${r.model} (${r.voice || '-'})</td></tr>`
                     ).join('');
+                }
+
+                // Warmed / Standby Workers (LS-12)
+                const warmedWorkers = stats.warmed_workers || [];
+                const valWarmedTotal = document.getElementById('valWarmedWorkersTotal');
+                if (valWarmedTotal) valWarmedTotal.innerText = warmedWorkers.length;
+                const valWarmedCount = document.getElementById('valWarmedWorkersCount');
+                if (valWarmedCount) valWarmedCount.innerText = warmedWorkers.length;
+
+                const warmedTbody = document.getElementById('warmedWorkersTbody');
+                if (warmedTbody) {
+                    if (warmedWorkers.length === 0) {
+                        warmedTbody.innerHTML = '<tr><td colspan="5" class="card-subtext">No idled workers currently warmed</td></tr>';
+                    } else {
+                        warmedTbody.innerHTML = warmedWorkers.map(w => {
+                            const isTts = (w.service || '').toLowerCase().includes('tts');
+                            const srvChip = `<span class="tag-chip ${isTts ? 'tag-tts' : 'tag-stt'}">${w.service || ''}</span>`;
+                            const devStr = String(w.device || 'CPU').toUpperCase();
+                            const devChip = `<span class="tag-chip ${devStr === 'GPU' ? 'tag-gpu' : 'tag-cpu'}">${devStr}</span>`;
+                            const idleDisplay = w.busy ? '<span class="tag-chip tag-streaming">BUSY</span>' : (typeof w.idle_sec === 'number' ? `${w.idle_sec.toFixed(1)}s` : `${w.idle_sec}s`);
+                            return `<tr>` +
+                                `<td class="kv-val col-service">${srvChip}</td>` +
+                                `<td class="kv-val col-model"><code>${w.model || '-'}</code></td>` +
+                                `<td class="kv-val col-pid">#${w.pid ?? '-'}</td>` +
+                                `<td class="kv-val col-idle">${idleDisplay}</td>` +
+                                `<td class="kv-val col-device">${devChip}</td>` +
+                                `</tr>`;
+                        }).join('');
+                    }
                 }
             }
 
@@ -2807,6 +2889,34 @@ def _handle_tts_engine_install(state: ServerState, body: bytes) -> tuple[int, di
     }
 
 
+def _build_warmed_workers_snapshot(state: ServerState) -> list[dict[str, Any]]:
+    """Gathers diagnostic snapshots of all active standby/warm workers across STT and TTS."""
+    warmed: list[dict[str, Any]] = []
+    if getattr(state, "worker_pool", None) is not None:
+        for sw in state.worker_pool.snapshot():
+            warmed.append({
+                "service": "STT Standby",
+                "model": sw.get("model", "unknown"),
+                "pid": sw.get("pid"),
+                "idle_sec": sw.get("idle_sec", 0.0),
+                "device": "GPU" if sw.get("use_gpu") else "CPU",
+                "busy": False,
+            })
+    tts_mgr = getattr(state, "tts_worker_manager", None)
+    if tts_mgr is not None:
+        tw = tts_mgr.snapshot()
+        if tw is not None:
+            warmed.append({
+                "service": "TTS Warm",
+                "model": tw.get("model", "unknown"),
+                "pid": tw.get("pid"),
+                "idle_sec": tw.get("idle_sec", 0.0),
+                "device": "GPU" if str(tw.get("device", "")).lower() in ("cuda", "gpu") else "CPU",
+                "busy": tw.get("busy", False),
+            })
+    return warmed
+
+
 def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def _write(self, status: int, body: bytes, content_type: str) -> None:
@@ -2922,11 +3032,17 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                             "rejected_vram_total": state.tts_sessions.rejected_vram_total,
                             "rejected_capacity_total": state.tts_sessions.rejected_capacity_total,
                             "active_requests": state.tts_sessions.snapshot_active(),
+                            "warm_worker": (
+                                state.tts_worker_manager.snapshot()
+                                if getattr(state, "tts_worker_manager", None) is not None
+                                else None
+                            ),
                         },
                         "stt_worker_pool": {
                             "standby_workers": state.worker_pool.snapshot(),
                             "standby_count": state.worker_pool.count(),
                         },
+                        "warmed_workers": _build_warmed_workers_snapshot(state),
                     },
                 )
             elif self.path == "/api/config":

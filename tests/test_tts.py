@@ -535,6 +535,41 @@ class TestTTSWorkerPersistentServer:
         stop_tts_worker()
         assert _TTS_WORKER_MANAGER.is_running() is False
 
+    def test_tts_worker_manager_snapshot_not_running(self) -> None:
+        from live_stt.tts import TTSWorkerManager
+
+        manager = TTSWorkerManager()
+        assert manager.snapshot() is None
+
+    def test_tts_worker_manager_snapshot_running(self) -> None:
+        import time
+        from live_stt.tts import TTSWorkerManager
+
+        manager = TTSWorkerManager()
+
+        class DummyProc:
+            pid = 998877
+
+            def poll(self):
+                return None
+
+        manager._proc = DummyProc()  # type: ignore[assignment]
+        manager._current_model = "kokoro-82m-v1"
+        manager._current_device = "cpu"
+        manager._last_active = time.monotonic() - 15.0
+
+        snap = manager.snapshot()
+        assert snap is not None
+        assert snap["model"] == "kokoro-82m-v1"
+        assert snap["pid"] == 998877
+        assert snap["idle_sec"] >= 14.5
+        assert snap["device"] == "cpu"
+        assert snap["busy"] is False
+
+        # When stopped, snapshot is None
+        manager.stop()
+        assert manager.snapshot() is None
+
     def test_server_idle_timeout_clean_exit(self) -> None:
         import subprocess
         import sys
