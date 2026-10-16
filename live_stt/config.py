@@ -140,6 +140,17 @@ class Settings(BaseSettings):
     # Revisit with a real sweep before trusting this default under load.
     n_threads_whisper: int = 4
     n_threads_parakeet_tdt: int = 4
+    # Encoder self-attention window for the batch TDT worker, passed to it as
+    # PARAKEET_ATT_CONTEXT (NeMo rel_pos_local_attn [W,W], W<=128). parakeet.cpp
+    # otherwise uses FULL attention, O(T^2) memory, for anything up to 8192
+    # encoder frames (~11 min) and only switches to local attention beyond that
+    # -- a threshold sized for big GPUs. Measured on the 4GB Quadro P1000: full
+    # attention needed a 5.05 GB compute buffer for a 358s file and 14.0 GB for
+    # 600s (quadratic: 2.77x for 1.68x the length), so any upload past ~3 min
+    # died with cudaMalloc out of memory. 128 = NeMo's own long-form setting;
+    # clips under ~20s fit inside the window, so their output is unchanged.
+    # 0 = leave it to parakeet.cpp's auto threshold.
+    parakeet_tdt_att_context: int = 128
     max_concurrent_calls: int = 3
     # Admission always reserves this many slots so a mid-call rotation has
     # somewhere to put its overlap shadow. Never hand the reserve to a call.

@@ -112,6 +112,10 @@ class StandbyKey:
     ggml_backend_path: str | None = None
     use_gpu: bool = False
     model_key: str = ""
+    # Extra environment for the worker process (e.g. PARAKEET_ATT_CONTEXT for
+    # the TDT engine -- see live_stt/session.py's _extra_env). Part of the key:
+    # a standby spawned under different settings must never be reused.
+    extra_env: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -143,10 +147,12 @@ def spawn_standby_sync(
     ggml_backend_path: Path | None = None,
     use_gpu: bool = False,
     model_key: str = "",
+    extra_env: tuple[tuple[str, str], ...] = (),
 ) -> StandbyWorker:
     parent_sock, child_sock = socket.socketpair()
     child_fd = child_sock.fileno()
     env = dict(os.environ)
+    env.update(dict(extra_env))
     if ggml_lib_dir is not None:
         env["LD_LIBRARY_PATH"] = str(ggml_lib_dir)
     if ggml_backend_path is not None:
@@ -198,6 +204,7 @@ def spawn_standby_sync(
         ggml_backend_path=str(ggml_backend_path) if ggml_backend_path else None,
         use_gpu=use_gpu,
         model_key=model_key,
+        extra_env=tuple(extra_env),
     )
     return StandbyWorker(
         proc=proc,
@@ -236,10 +243,12 @@ class WorkerHandle:
         ggml_lib_dir: Path | None = None,
         ggml_backend_path: Path | None = None,
         use_gpu: bool = False,
+        extra_env: tuple[tuple[str, str], ...] = (),
     ) -> "WorkerHandle":
         parent_sock, child_sock = socket.socketpair()
         child_fd = child_sock.fileno()
         env = dict(os.environ)
+        env.update(dict(extra_env))
         if ggml_lib_dir is not None:
             env["LD_LIBRARY_PATH"] = str(ggml_lib_dir)
         if ggml_backend_path is not None:

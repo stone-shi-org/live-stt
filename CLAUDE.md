@@ -1005,6 +1005,24 @@ in `configure()` and there is no loop anywhere near it.
   from the 300s CUDA Gate A plateau (1828 MB); long streaming calls on the other parakeet models
   are not measured. Not handled, as before: two requests checked at the same instant can both pass.
 
+- **parakeet-tdt batch OOM on long uploads -- full O(T^2) attention below ~11 min (fixed by forcing
+  local attention, not yet re-measured after the fix).** A real user upload to the deployed P1000
+  died with `cudaMalloc failed: out of memory` (a 5.2 GB compute buffer) and HTTP 500 "worker
+  connection lost". Reproduced through the API with real meeting audio: **358s needed a 5,051 MiB
+  buffer, 600s needed 14,004 MiB** -- 2.77x for 1.68x the length, i.e. quadratic. Cause, read in the
+  v0.5.0 source (`src/encoder.cpp::local_attn_window`): parakeet.cpp uses FULL relative-position
+  attention for any clip up to 8192 encoder frames (~11 min at 80ms/frame) and only switches to
+  NeMo's banded `rel_pos_local_attn [128,128]` (linear memory) above that -- a threshold sized for big
+  GPUs. On 4 GB, full attention tops out around ~3 min of audio. Its `PARAKEET_ATT_CONTEXT` env
+  override was never set by this service. Fix: `Settings.parakeet_tdt_att_context` (default 128,
+  hot-reloadable, 0 = upstream auto) is passed as `PARAKEET_ATT_CONTEXT` to TDT workers only
+  (`CallSession._extra_env`), through BOTH spawn paths, and is part of `StandbyKey` so a standby
+  spawned under another value is never reused. Clips under ~20s fit inside the window, so their
+  output is unchanged. Tested against real fake-worker subprocesses (`att_context_received` echo).
+  **Still open:** the post-fix VRAM-vs-duration curve and the accuracy cost of local attention on
+  mid-length audio are unmeasured; `ModelSpec.vram_mb` for TDT (2300) is a fixed figure while its
+  real need grows with upload length, so a long enough upload can still OOM past admission.
+
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and

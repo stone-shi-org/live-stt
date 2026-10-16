@@ -62,6 +62,9 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset(
         "vram_reserve_pct",
         "vram_overrides",
         "tts_vram_mb",
+        # Read at each worker spawn; StandbyKey carries it, so a standby spawned
+        # under the old value is never handed out after a change.
+        "parakeet_tdt_att_context",
         "tts_voice",
         "tts_idle_timeout_sec",
         "stt_idle_timeout_sec",

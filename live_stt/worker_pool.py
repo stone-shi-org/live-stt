@@ -119,6 +119,7 @@ class STTWorkerPool:
                     ggml_backend_path=Path(key.ggml_backend_path) if key.ggml_backend_path else None,
                     use_gpu=key.use_gpu,
                     model_key=key.model_key,
+                    extra_env=key.extra_env,
                 )
             except Exception as exc:
                 logger.debug(

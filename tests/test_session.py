@@ -543,3 +543,57 @@ def test_rotation_still_triggers_normally_for_a_streaming_model_with_the_same_th
 
     reason = session._should_start_rotation({})  # noqa: SLF001
     assert reason is not None
+
+
+def _tdt_settings(**overrides) -> Settings:
+    return Settings(
+        _env_file=None,
+        worker_bin=str(FAKE_WORKER),
+        worker_bin_whisper="/nonexistent/live_stt_worker_whisper",
+        worker_bin_parakeet_tdt=str(FAKE_WORKER),
+        models_dir="/fake",
+        stt_idle_timeout_sec=0,  # one-shot spawns: exercise WorkerHandle.spawn directly
+        **overrides,
+    )
+
+
+async def _ready_doc(settings: Settings, model_key: str) -> dict:
+    session = _session(settings=settings, model_key=model_key)
+    try:
+        await session.start()
+        return dict(session._worker.ready)  # noqa: SLF001
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_tdt_worker_gets_local_attention_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # parakeet.cpp's own default is FULL O(T^2) attention below ~11 min: a 358s
+    # upload needed a 5 GB buffer and OOMed the 4 GB P1000. The worker process
+    # itself must see the override, not just the Python object.
+    monkeypatch.delenv("PARAKEET_ATT_CONTEXT", raising=False)
+    doc = await _ready_doc(_tdt_settings(), "parakeet-tdt-0.6b-v3")
+    assert doc["att_context_received"] == "128"
+
+
+@pytest.mark.asyncio
+async def test_tdt_att_context_zero_leaves_upstream_auto_behaviour(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PARAKEET_ATT_CONTEXT", raising=False)
+    doc = await _ready_doc(_tdt_settings(parakeet_tdt_att_context=0), "parakeet-tdt-0.6b-v3")
+    assert doc["att_context_received"] is None
+
+
+@pytest.mark.asyncio
+async def test_streaming_worker_never_gets_the_tdt_attention_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The streaming engines' chunked encoder has its own baked-in context.
+    monkeypatch.delenv("PARAKEET_ATT_CONTEXT", raising=False)
+    doc = await _ready_doc(_tdt_settings(), "realtime_eou_120m-v1")
+    assert doc["att_context_received"] is None
+
+
+def test_standby_key_changes_with_att_context_so_stale_workers_are_not_reused() -> None:
+    a = _session(settings=_tdt_settings(parakeet_tdt_att_context=128), model_key="parakeet-tdt-0.6b-v3")
+    b = _session(settings=_tdt_settings(parakeet_tdt_att_context=64), model_key="parakeet-tdt-0.6b-v3")
+    ka, kb = a._resolve_standby_key(), b._resolve_standby_key()  # noqa: SLF001
+    assert ka.extra_env == (("PARAKEET_ATT_CONTEXT", "128"),)
+    assert ka != kb

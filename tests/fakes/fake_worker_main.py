@@ -118,6 +118,9 @@ def main() -> None:
                 # session.py code, but this fake worker doesn't care which
                 # "engine" it's pretending to be.
                 "ggml_backend_path_received": os.environ.get("GGML_BACKEND_PATH"),
+                # Same pattern for the TDT engine's attention-window override
+                # (live_stt/session.py's _extra_env).
+                "att_context_received": os.environ.get("PARAKEET_ATT_CONTEXT"),
             }
         ).encode(),
     )

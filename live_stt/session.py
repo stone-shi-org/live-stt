@@ -183,6 +183,16 @@ class CallSession:
 
         return worker_bin, gguf_path, self._config.language, n_threads, ggml_lib_dir, ggml_backend_path, use_gpu, engine_backend
 
+    def _extra_env(self) -> tuple[tuple[str, str], ...]:
+        """Per-engine worker environment. Today only the batch TDT engine needs
+        one: PARAKEET_ATT_CONTEXT forces local attention so memory grows
+        linearly with audio length instead of quadratically (see
+        Settings.parakeet_tdt_att_context). Not set for the streaming engines,
+        whose chunked encoder has its own baked-in attention context."""
+        if self._model_spec.engine == "parakeet_tdt" and self._settings.parakeet_tdt_att_context > 0:
+            return (("PARAKEET_ATT_CONTEXT", str(self._settings.parakeet_tdt_att_context)),)
+        return ()
+
     def _resolve_standby_key(self) -> StandbyKey:
         worker_bin, gguf_path, language, n_threads, ggml_lib_dir, ggml_backend_path, use_gpu, _ = (
             self._resolve_spawn_params()
@@ -196,6 +206,7 @@ class CallSession:
             ggml_backend_path=str(ggml_backend_path) if ggml_backend_path else None,
             use_gpu=use_gpu,
             model_key=self._model_spec.key,
+            extra_env=self._extra_env(),
         )
 
     async def _spawn_worker(self) -> WorkerHandle:
@@ -213,6 +224,7 @@ class CallSession:
                 ggml_backend_path=str(ggml_backend_path) if ggml_backend_path else None,
                 use_gpu=use_gpu,
                 model_key=self._model_spec.key,
+                extra_env=self._extra_env(),
             )
             standby = self._worker_pool.acquire(key)
             if standby is not None:
@@ -239,6 +251,7 @@ class CallSession:
             ggml_lib_dir=ggml_lib_dir,
             ggml_backend_path=ggml_backend_path,
             use_gpu=use_gpu,
+            extra_env=self._extra_env(),
         )
         metrics.model_load_duration_seconds.observe(time.monotonic() - start)
         version = __about__.info()
