@@ -983,6 +983,28 @@ in `configure()` and there is no loop anywhere near it.
   `"stale"`; unknown engine names are now HTTP 400 not 502. Unit-tested (`tests/test_stale_deps_reinstall.py`);
   the real-pip swap is first exercised by the redeploy, not by a container test.
 
+- **VRAM admission is per model, card-relative, reclaiming, and hot-reloadable (`live_stt/vram.py`)
+  -- replaces the flat per-path constants that blocked every GPU request on the 4GB P1000.** The
+  old gates compared raw free VRAM with `vram_per_worker_mb + vram_reserve_mb` (3000+2000 for ANY
+  ASR model, even one needing ~0.3 GB), `diarization_vram_mb` (13000) and `tts_vram_mb`, and
+  retuning needed a restart. Now: (1) each model's own figure is required -- `ModelSpec.vram_mb`,
+  `DiarizationModelSpec.vram_mb` (deliberately NOT `measured_peak_vram_mb`: PyTorch's caching
+  allocator grew pyannote to ~11.4 GB on the 3090 but the same job ran in ~3.1 GB on the P1000),
+  TTS `measured_peak_vram_mb`; the flat settings are only the fallback for an unmeasured model, and
+  `vram_overrides` ({model_key: MB}) is the explicit override. Not "unset means auto": the settings
+  DB is seeded with every field on first boot, so existing deployments already store the old flat
+  values and an auto sentinel would never apply to them. (2) reserve = max(`vram_reserve_mb`,
+  `vram_reserve_pct`% of total), ~0.4 GB on 4 GB and ~2.4 GB on 24 GB. (3) When short, idle warm
+  workers (STT standby pool, the warm TTS worker via non-blocking `TTSWorkerManager.stop_if_idle()`)
+  are evicted and free VRAM re-read for up to 3s before rejecting; busy workers and calls are never
+  touched, and a TTS request skips the gate if the warm worker already holds that model. (4) All
+  VRAM fields are in `HOT_RELOAD_FIELDS` (they were only ever read per request). The gRPC gate moved
+  from before the first message to after model resolution (it needs the model) and runs in a thread.
+  `/v1/models` shows each model's `vram_mb`, `/api/stats.gpu.reserve_mb` the reserve. The ASR
+  figures are 20s-clip per-process peaks (larger of P1000/3090, +~15%), except realtime_eou, sized
+  from the 300s CUDA Gate A plateau (1828 MB); long streaming calls on the other parakeet models
+  are not measured. Not handled, as before: two requests checked at the same instant can both pass.
+
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and

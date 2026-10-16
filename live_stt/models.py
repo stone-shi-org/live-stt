@@ -82,11 +82,20 @@ class ModelSpec:
     # (live_stt/session.py skips the rotation-trigger check entirely) --
     # see this module's docstring for why.
     streaming_capable: bool = True
+    # Working VRAM one worker of this model needs on CUDA (MiB), used by
+    # VRAM admission (live_stt/vram.py) instead of one flat figure for every
+    # model. Measured per-process on the Quadro P1000 and RTX 3090 with a 20s
+    # clip, the larger of the two plus ~15% margin. realtime_eou is sized from
+    # the 300s CUDA Gate A run instead: a streaming worker's VRAM ramped to a
+    # 1828 MB plateau over a long call, far above its 20s figure. None => fall
+    # back to Settings.vram_per_worker_mb.
+    vram_mb: int | None = None
 
 
 MODELS: dict[str, ModelSpec] = {
     "realtime_eou_120m-v1": ModelSpec(
         key="realtime_eou_120m-v1",
+        vram_mb=2100,
         gguf_filename="realtime_eou_120m-v1-q8_0.gguf",
         model_chunk_ms=160,
         has_eou=True,
@@ -96,6 +105,7 @@ MODELS: dict[str, ModelSpec] = {
     ),
     "nemotron-3.5-asr-streaming-0.6b": ModelSpec(
         key="nemotron-3.5-asr-streaming-0.6b",
+        vram_mb=2200,
         gguf_filename="nemotron-3.5-asr-streaming-0.6b-q8_0.gguf",
         model_chunk_ms=320,
         has_eou=False,
@@ -107,6 +117,7 @@ MODELS: dict[str, ModelSpec] = {
     # --- Parakeet TDT family (batch-only, see this module's docstring) ----
     "parakeet-tdt-0.6b-v3": ModelSpec(
         key="parakeet-tdt-0.6b-v3",
+        vram_mb=2300,
         gguf_filename="tdt-0.6b-v3-q8_0.gguf",
         model_chunk_ms=1000,
         has_eou=False,
@@ -124,6 +135,7 @@ MODELS: dict[str, ModelSpec] = {
     # closest available quantization instead of the ~3GB unquantized file.
     "whisper-base.en-q8_0": ModelSpec(
         key="whisper-base.en-q8_0",
+        vram_mb=1400,
         gguf_filename="ggml-base.en-q8_0.bin",
         model_chunk_ms=1000,  # not baked into the model like Parakeet -- just an IPC buffering size
         has_eou=False,
@@ -135,6 +147,7 @@ MODELS: dict[str, ModelSpec] = {
     ),
     "whisper-small-q8_0": ModelSpec(
         key="whisper-small-q8_0",
+        vram_mb=1000,
         gguf_filename="ggml-small-q8_0.bin",
         model_chunk_ms=1000,
         has_eou=False,
@@ -146,6 +159,7 @@ MODELS: dict[str, ModelSpec] = {
     ),
     "whisper-medium-q8_0": ModelSpec(
         key="whisper-medium-q8_0",
+        vram_mb=1800,
         gguf_filename="ggml-medium-q8_0.bin",
         model_chunk_ms=1000,
         has_eou=False,
@@ -157,6 +171,7 @@ MODELS: dict[str, ModelSpec] = {
     ),
     "whisper-large-v3-q5_0": ModelSpec(
         key="whisper-large-v3-q5_0",
+        vram_mb=2200,
         gguf_filename="ggml-large-v3-q5_0.bin",
         model_chunk_ms=1000,
         has_eou=False,
@@ -168,6 +183,7 @@ MODELS: dict[str, ModelSpec] = {
     ),
     "whisper-large-v3-turbo-q8_0": ModelSpec(
         key="whisper-large-v3-turbo-q8_0",
+        vram_mb=2300,
         gguf_filename="ggml-large-v3-turbo-q8_0.bin",
         model_chunk_ms=1000,
         has_eou=False,

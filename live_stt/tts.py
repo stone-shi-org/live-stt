@@ -712,6 +712,23 @@ class TTSWorkerManager:
                 if (now - self._last_active) >= self._current_timeout:
                     self.stop()
 
+    def stop_if_idle(self) -> bool:
+        """Stop the warm worker only if it is not serving a request. Never
+        blocks: synthesize() holds the lock for the whole request, so a plain
+        stop() here would wait for it -- and VRAM admission calls this from
+        request paths, including the gRPC event loop (via a thread). Returns
+        True if a worker was actually stopped (live_stt/vram.py)."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if self._is_busy or self._proc is None or self._proc.poll() is not None:
+                return False
+            logger.info("stopping idle warm TTS worker (pid=%s) to free VRAM", self._proc.pid)
+            self.stop()
+            return True
+        finally:
+            self._lock.release()
+
     def stop(self) -> None:
         with self._lock:
             if self._idle_timer is not None:

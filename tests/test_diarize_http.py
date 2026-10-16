@@ -221,7 +221,11 @@ class TestVramAdmission:
         assert status == 200
 
     def test_cuda_with_insufficient_vram_is_503_before_touching_the_pipeline(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(diarize_http.gpu, "free_vram_mb", lambda: 5000)
+        # Per-model requirement now (live_stt/vram.py): pyannote's own vram_mb
+        # (3500) + reserve, not the flat diarization_vram_mb -- so pick a free
+        # figure below THAT, and make sure no idle-worker reclaim rescues it.
+        monkeypatch.setattr(diarize_http.gpu, "free_vram_mb", lambda: 1000)
+        monkeypatch.setattr(diarize_http.vram, "reclaim_idle_workers", lambda: 0)
 
         def fake_diarize_file(*a, **k):
             raise AssertionError("pipeline must not run when VRAM is insufficient")
@@ -236,7 +240,7 @@ class TestVramAdmission:
             tracker=tracker,
         )
         assert status == 503
-        assert "5000" in doc["error"]["message"] and "13000" in doc["error"]["message"]
+        assert "1000MB free" in doc["error"]["message"]
         assert tracker.rejected_vram_total == 1
         assert tracker.active == 0  # never started -- rejected before start()
 

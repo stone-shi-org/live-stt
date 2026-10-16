@@ -17,7 +17,7 @@ from collections.abc import AsyncIterator
 
 import grpc
 
-from live_stt import __about__, gpu, metrics, models, redaction
+from live_stt import __about__, gpu, metrics, models, redaction, vram
 from live_stt.logging_config import get_logger
 from live_stt.pb.livestt.v1 import asr_pb2, asr_pb2_grpc
 from live_stt.session import CallSession
@@ -76,28 +76,6 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
             metrics.admission_rejections_total.labels(reason="draining").inc()
             await context.abort(grpc.StatusCode.UNAVAILABLE, "draining")
             return
-
-        if self._settings.parakeet_backend == "cuda":
-            # A CUDA allocation failure is an abort(), not a catchable
-            # exception (see CLAUDE.md) -- admitting a call this box can't
-            # actually fit crashes a worker process, not just slows one
-            # down. Checked before the (cheap, synchronous) call-slot check
-            # below since this one is the more expensive shell-out.
-            # parakeet_backend specifically (LS-5): Transcribe only ever
-            # spawns the parakeet engine (see the streaming_capable gate
-            # further down), so that is the only per-engine backend choice
-            # relevant to this admission check.
-            free = gpu.free_vram_mb()
-            if free is not None:
-                metrics.gpu_free_vram_mb.set(free)
-            required = self._settings.vram_per_worker_mb + self._settings.vram_reserve_mb
-            if free is not None and free < required:
-                metrics.admission_rejections_total.labels(reason="no_vram").inc()
-                await context.abort(
-                    grpc.StatusCode.RESOURCE_EXHAUSTED,
-                    f"insufficient VRAM: {free}MB free, {required}MB required",
-                )
-                return
 
         # Race-free without a lock: try_admit_call()/release_call() have no
         # `await` between reading and mutating their counters, and grpc.aio
@@ -179,6 +157,32 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
                     "use POST /v1/audio/transcriptions instead of the Transcribe RPC",
                 )
                 return
+
+            if self._settings.parakeet_backend == "cuda":
+                # A CUDA allocation failure is an abort(), not a catchable
+                # exception (see CLAUDE.md) -- admitting a call this box can't
+                # fit crashes a worker, not just slows it. Runs HERE, after the
+                # model is known, because the requirement is per model
+                # (live_stt/vram.py); it used to run before the first message
+                # with one flat figure for every model. parakeet_backend
+                # specifically: Transcribe only ever spawns streaming parakeet
+                # models (the streaming_capable gate just above). In a thread:
+                # admit() shells out to nvidia-smi and may poll while idle
+                # workers are reclaimed -- never block the event loop on that.
+                admission = await asyncio.to_thread(
+                    vram.admit,
+                    self._settings,
+                    model_key=spec.key,
+                    model_mb=spec.vram_mb,
+                    fallback_mb=self._settings.vram_per_worker_mb,
+                )
+                if admission.free_mb is not None:
+                    metrics.gpu_free_vram_mb.set(admission.free_mb)
+                if not admission.ok:
+                    metrics.admission_rejections_total.labels(reason="no_vram").inc()
+                    outcome = "resource_exhausted"
+                    await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, admission.message())
+                    return
 
             session = CallSession(
                 self._settings, spec, config, self._budget, worker_pool=self._state.worker_pool

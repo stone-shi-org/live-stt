@@ -55,6 +55,13 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset(
         "diarization_min_speakers",
         "diarization_max_speakers",
         "diarization_vram_mb",
+        # VRAM admission (live_stt/vram.py) reads these per request; nothing is
+        # sized from them at startup, so a restart bought nothing.
+        "vram_per_worker_mb",
+        "vram_reserve_mb",
+        "vram_reserve_pct",
+        "vram_overrides",
+        "tts_vram_mb",
         "tts_voice",
         "tts_idle_timeout_sec",
         "stt_idle_timeout_sec",

@@ -58,6 +58,7 @@ def test_spec_dataclass_shape_has_no_surprise_fields():
         "gated",
         "supports_num_speakers_hint",
         "measured_peak_vram_mb",
+        "vram_mb",
         "engine",
         "max_speakers_supported",
     }

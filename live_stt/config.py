@@ -178,8 +178,17 @@ class Settings(BaseSettings):
     # via `nvidia-smi --query-gpu=memory.free`, not pynvml -- avoids a new
     # dependency for one query, and nvidia-smi is already present in any
     # nvidia/cuda-based image.
+    #
+    # Per-model since the P1000 swap (see live_stt/vram.py): an ASR model's
+    # own measured `ModelSpec.vram_mb` is what admission requires.
+    # vram_per_worker_mb is only the FALLBACK for a model with no figure, and
+    # vram_overrides ({model_key: MB}) the explicit per-model override (also
+    # used for diarization/TTS keys). The reserve is card-relative:
+    # max(vram_reserve_mb, vram_reserve_pct% of total VRAM). All hot-reloadable.
     vram_per_worker_mb: int = 3000
-    vram_reserve_mb: int = 2000  # headroom for other tenants on the shared card
+    vram_reserve_mb: int = 256  # absolute floor of the headroom kept free for other tenants
+    vram_reserve_pct: float = 10.0  # ...or this share of the card, whichever is larger
+    vram_overrides: dict[str, int] = {}
 
     # Backpressure / drift (live_stt/session.py's AudioRing + watchdog).
     queue_max_sec: float = 8.0
@@ -291,6 +300,8 @@ class Settings(BaseSettings):
     # scales with file length (bigger batched windows for longer audio) --
     # re-measure with a much longer recording before trusting this on calls
     # significantly longer than ~6 minutes.
+    # Since live_stt/vram.py: FALLBACK only, for a diarization model with no
+    # `DiarizationModelSpec.vram_mb` (both registered models have one).
     diarization_vram_mb: int = 13000
 
     # Subprocess worker isolation for post-call diarization.
@@ -304,7 +315,7 @@ class Settings(BaseSettings):
     tts_model: str = DEFAULT_TTS_MODEL_KEY
     tts_voice: str = "af_heart"
     tts_device: str = "cpu"  # "cpu" | "cuda"
-    tts_vram_mb: int = 1500  # admission gate when tts_device is "cuda"
+    tts_vram_mb: int = 1500  # fallback admission figure (cuda) for a TTS model without measured_peak_vram_mb
     tts_in_subprocess: bool = True
     # Warmed-up engine cache idle timeout in seconds (LS-9).
     # When > 0, the loaded engine / worker process is kept warm across requests

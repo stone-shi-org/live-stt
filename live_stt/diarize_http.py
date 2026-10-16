@@ -58,7 +58,7 @@ import json
 import tempfile
 from typing import Any
 
-from live_stt import gpu, metrics
+from live_stt import diarization_models, gpu, metrics, vram
 from live_stt.config import Settings
 from live_stt.diarization import DiarizationError, diarize_file
 from live_stt.diarize_sessions import DiarizationSessionTracker
@@ -187,18 +187,26 @@ def handle_diarize_request(
         )
 
     if effective_settings.diarization_device == "cuda":
-        free = gpu.free_vram_mb()
-        if free is not None:
-            metrics.gpu_free_vram_mb.set(free)
-        required = effective_settings.diarization_vram_mb
-        if free is not None and free < required:
+        # Per-model requirement + reclaim of idle warm workers (live_stt/vram.py).
+        try:
+            dspec = diarization_models.resolve(effective_settings.diarization_model)
+            dkey, dmb = dspec.key, dspec.vram_mb
+        except KeyError:
+            # Unknown model: let the pipeline loader report it with its own
+            # 400 below, and gate on the fallback figure meanwhile.
+            dkey, dmb = effective_settings.diarization_model, None
+        admission = vram.admit(
+            effective_settings,
+            model_key=dkey,
+            model_mb=dmb,
+            fallback_mb=effective_settings.diarization_vram_mb,
+        )
+        if admission.free_mb is not None:
+            metrics.gpu_free_vram_mb.set(admission.free_mb)
+        if not admission.ok:
             tracker.record_rejected_vram()
             metrics.diarization_requests_total.labels(outcome="rejected_vram").inc()
-            return 503, {
-                "error": {
-                    "message": f"insufficient VRAM for diarization: {free}MB free, {required}MB required"
-                }
-            }
+            return 503, {"error": {"message": admission.message("diarization")}}
 
     with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
         tmp.write(fields["file"])

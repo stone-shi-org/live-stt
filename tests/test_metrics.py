@@ -252,6 +252,8 @@ async def test_stats_json_endpoint_includes_gpu_and_diarization() -> None:
             "total_vram_mb": None,
             "used_vram_mb": None,
             "utilization_pct": None,
+            # card-relative reserve (live_stt/vram.py); no card => the absolute floor
+            "reserve_mb": settings.vram_reserve_mb,
         }
         # Fresh ServerState -- diarization_sessions starts at all zeros,
         # with no in-flight requests in the live list.

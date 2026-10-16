@@ -312,3 +312,44 @@ async def test_client_cancellation_does_not_hang_the_server() -> None:
             # not hit RESOURCE_EXHAUSTED from a leaked admission count.
             events = [e async for e in stub.Transcribe(_config_then_audio(n_chunks=1))]
             assert events[0].WhichOneof("event") == "ready"
+
+
+@pytest.mark.asyncio
+async def test_vram_gate_is_per_model_and_runs_after_the_config_message(monkeypatch) -> None:
+    from live_stt import gpu, models, vram
+
+    monkeypatch.setattr(vram, "_total_mb_cache", None)
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: None)
+    monkeypatch.setattr(gpu, "free_vram_mb", lambda: 100)
+    monkeypatch.setattr(vram, "reclaim_idle_workers", lambda: 0)
+    settings = _settings(parakeet_backend="cuda", vram_reserve_mb=256)
+    async with _Server(settings) as server:
+        async with server.channel() as channel:
+            stub = asr_pb2_grpc.StreamingASRStub(channel)
+            with pytest.raises(grpc.aio.AioRpcError) as exc_info:
+                async for _ in stub.Transcribe(_config_then_audio(n_chunks=0)):
+                    pass
+    assert exc_info.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+    need = models.MODELS[settings.default_model].vram_mb + 256
+    assert f"{need}MB required" in exc_info.value.details()
+    assert server.state.budget.active_calls == 0  # slot released on the VRAM reject
+
+
+@pytest.mark.asyncio
+async def test_vram_gate_admits_a_small_model_the_old_flat_figure_rejected(monkeypatch) -> None:
+    # 3000 MB free: under the old flat 3000+2000, enough for the default model's own figure.
+    from live_stt import gpu, vram
+
+    monkeypatch.setattr(vram, "_total_mb_cache", None)
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: None)
+    monkeypatch.setattr(gpu, "free_vram_mb", lambda: 3000)
+    settings = _settings(parakeet_backend="cuda", vram_per_worker_mb=3000, vram_reserve_mb=256)
+    async with _Server(settings) as server:
+        async with server.channel() as channel:
+            stub = asr_pb2_grpc.StreamingASRStub(channel)
+            try:
+                async for _ in stub.Transcribe(_config_then_audio(n_chunks=0)):
+                    pass
+            except grpc.aio.AioRpcError as exc:
+                # Past the gate; anything after it (no real CUDA backend here) is fine.
+                assert exc.code() != grpc.StatusCode.RESOURCE_EXHAUSTED, exc.details()

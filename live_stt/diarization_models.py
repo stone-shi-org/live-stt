@@ -59,6 +59,12 @@ class DiarizationModelSpec:
     # finished in ~1-1.4s, too fast for the 0.5s-interval sampler used to
     # catch more than ~3 readings.
     measured_peak_vram_mb: int | None = None
+    # What admission requires (live_stt/vram.py) -- NOT measured_peak_vram_mb.
+    # PyTorch's caching allocator grows to whatever the card offers: pyannote
+    # peaked at ~11.4 GB on the 24 GB RTX 3090 but ran the same 358s meeting
+    # within ~3.1 GB on the 4 GB Quadro P1000. The peak says how big the cache
+    # gets, this says how much the job actually needs.
+    vram_mb: int | None = None
     # Which loader/runner path live_stt/diarization.py dispatches to.
     # "pyannote" (default, preserves the one pre-existing entry unchanged)
     # or "nemo_sortformer". Mirrors ASR's ModelSpec.engine field/reasoning.
@@ -83,6 +89,7 @@ DIARIZATION_MODELS: dict[str, DiarizationModelSpec] = {
         gated=True,
         supports_num_speakers_hint=True,
         measured_peak_vram_mb=11424,
+        vram_mb=3500,  # P1000: 3073 MiB peak on the 358s meeting
     ),
     # NVIDIA Sortformer v2.1 (LS-4) -- streaming-capable end-to-end neural
     # diarizer, run here in fully-batch mode (one diarize() call over the
@@ -101,6 +108,7 @@ DIARIZATION_MODELS: dict[str, DiarizationModelSpec] = {
         gated=False,
         supports_num_speakers_hint=False,
         measured_peak_vram_mb=1402,
+        vram_mb=2300,  # P1000: 2015 MiB peak (above the 3090's 1402 -- undersampled there)
         engine="nemo_sortformer",
         max_speakers_supported=4,
     ),

@@ -127,6 +127,14 @@ def test_hot_reload_fields_excludes_process_lifetime_fields() -> None:
     # A representative sample of fields live_stt/config.py's Settings
     # docstring has always documented as unsafe to change under a live
     # worker pool -- must stay restart-required.
-    for field in ("max_concurrent_calls", "worker_bin", "rotate_after_sec", "vram_per_worker_mb"):
+    for field in ("max_concurrent_calls", "worker_bin", "rotate_after_sec"):
         assert field not in HOT_RELOAD_FIELDS
+
+
+def test_vram_admission_fields_are_hot_reloadable() -> None:
+    # live_stt/vram.py reads these per request and nothing is sized from them
+    # at startup (vram_per_worker_mb used to be listed above as restart-only;
+    # it never fed anything but the admission check).
+    for field in ("vram_per_worker_mb", "vram_reserve_mb", "vram_reserve_pct", "vram_overrides", "tts_vram_mb", "diarization_vram_mb"):
+        assert field in HOT_RELOAD_FIELDS
 

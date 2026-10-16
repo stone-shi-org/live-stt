@@ -55,13 +55,14 @@ this repo's phases were held to.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import uuid
 import wave
 from typing import Any
 
-from live_stt import gpu, metrics, models
+from live_stt import gpu, metrics, models, vram
 from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
 from live_stt.logging_config import get_logger
@@ -244,18 +245,20 @@ async def handle_transcribe_request(
         "parakeet_tdt": settings.parakeet_tdt_backend,
     }.get(spec.engine, settings.parakeet_backend)
     if engine_backend == "cuda":
-        free = gpu.free_vram_mb()
-        if free is not None:
-            metrics.gpu_free_vram_mb.set(free)
-        required = settings.vram_per_worker_mb + settings.vram_reserve_mb
-        if free is not None and free < required:
+        # Per-model requirement + reclaim of idle warm workers (live_stt/vram.py).
+        admission = await asyncio.to_thread(
+            vram.admit,
+            settings,
+            model_key=spec.key,
+            model_mb=spec.vram_mb,
+            fallback_mb=settings.vram_per_worker_mb,
+        )
+        if admission.free_mb is not None:
+            metrics.gpu_free_vram_mb.set(admission.free_mb)
+        if not admission.ok:
             tracker.record_rejected_vram()
             metrics.transcribe_requests_total.labels(outcome="rejected_vram").inc()
-            return (
-                503,
-                _err(f"insufficient VRAM: {free}MB free, {required}MB required"),
-                "application/json",
-            )
+            return 503, _err(admission.message()), "application/json"
 
     if not budget.try_admit_call():
         tracker.record_rejected_capacity()

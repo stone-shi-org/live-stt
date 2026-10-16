@@ -35,6 +35,7 @@ from live_stt import (
     tts_http,
     tts_installer,
     tts_models,
+    vram,
 )
 from live_stt.backends import installer
 from live_stt.backends import registry as backend_registry
@@ -2996,7 +2997,9 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         # None fields throughout when nvidia-smi is
                         # unavailable (CPU backend / no GPU) -- see
                         # live_stt/gpu.py's snapshot() docstring.
-                        "gpu": gpu.snapshot(),
+                        # reserve_mb: the headroom VRAM admission keeps free on top of
+                        # each model's own figure (live_stt/vram.py) -- card-relative.
+                        "gpu": {**gpu.snapshot(), "reserve_mb": vram.reserve_mb(state.settings)},
                         "diarization": {
                             "active": diar.active,
                             "completed_total": diar.completed_total,
@@ -3080,6 +3083,9 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         # second hardcoded list.
                         "engine": spec.engine,
                         "streaming_capable": spec.streaming_capable,
+                        # What VRAM admission requires per worker (live_stt/vram.py),
+                        # after Settings.vram_overrides, before the reserve.
+                        "vram_mb": vram.need_mb(state.settings, spec.key, spec.vram_mb, state.settings.vram_per_worker_mb),
                     }
                     for spec in models.MODELS.values()
                 ]
@@ -3092,6 +3098,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         "gated": spec.gated,
                         "supports_num_speakers_hint": spec.supports_num_speakers_hint,
                         "measured_peak_vram_mb": spec.measured_peak_vram_mb,
+                        "vram_mb": vram.need_mb(state.settings, spec.key, spec.vram_mb, state.settings.diarization_vram_mb),
                     }
                     for spec in diarization_models.DIARIZATION_MODELS.values()
                 ]

@@ -10,7 +10,7 @@ import json
 from typing import Iterator
 from urllib.parse import parse_qs
 
-from live_stt import gpu, metrics, tts, tts_models
+from live_stt import gpu, metrics, tts, tts_models, vram
 from live_stt.config import Settings
 from live_stt.logging_config import get_logger
 from live_stt.tts import TTSBadRequestError, TTSError, TTSUnavailableError
@@ -101,24 +101,39 @@ def handle_speech_request(
     # duplicating (and re-breaking) it.
     voice = tts.resolve_voice(payload.get("voice"), settings, model_spec)
 
-    # VRAM Gate for CUDA: only enforce VRAM budget for models requiring GPU VRAM
+    # VRAM Gate for CUDA: only enforce VRAM budget for models requiring GPU VRAM.
+    # Per-model requirement + reclaim of idle warm workers (live_stt/vram.py).
+    # Skipped when the warm worker already holds THIS model on the GPU: the
+    # request reuses that VRAM rather than allocating more, and reclaiming would
+    # only kill the very worker it is about to use.
     if settings.tts_device == "cuda" and (model_spec.measured_peak_vram_mb or 0) > 0:
-        free_vram = gpu.free_vram_mb()
-        if free_vram is not None and free_vram < settings.tts_vram_mb:
+        warm = tts.get_tts_worker_manager().snapshot()
+        already_warm = bool(warm) and warm.get("model") == model_spec.key and warm.get("device") == "cuda"
+        admission = (
+            None
+            if already_warm
+            else vram.admit(
+                settings,
+                model_key=model_spec.key,
+                model_mb=model_spec.measured_peak_vram_mb,
+                fallback_mb=settings.tts_vram_mb,
+            )
+        )
+        if admission is not None and not admission.ok:
             tracker.record_rejected_vram()
             metrics.tts_requests_total.labels(outcome="rejected_vram").inc()
             logger.warning(
-                "TTS rejected: insufficient free VRAM (%d MiB free < %d MiB budget)",
-                free_vram,
-                settings.tts_vram_mb,
+                "TTS rejected: insufficient free VRAM (%s MiB free < %d MiB required)",
+                admission.free_mb,
+                admission.required_mb,
             )
             return (
                 503,
                 json.dumps(
                     {
                         "error": (
-                            f"insufficient free VRAM for TTS ({free_vram} MiB free, "
-                            f"{settings.tts_vram_mb} MiB required)"
+                            f"insufficient free VRAM for TTS ({admission.free_mb} MiB free, "
+                            f"{admission.required_mb} MiB required)"
                         )
                     }
                 ).encode(),
