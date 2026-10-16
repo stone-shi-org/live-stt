@@ -21,6 +21,7 @@ from live_stt.config import Settings
 from live_stt.pb.livestt.v1 import asr_pb2, asr_pb2_grpc
 from live_stt.servicer import StreamingASRServicer
 from live_stt.state import ServerState
+from live_stt.worker_pool import STTWorkerPool
 
 FAKE_WORKER = Path(__file__).resolve().parent / "fakes" / "fake_worker_main.py"
 
@@ -33,7 +34,9 @@ class _Server:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.state = ServerState(
-            settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots)
+            settings=settings,
+            budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots),
+            worker_pool=STTWorkerPool(),
         )
         self.servicer = StreamingASRServicer(self.state)
         self._server: grpc.aio.Server | None = None
@@ -49,6 +52,7 @@ class _Server:
     async def __aexit__(self, *exc_info: object) -> None:
         await self._server.stop(grace=1.0)
         await self._server.wait_for_termination()
+        self.state.worker_pool.close()
 
     def channel(self) -> grpc.aio.Channel:
         return grpc.aio.insecure_channel(f"127.0.0.1:{self.port}")
@@ -237,8 +241,10 @@ async def test_transcribe_at_capacity_rejects_immediately_with_resource_exhauste
                 stub_a = asr_pb2_grpc.StreamingASRStub(channel_a)
                 stub_b = asr_pb2_grpc.StreamingASRStub(channel_b)
 
+                stream_a = stub_a.Transcribe(_config_then_audio(n_chunks=1))
+
                 async def slow_call() -> None:
-                    async for _ in stub_a.Transcribe(_config_then_audio(n_chunks=1)):
+                    async for _ in stream_a:
                         pass
 
                 first_call = asyncio.ensure_future(slow_call())
@@ -258,6 +264,7 @@ async def test_transcribe_at_capacity_rejects_immediately_with_resource_exhauste
                         pass
                 assert exc_info.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
 
+                stream_a.cancel()
                 first_call.cancel()
                 try:
                     await first_call
@@ -275,12 +282,15 @@ async def test_client_cancellation_does_not_hang_the_server() -> None:
         async with server.channel() as channel:
             stub = asr_pb2_grpc.StreamingASRStub(channel)
 
+            stream = stub.Transcribe(_config_then_audio(n_chunks=1000))
+
             async def long_call() -> None:
-                async for _ in stub.Transcribe(_config_then_audio(n_chunks=1000)):
+                async for _ in stream:
                     pass
 
             call = asyncio.ensure_future(long_call())
             await asyncio.sleep(0.2)
+            stream.cancel()
             call.cancel()
             try:
                 await call

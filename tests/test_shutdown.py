@@ -19,6 +19,7 @@ from live_stt.config import Settings
 from live_stt.pb.livestt.v1 import asr_pb2, asr_pb2_grpc
 from live_stt.servicer import StreamingASRServicer
 from live_stt.state import ServerState
+from live_stt.worker_pool import STTWorkerPool
 
 FAKE_WORKER = Path(__file__).resolve().parent / "fakes" / "fake_worker_main.py"
 
@@ -30,7 +31,9 @@ def _settings(**overrides) -> Settings:
 class _Server:
     def __init__(self, settings: Settings) -> None:
         self.state = ServerState(
-            settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots)
+            settings=settings,
+            budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots),
+            worker_pool=STTWorkerPool(),
         )
         self.servicer = StreamingASRServicer(self.state)
         self._server: grpc.aio.Server | None = None
@@ -46,6 +49,7 @@ class _Server:
     async def __aexit__(self, *exc_info: object) -> None:
         await self._server.stop(grace=1.0)
         await self._server.wait_for_termination()
+        self.state.worker_pool.close()
 
     def channel(self) -> grpc.aio.Channel:
         return grpc.aio.insecure_channel(f"127.0.0.1:{self.port}")

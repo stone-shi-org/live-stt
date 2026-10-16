@@ -44,6 +44,7 @@ class STTWorkerPool:
         self._spawning_keys: set[StandbyKey] = set()
         self._reaper_timer: threading.Timer | None = None
         self._closed: bool = False
+        self._epoch: int = 0
 
     @property
     def is_closed(self) -> bool:
@@ -104,6 +105,7 @@ class STTWorkerPool:
             if key in self._spawning_keys:
                 return
             self._spawning_keys.add(key)
+            spawn_epoch = self._epoch
 
         def _do_spawn() -> None:
             worker: StandbyWorker | None = None
@@ -125,12 +127,14 @@ class STTWorkerPool:
                     exc,
                 )
                 with self._lock:
-                    self._spawning_keys.discard(key)
+                    if self._epoch == spawn_epoch:
+                        self._spawning_keys.discard(key)
                 return
 
             with self._lock:
-                self._spawning_keys.discard(key)
-                if self._closed or key in self._workers:
+                if self._epoch == spawn_epoch:
+                    self._spawning_keys.discard(key)
+                if self._closed or self._epoch != spawn_epoch or key in self._workers:
                     if worker is not None:
                         worker.kill()
                     return
@@ -188,6 +192,7 @@ class STTWorkerPool:
     def clear(self) -> int:
         """Kills and clears all standby workers."""
         with self._lock:
+            self._epoch += 1
             if self._reaper_timer is not None:
                 self._reaper_timer.cancel()
                 self._reaper_timer = None

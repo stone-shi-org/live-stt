@@ -150,6 +150,17 @@ class TestSTTWorkerPoolCore:
         finally:
             pool.close()
 
+    def test_clear_invalidates_inflight_background_spawns(self) -> None:
+        pool = STTWorkerPool()
+        try:
+            key = _make_key()
+            pool.maintain_warm_async(key=key, timeout_sec=600.0)
+            pool.clear()
+            time.sleep(0.5)
+            assert pool.count() == 0
+        finally:
+            pool.close()
+
     def test_snapshot_reports_worker_metadata(self) -> None:
         pool = STTWorkerPool()
         try:
