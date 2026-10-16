@@ -159,7 +159,9 @@ def test_upstream_visibility_report_covers_every_registered_backend_and_caches_p
     assert len(calls) == len(github_release_repos)
     for (engine, flavor), spec in BACKENDS.items():
         key = f"{engine}:{flavor}"
-        assert report[key]["pinned"] == spec.pinned_version
+        # github_release compares the upstream TAG (the install label can carry a
+        # build-variant suffix like "-cuda12" that no release tag ever has)
+        assert report[key]["pinned"] == (spec.tag if spec.source == "github_release" else spec.pinned_version)
         if spec.source == "github_release":
             assert report[key]["upstream_latest"] == "vX"
         else:

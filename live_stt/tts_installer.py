@@ -37,7 +37,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from live_stt.torch_index import pip_index_args
+from live_stt.torch_index import deps_marker, marker_is_current, pip_index_args, swap_in
 
 # key -> requirements file (repo-root-relative, shipped in the image --
 # see Dockerfile's runtime stage COPY). Keep in sync with
@@ -63,6 +63,9 @@ class TTSInstallResult:
     engine: str
     path: str
     already_installed: bool
+    # True when an install built against an outdated torch (see torch_index.deps_marker)
+    # was replaced by a fresh one.
+    replaced_stale: bool = False
 
 
 def _repo_root() -> Path:
@@ -93,8 +96,18 @@ def install(deps_root: str, engine: str) -> TTSInstallResult:
 
     target_dir = engine_deps_dir(deps_root, engine)
     marker = target_dir / ".installed"
+    stale = False
     if marker.is_file():
-        return TTSInstallResult(engine, str(target_dir), already_installed=True)
+        if marker_is_current(marker, engine):
+            return TTSInstallResult(engine, str(target_dir), already_installed=True)
+        # Installed, but against an outdated torch build (e.g. CUDA 13, which has no
+        # Pascal support). Build the replacement NEXT TO the live tree and swap it in
+        # only on success: the old install keeps serving requests meanwhile, and a
+        # failed upgrade leaves it untouched.
+        stale = True
+    staging = target_dir.with_name(engine + ".new") if stale else target_dir
+    if stale:
+        shutil.rmtree(staging, ignore_errors=True)
 
     requirements_path = _repo_root() / REQUIREMENTS_FILES[engine]
     if not requirements_path.is_file():
@@ -103,7 +116,7 @@ def install(deps_root: str, engine: str) -> TTSInstallResult:
             "was it dropped from the Dockerfile's runtime stage?"
         )
 
-    target_dir.mkdir(parents=True, exist_ok=True)
+    staging.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable,
         "-m",
@@ -111,7 +124,7 @@ def install(deps_root: str, engine: str) -> TTSInstallResult:
         "install",
         "--no-cache-dir",
         "--target",
-        str(target_dir),
+        str(staging),
         "-r",
         str(requirements_path),
         *pip_index_args(),
@@ -121,23 +134,25 @@ def install(deps_root: str, engine: str) -> TTSInstallResult:
             cmd, capture_output=True, text=True, timeout=_INSTALL_TIMEOUT_SEC, check=False
         )
     except subprocess.TimeoutExpired as exc:
-        shutil.rmtree(target_dir, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
         raise TTSInstallError(
             f"pip install timed out after {_INSTALL_TIMEOUT_SEC:.0f}s installing {engine!r}"
         ) from exc
     except OSError as exc:
-        shutil.rmtree(target_dir, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
         raise TTSInstallError(f"failed to run pip installing {engine!r}: {exc}") from exc
 
     if result.returncode != 0:
-        shutil.rmtree(target_dir, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
         raise TTSInstallError(
             f"pip install failed for {engine!r} (exit {result.returncode}): "
             f"{result.stderr[-4000:] or result.stdout[-4000:]}"
         )
 
-    marker.write_text("1", encoding="utf-8")
-    return TTSInstallResult(engine, str(target_dir), already_installed=False)
+    if stale:
+        swap_in(staging, target_dir)
+    marker.write_text(deps_marker(engine), encoding="utf-8")
+    return TTSInstallResult(engine, str(target_dir), already_installed=False, replaced_stale=stale)
 
 
 def status(deps_root: str) -> dict[str, dict[str, object]]:
@@ -146,6 +161,9 @@ def status(deps_root: str) -> dict[str, dict[str, object]]:
     return {
         engine: {
             "installed": is_installed(deps_root, engine),
+            # installed but built against outdated torch -- POST install to rebuild
+            "stale": is_installed(deps_root, engine)
+            and not marker_is_current(engine_deps_dir(deps_root, engine) / ".installed", engine),
             "path": str(engine_deps_dir(deps_root, engine)),
             "requirements_file": req_file,
         }

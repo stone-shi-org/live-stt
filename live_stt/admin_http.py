@@ -2837,6 +2837,8 @@ def _handle_diarization_engine_install(state: ServerState, body: bytes) -> tuple
     if not engine:
         return 400, {"error": "expected a JSON object: {'engine': 'pyannote' | 'nemo_sortformer'}"}
 
+    if engine not in diarization_installer.REQUIREMENTS_FILES:
+        return 400, {"error": f"unknown diarization engine {engine!r}; known: {sorted(diarization_installer.REQUIREMENTS_FILES)}"}
     try:
         result = diarization_installer.install(state.settings.diarization_deps_dir, engine)
     except diarization_installer.DiarizationInstallError as exc:
@@ -2852,6 +2854,7 @@ def _handle_diarization_engine_install(state: ServerState, body: bytes) -> tuple
         "engine": result.engine,
         "path": result.path,
         "already_installed": result.already_installed,
+        "replaced_stale": result.replaced_stale,
     }
 
 
@@ -2877,6 +2880,8 @@ def _handle_tts_engine_install(state: ServerState, body: bytes) -> tuple[int, di
     if not engine:
         return 400, {"error": "expected a JSON object: {'engine': 'kokoro' | 'piper'}"}
 
+    if engine not in tts_installer.REQUIREMENTS_FILES:
+        return 400, {"error": f"unknown TTS engine {engine!r}; known: {sorted(tts_installer.REQUIREMENTS_FILES)}"}
     try:
         result = tts_installer.install(state.settings.tts_deps_dir, engine)
     except tts_installer.TTSInstallError as exc:
@@ -2886,6 +2891,7 @@ def _handle_tts_engine_install(state: ServerState, body: bytes) -> tuple[int, di
         "engine": result.engine,
         "path": result.path,
         "already_installed": result.already_installed,
+        "replaced_stale": result.replaced_stale,
     }
 
 

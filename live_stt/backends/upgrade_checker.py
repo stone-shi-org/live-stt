@@ -124,7 +124,9 @@ def upstream_visibility_report() -> dict[str, dict[str, str | None]]:
             continue
         if spec.repo not in seen_repos:
             seen_repos[spec.repo] = fetch_upstream_latest_tag(spec.repo)
-        report[f"{engine}:{flavor}"] = {"pinned": spec.pinned_version, "upstream_latest": seen_repos[spec.repo]}
+        # Compare the upstream TAG, not the install label (spec.version may append a
+        # build variant like "-cuda12" that no upstream release tag will ever carry).
+        report[f"{engine}:{flavor}"] = {"pinned": spec.tag, "upstream_latest": seen_repos[spec.repo]}
     return report
 
 

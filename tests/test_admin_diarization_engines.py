@@ -67,7 +67,7 @@ async def test_post_install_missing_engine_field_is_400(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_install_unknown_engine_is_502(tmp_path) -> None:
+async def test_post_install_unknown_engine_is_400(tmp_path) -> None:
     settings = Settings(_env_file=None, diarization_deps_dir=str(tmp_path))
     server = serve_admin_http("127.0.0.1", 0, _state(settings))
     try:
@@ -75,7 +75,7 @@ async def test_post_install_unknown_engine_is_502(tmp_path) -> None:
         status, doc = _post(
             f"http://127.0.0.1:{port}/api/diarization-engines/install", {"engine": "not_a_real_engine"}
         )
-        assert status == 502
+        assert status == 400  # caller's fault, not an upstream failure
         assert "unknown diarization engine" in doc["error"]
     finally:
         server.shutdown()

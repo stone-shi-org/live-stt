@@ -67,13 +67,13 @@ async def test_post_install_missing_engine_field_is_400(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_install_unknown_engine_is_502(tmp_path) -> None:
+async def test_post_install_unknown_engine_is_400(tmp_path) -> None:
     settings = Settings(_env_file=None, tts_deps_dir=str(tmp_path))
     server = serve_admin_http("127.0.0.1", 0, _state(settings))
     try:
         port = server.server_address[1]
         status, doc = _post(f"http://127.0.0.1:{port}/api/tts-engines/install", {"engine": "not_a_real_engine"})
-        assert status == 502
+        assert status == 400  # caller's fault, not an upstream failure
         assert "unknown TTS engine" in doc["error"]
     finally:
         server.shutdown()

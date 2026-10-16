@@ -969,6 +969,20 @@ in `configure()` and there is no loop anywhere near it.
   `CallSession`'s cold-recovery loop respawns it until it gives up and the batch endpoint returned
   HTTP 200 with `{"text": ""}` instead of an error -- a silent failure, not fixed here.
 
+- **Upgrading an existing deployment to the CUDA 12 artifacts (found by testing the real redeployed
+  P1000 box over its API -- the first version of the change above could not upgrade in place).**
+  `installer.install()`/the deps installers treat "already installed" as a no-op, and (1)
+  `parakeet:cuda`'s new asset kept the OLD asset's tag (`v0.5.0`) so it looked installed, (2) the
+  diarization/TTS `.installed` markers carried no record of which torch they were built from. Fixes:
+  `BackendSpec.version` overrides the install label without changing the download tag
+  (`parakeet:cuda` is now `v0.5.0-cuda12`; install it, then `POST /api/backends/activate` -- install
+  never activates); torch-based engines (pyannote/nemo_sortformer/kokoro, not piper) write
+  `torch-index=<url>` into their marker, a legacy `1` marker is "stale", and
+  `POST .../install` on a stale engine builds a replacement in `<engine>.new` and swaps it in only on
+  success (old tree keeps serving, a failed rebuild leaves it untouched); `GET` engine status gains
+  `"stale"`; unknown engine names are now HTTP 400 not 502. Unit-tested (`tests/test_stale_deps_reinstall.py`);
+  the real-pip swap is first exercised by the redeploy, not by a container test.
+
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and

@@ -147,6 +147,14 @@ class BackendSpec:
     # without silently implying it works.
     wired: bool = False
 
+    # Optional install-identity override. By default the on-disk directory and
+    # the installed_backends `version` column are `tag` (github_release) or
+    # `image_digest` (oci_image). Set this when two DIFFERENT artifacts share
+    # one upstream tag: the installer treats "this version already installed"
+    # as a no-op, so a re-pointed asset under an unchanged tag would never
+    # replace what is on disk. `tag` still drives the download URL.
+    version: str = ""
+
     @property
     def pinned_version(self) -> str:
         """The one string identifying which pinned build this spec is --
@@ -157,7 +165,7 @@ class BackendSpec:
         needs "the identity of what's pinned" without caring which source
         type produced it.
         """
-        return self.tag or self.image_digest
+        return self.version or self.tag or self.image_digest
 
 
 BACKENDS: dict[tuple[str, str], BackendSpec] = {
@@ -180,6 +188,11 @@ BACKENDS: dict[tuple[str, str], BackendSpec] = {
         tag="v0.5.0",
         asset_filename="parakeet-v0.5.0-lib-linux-cuda12-x64.tar.gz",
         sha256="7c3a151793050436386b2699ad025ae96713f34e8a070a9f2029c39d57162ec1",
+        # Same upstream tag as the earlier CUDA 13 asset this entry used to point
+        # at (which dropped Pascal -- see CLAUDE.md), so without a distinct label
+        # a deployment that already had "v0.5.0" installed could never pick up
+        # the CUDA 12 build: install() is a no-op for an installed version.
+        version="v0.5.0-cuda12",
         lib_filename="libparakeet.so",
         wired=True,
     ),
