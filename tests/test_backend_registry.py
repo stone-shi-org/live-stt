@@ -34,23 +34,18 @@ def test_whisper_cpu_is_a_github_release_with_headers_fetched_separately() -> No
     assert "ggml.h" in spec.header_urls
 
 
-def test_whisper_cuda_is_an_oci_image_source_pinned_by_digest() -> None:
-    spec = resolve("whisper", "cuda")
-    assert spec.source == "oci_image"
-    assert spec.image_digest.startswith("sha256:")
-    assert spec.tag == ""  # no floating tag pin for oci_image -- digest only
-    assert spec.pinned_version == spec.image_digest
-    # Every image_files entry must have a real-looking sha256 and a real
-    # absolute in-image path.
-    assert len(spec.image_files) > 0
-    for path_in_image, sha256 in spec.image_files.values():
-        assert path_in_image.startswith("/")
-        assert len(sha256) == 64
-    # The SONAME symlink chain installer.py must create -- every symlink
-    # target must correspond to a file this spec actually fetches.
-    fetched_filenames = set(spec.image_files)
-    for target in spec.symlinks.values():
-        assert target in fetched_filenames
+def test_cuda_backends_are_cuda12_builds_so_pascal_gpus_work() -> None:
+    # CUDA 13 dropped Pascal (sm_6x): the old cuda/ghcr "main-cuda" artifacts were
+    # CUDA 13 and crashed with "no kernel image is available" on a Quadro P1000.
+    # Both CUDA entries must stay CUDA 12 builds. (Architectures themselves were
+    # checked with cuobjdump against the real artifacts, not assertable here.)
+    parakeet = resolve("parakeet", "cuda")
+    assert "cuda12" in parakeet.asset_filename
+    whisper = resolve("whisper", "cuda")
+    assert whisper.source == "github_release"  # our own build; upstream has no CUDA 12 artifact
+    assert "cuda12" in whisper.asset_filename
+    assert len(whisper.sha256) == 64
+    assert whisper.pinned_version == whisper.tag
 
 
 def test_available_flavors_for_parakeet() -> None:

@@ -937,6 +937,38 @@ in `configure()` and there is no loop anywhere near it.
   (same code path, not itself proof); and `ai.env`/`ai.yml`'s GPU sizing comments still describe
   the old baked-image assumptions in a couple of places not touched by this specific change.
 
+- **Both GPUs (Quadro P1000, sm_61, 4GB + RTX 3090, sm_86) -- every GPU path verified on the P1000;
+  the 3090 was swapped out of 10.100.0.50 and could NOT be re-run.** The box's card changed from the
+  3090 to a P1000 and every CUDA path failed: `no kernel image is available` (ggml/torch) and
+  `cuDNN ... not compatible with devices with SM < 7.5`. Root cause: **CUDA 13 dropped Pascal
+  (sm_6x)** and every CUDA artifact we consumed was CUDA 13 (the parakeet release asset, the
+  `ghcr.io/ggml-org/whisper.cpp:main-cuda` image, and PyPI's default torch wheel). Fixes, all
+  CUDA 12: (1) `parakeet:cuda` now uses upstream's `parakeet-v0.5.0-lib-linux-cuda12-x64.tar.gz`
+  (SASS sm_86/89/120/121 + PTX 50..90 -- on the P1000 it JIT-compiles the PTX, ~15s on the first
+  request). (2) `whisper:cuda` is now our OWN build -- upstream publishes no CUDA 12 whisper
+  artifact -- `scripts/build_whisper_cuda12.sh` / `scripts/whisper-cuda12.Dockerfile` (whisper.cpp
+  v1.9.4, CUDA 12.8.1, SASS+PTX for sm_61/75/80/86, `GGML_NATIVE=OFF`, `GGML_CUDA_NCCL=OFF` --
+  leaving NCCL on made libggml-cuda need libnccl.so.2 and the worker died at startup; the build now
+  fails if the bundle has an unresolved lib). It is a `github_release` entry pointing at
+  `stone-shi-org/live-stt` tag `backend-whisper-v1.9.4-cuda12` -- **that release asset must be
+  uploaded by hand before runtime install works** (tarball sha256 `a02eef7d...`, in the registry).
+  (3) `live_stt/torch_index.py`: the diarization/TTS installers add
+  `--extra-index-url https://download.pytorch.org/whl/cu126` so pip picks `torch 2.14.1+cu126`
+  (sm_60 SASS, cuDNN 9.10; override with `LSTT_TORCH_INDEX_URL`, empty = PyPI only). (4) Dockerfile
+  sets `CUDA_CACHE_PATH`/`CUDA_CACHE_MAXSIZE` onto the persistent volume so the PTX JIT cost is paid
+  once, not every restart. **Verified on the real P1000** (throwaway containers, production
+  untouched): streaming gRPC (parakeet EOU), batch HTTP for nemotron/parakeet-tdt and all 5 whisper
+  models, pyannote (full 358s meeting: 5/5 speakers, 130 segments = same as the 3090, 48s, peak VRAM
+  3073 MiB), Sortformer (15s, 2015 MiB), Kokoro. **Not verified:** nothing ran on the 3090 after the
+  change -- `cuobjdump` shows native sm_86 SASS in both CUDA libs and cu126 torch covers sm_86, so it
+  should work, but that is inference, not a run. The VRAM admission defaults (`vram_per_worker_mb`
+  3000, `vram_reserve_mb` 2000, `diarization_vram_mb` 13000) are sized for 24GB and reject EVERYTHING
+  on a 4GB card -- they need per-card values (measured on the P1000: whisper-large-v3-turbo ~2.0GB,
+  parakeet-tdt ~1.9GB, pyannote ~3.1GB, Kokoro idle ~1GB held warm), and the pyannote+Kokoro+ASR
+  combination does not fit 4GB at once. **Also found:** when a worker crashes at startup,
+  `CallSession`'s cold-recovery loop respawns it until it gives up and the batch endpoint returned
+  HTTP 200 with `{"text": ""}` instead of an error -- a silent failure, not fixed here.
+
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and

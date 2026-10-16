@@ -17,3 +17,4 @@ __pycache__/
 live_stt/pb/
 worker/build/
 worker/build-*/
+dist/

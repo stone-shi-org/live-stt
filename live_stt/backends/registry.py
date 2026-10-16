@@ -178,8 +178,8 @@ BACKENDS: dict[tuple[str, str], BackendSpec] = {
         source="github_release",
         repo="mudler/parakeet.cpp",
         tag="v0.5.0",
-        asset_filename="parakeet-v0.5.0-lib-linux-cuda-x64.tar.gz",
-        sha256="976d55f45d04f64dc53d6d7815f48abf906f52c70db90a66ab8accff3f1028fe",
+        asset_filename="parakeet-v0.5.0-lib-linux-cuda12-x64.tar.gz",
+        sha256="7c3a151793050436386b2699ad025ae96713f34e8a070a9f2029c39d57162ec1",
         lib_filename="libparakeet.so",
         wired=True,
     ),
@@ -195,54 +195,20 @@ BACKENDS: dict[tuple[str, str], BackendSpec] = {
         lib_filename="libwhisper.so",
         wired=True,
     ),
+    # CUDA 12 build (scripts/whisper-cuda12.Dockerfile, scripts/build_whisper_cuda12.sh),
+    # SASS for sm_61/75/80/86 -- ONE artifact for the Quadro P1000 and the RTX 3090.
+    # Replaces ghcr.io/ggml-org/whisper.cpp:main-cuda, which is CUDA 13 / sm_75+ only
+    # (CUDA 13 dropped Pascal) and crashed with "no kernel image is available" on a
+    # P1000. whisper.cpp publishes no CUDA 12 artifact, hence our own release asset.
+    # To bump: rebuild, upload the tarball to the release below, update sha256.
     ("whisper", "cuda"): BackendSpec(
         engine="whisper",
         flavor="cuda",
-        source="oci_image",
-        image_repo="ggml-org/whisper.cpp",
-        image_registry="ghcr.io",
-        # The real manifest-INDEX digest for the "main-cuda" tag, resolved
-        # live via ghcr.io's token+manifest endpoints (docker pull reports
-        # the same digest) -- pinning this, not the tag, is what makes this
-        # a stable reference despite "main-cuda" itself being a rolling
-        # build. installer.py resolves the linux/amd64 platform manifest
-        # from within this index.
-        image_digest="sha256:6042be448d2f11be3dfadceef9cbfd86f38a5cc5901919e7ac442fd4fd5c82e1",
-        image_files={
-            "libwhisper.so.1.9.4": ("/app/build/bin/libwhisper.so.1.9.4", "12443f2c9d16e0ddeeb11509349c6fb54356947f7ac8f98cb71b56a6fc53f4fd"),
-            "libggml.so.0.23.0": ("/app/build/bin/libggml.so.0.23.0", "dabe4c198708c859c668bd07bb530475696d84ffb04274f1b8d8ba0fac2e0ed7"),
-            "libggml-base.so.0.23.0": ("/app/build/bin/libggml-base.so.0.23.0", "ead06f24b5546aa094603d306881ad5409e97181c35e79c1f5ca977d2c965ed7"),
-            "libggml-cpu.so.0.23.0": ("/app/build/bin/libggml-cpu.so.0.23.0", "311356327699459fdefe28c9882aeb05e6bdba3a7d96e05c4186541a91153f87"),
-            "libggml-cuda.so.0.23.0": ("/app/build/bin/libggml-cuda.so.0.23.0", "059ad52520576a0d025a4701b108996e869d847916c0c75c250ab1b7e3bdd1f4"),
-            "libcudart.so.13.0.48": ("/usr/local/cuda-13.0/targets/x86_64-linux/lib/libcudart.so.13.0.48", "6876f4841bdbe30b187dcf8d7a7d2d6579bf12a36eeb430c7b28484ccdeed89a"),
-            "libcublas.so.13.0.0.19": ("/usr/local/cuda-13.0/targets/x86_64-linux/lib/libcublas.so.13.0.0.19", "ea443b3d282af9c82e16be974860b5ba993020bbe98988a7be201bf0c0215e88"),
-            "libcublasLt.so.13.0.0.19": ("/usr/local/cuda-13.0/targets/x86_64-linux/lib/libcublasLt.so.13.0.0.19", "c92c4c24c257d638a61130f8a5f7f31eb6d6262c24f8e19816ff56b58b73a857"),
-            "libnccl.so.2.27.7": ("/usr/lib/x86_64-linux-gnu/libnccl.so.2.27.7", "616933cf29bacefcfbc7bdc0222892f4682d2d4687c191ad3557a10cdb2dd723"),
-        },
-        # Full 3-level SONAME chain per library (unversioned -> soname ->
-        # fully-versioned) -- confirmed REQUIRED by actually linking
-        # against a directory missing the middle level (the dynamic
-        # loader/linker look up the exact SONAME string, e.g.
-        # "libwhisper.so.1", not just any file containing the right bytes).
-        symlinks={
-            "libwhisper.so": "libwhisper.so.1.9.4",
-            "libwhisper.so.1": "libwhisper.so.1.9.4",
-            "libggml.so": "libggml.so.0.23.0",
-            "libggml.so.0": "libggml.so.0.23.0",
-            "libggml-base.so": "libggml-base.so.0.23.0",
-            "libggml-base.so.0": "libggml-base.so.0.23.0",
-            "libggml-cpu.so": "libggml-cpu.so.0.23.0",
-            "libggml-cpu.so.0": "libggml-cpu.so.0.23.0",
-            "libggml-cuda.so": "libggml-cuda.so.0.23.0",
-            "libggml-cuda.so.0": "libggml-cuda.so.0.23.0",
-            "libcudart.so": "libcudart.so.13.0.48",
-            "libcudart.so.13": "libcudart.so.13.0.48",
-            "libcublas.so": "libcublas.so.13.0.0.19",
-            "libcublas.so.13": "libcublas.so.13.0.0.19",
-            "libcublasLt.so": "libcublasLt.so.13.0.0.19",
-            "libcublasLt.so.13": "libcublasLt.so.13.0.0.19",
-            "libnccl.so.2": "libnccl.so.2.27.7",
-        },
+        source="github_release",
+        repo="stone-shi-org/live-stt",
+        tag="backend-whisper-v1.9.4-cuda12",
+        asset_filename="whisper-v1.9.4-lib-linux-cuda12-x64.tar.gz",
+        sha256="a02eef7dd09af6920b7369816d266bef766ee2649eecbbab7f3c30797dd91b62",
         header_urls=dict(_WHISPER_HEADER_URLS),
         lib_filename="libwhisper.so",
         wired=True,

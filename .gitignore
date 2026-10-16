@@ -39,3 +39,4 @@ worker/prebuilt-*/
 
 # audio dumps (LSTT_AUDIO_DUMP), never committed
 data/dumps/
+dist/

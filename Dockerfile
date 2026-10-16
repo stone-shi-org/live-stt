@@ -202,6 +202,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # container-local cache re-downloaded (and re-burning the HF token's rate
 # limit) on every restart.
 ENV HF_HOME=/app/data/hf-cache
+# CUDA JIT cache on the persistent volume. Pascal (sm_61) runs the CUDA 12 builds'
+# PTX via driver JIT, which costs ~15s on the first request after every container
+# start and writes to ~/.nv/ComputeCache -- ephemeral, so it was paid on EVERY
+# restart. Persisting it makes that a one-time cost. The 256MB default cap is too
+# small for several engines' kernels, and an over-cap cache silently evicts.
+ENV CUDA_CACHE_PATH=/app/data/cuda-cache \
+    CUDA_CACHE_MAXSIZE=2147483648
 
 # See docker-cli-fetch's own comment above for why this is a pinned static
 # binary and not `apt-get install docker.io`. This alone is NOT sufficient

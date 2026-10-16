@@ -32,7 +32,7 @@ if [[ "${1:-}" == "--cuda" ]]; then
     # unquoted, the shell parses it as a command separator, not part of the
     # value (a latent bug in an earlier version of this script, never
     # actually exercised until this one ran for real).
-    CUDA_ARGS=(-DPARAKEET_GGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=86")
+    CUDA_ARGS=(-DPARAKEET_GGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=61;75;80;86")
     # GGML_CUDA_NCCL=OFF: NCCL (NVIDIA Collective Comm. Library) is
     # multi-GPU tensor-parallel comm code -- ggml's own CMake default is ON
     # whenever it finds NCCL available (which the CUDA devel image does),
@@ -46,7 +46,7 @@ if [[ "${1:-}" == "--cuda" ]]; then
     # see CLAUDE.md), so multi-GPU collectives are simply unneeded, not a
     # feature this ever wants: disabling it at configure time avoids the
     # dependency entirely rather than also linking NCCL just to satisfy it.
-    WHISPER_CUDA_ARGS=(-DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=86" -DGGML_CUDA_NCCL=OFF)
+    WHISPER_CUDA_ARGS=(-DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=61;75;80;86" -DGGML_CUDA_NCCL=OFF)
 fi
 
 echo "==> Configuring parakeet.cpp (standalone build)"

@@ -46,6 +46,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from live_stt.torch_index import pip_index_args
+
 # key -> requirements file (repo-root-relative, shipped in the image --
 # see Dockerfile's runtime stage COPY). Keep in sync with
 # live_stt/diarization_models.py's DiarizationModelSpec.engine values.
@@ -141,6 +143,7 @@ def install(deps_root: str, engine: str) -> DiarizationInstallResult:
         str(target_dir),
         "-r",
         str(requirements_path),
+        *pip_index_args(),
     ]
     try:
         result = subprocess.run(
