@@ -93,6 +93,19 @@ async def test_transcribe_happy_path_yields_ready_then_final() -> None:
 
 
 @pytest.mark.asyncio
+async def test_transcribe_uses_configured_default_model_when_config_omits_model() -> None:
+    # LS-13: omitting StreamConfig.model must resolve against Settings.default_model
+    # (the configured/hot-reloaded default streaming model), not the hardcoded constant.
+    async with _Server(_settings(default_model="nemotron-3.5-asr-streaming-0.6b")) as server:
+        async with server.channel() as channel:
+            stub = asr_pb2_grpc.StreamingASRStub(channel)
+            events = [e async for e in stub.Transcribe(_config_then_audio(n_chunks=1))]
+
+    assert events[0].WhichOneof("event") == "ready"
+    assert events[0].ready.model == "nemotron-3.5-asr-streaming-0.6b"
+
+
+@pytest.mark.asyncio
 async def test_transcribe_rejects_missing_config_first_message() -> None:
     async def audio_only() -> AsyncIterator[asr_pb2.TranscriptionRequest]:
         yield asr_pb2.TranscriptionRequest(audio=b"\x00\x00")

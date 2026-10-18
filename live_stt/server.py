@@ -63,7 +63,7 @@ async def serve(settings: Settings | None = None) -> None:
     admin_http = serve_admin_http(settings.admin_host, settings.admin_port, state)
     logger.info(
         "starting grpc=%s admin_http=%s:%s parakeet_backend=%s whisper_backend=%s "
-        "parakeet_tdt_backend=%s default_model=%s max_concurrent_calls=%s",
+        "parakeet_tdt_backend=%s default_model=%s default_batch_model=%s max_concurrent_calls=%s",
         listen_addr,
         settings.admin_host,
         settings.admin_port,
@@ -71,6 +71,7 @@ async def serve(settings: Settings | None = None) -> None:
         settings.whisper_backend,
         settings.parakeet_tdt_backend,
         settings.default_model,
+        settings.default_batch_model,
         settings.max_concurrent_calls,
     )
 

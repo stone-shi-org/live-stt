@@ -383,7 +383,7 @@ async def test_stats_json_endpoint_reflects_an_in_flight_tts_request() -> None:
 async def test_v1_models_endpoint_lists_asr_and_diarization_and_tts_models() -> None:
     import json
 
-    settings = Settings(_env_file=None)
+    settings = Settings(_env_file=None, default_batch_model="parakeet-tdt-0.6b-v3")
     state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
     server = serve_admin_http("127.0.0.1", 0, state)
     try:
@@ -397,7 +397,7 @@ async def test_v1_models_endpoint_lists_asr_and_diarization_and_tts_models() -> 
         by_id = {entry["id"]: entry for entry in doc["data"]}
 
         # Every ASR model in the registry is present, typed correctly, and
-        # exactly one is marked default (the configured default_model).
+        # default_streaming / default_batch reflect default_model and default_batch_model.
         for key, spec in models.MODELS.items():
             assert key in by_id
             entry = by_id[key]
@@ -406,9 +406,13 @@ async def test_v1_models_endpoint_lists_asr_and_diarization_and_tts_models() -> 
             assert entry["model_chunk_ms"] == spec.model_chunk_ms
             assert entry["has_eou"] == spec.has_eou
             assert entry["default"] == (key == settings.default_model)
+            assert entry["default_streaming"] == (key == settings.default_model)
+            assert entry["default_batch"] == (key == settings.default_batch_model)
             assert entry["engine"] == spec.engine
             assert entry["streaming_capable"] == spec.streaming_capable
         assert sum(e["default"] for e in by_id.values() if e["type"] == "asr") == 1
+        assert sum(e["default_streaming"] for e in by_id.values() if e["type"] == "asr") == 1
+        assert sum(e["default_batch"] for e in by_id.values() if e["type"] == "asr") == 1
 
         asr_entries = [e for e in by_id.values() if e["type"] == "asr"]
         assert any(e["streaming_capable"] is True for e in asr_entries)

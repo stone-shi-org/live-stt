@@ -200,3 +200,85 @@ async def test_put_api_settings_unknown_key_is_400() -> None:
         assert "unknown setting" in doc["error"]
     finally:
         server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_get_api_settings_includes_field_options_for_default_model_pickers() -> None:
+    # LS-13: default_model must list only streaming-capable ASR models, while
+    # default_batch_model lists all ASR models (streaming + batch-only).
+    from live_stt import diarization_models, models, tts_models
+
+    server = serve_admin_http("127.0.0.1", 0, _state())
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/settings", timeout=5) as resp:
+            doc = json.loads(resp.read().decode())
+        opts = doc["field_options"]
+        streaming_values = [o["value"] for o in opts["default_model"]]
+        batch_values = [o["value"] for o in opts["default_batch_model"]]
+        diar_values = [o["value"] for o in opts["diarization_model"]]
+        tts_values = [o["value"] for o in opts["tts_model"]]
+
+        assert streaming_values == list(models.STREAMING_MODELS.keys())
+        assert "whisper-base.en-q8_0" not in streaming_values
+        assert "parakeet-tdt-0.6b-v3" not in streaming_values
+
+        assert batch_values == list(models.MODELS.keys())
+        assert "whisper-base.en-q8_0" in batch_values
+        assert "parakeet-tdt-0.6b-v3" in batch_values
+
+        assert diar_values == list(diarization_models.DIARIZATION_MODELS.keys())
+        assert tts_values == list(tts_models.TTS_MODELS.keys())
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_settings_page_renders_select_picker_and_batch_model_row() -> None:
+    # LS-13: settings page uses a <select> dropdown for fields with field_options
+    # and displays both default_model (streaming) and default_batch_model (batch).
+    server = serve_admin_http("127.0.0.1", 0, _state())
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/settings", timeout=5) as resp:
+            body = resp.read().decode()
+            assert 'id="cfgBatchModel"' in body
+            assert "default_batch_model" in body
+            assert "field_options" in body
+            assert "<select data-key=" in body
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_put_api_settings_hot_reloads_default_models_and_rejects_batch_only_for_streaming() -> None:
+    store = SettingsStore(":memory:")
+    settings = Settings(_env_file=None)
+    store.migrate_if_empty(settings)
+    state = _state(settings=settings, settings_store=store)
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+        url = f"http://127.0.0.1:{port}/api/settings"
+
+        # Valid streaming model + batch-only model for batch ASR both hot-reload
+        status, doc = _put(
+            url,
+            {
+                "default_model": "nemotron-3.5-asr-streaming-0.6b",
+                "default_batch_model": "parakeet-tdt-0.6b-v3",
+            },
+        )
+        assert status == 200
+        assert set(doc["applied_hot"]) == {"default_model", "default_batch_model"}
+        assert doc["pending_restart"] == []
+        assert state.settings.default_model == "nemotron-3.5-asr-streaming-0.6b"
+        assert state.settings.default_batch_model == "parakeet-tdt-0.6b-v3"
+
+        # Rejecting a batch-only model on default_model (streaming ASR) returns 400
+        status_bad, doc_bad = _put(url, {"default_model": "whisper-base.en-q8_0"})
+        assert status_bad == 400
+        assert "batch-only" in doc_bad["error"]
+        assert state.settings.default_model == "nemotron-3.5-asr-streaming-0.6b"
+    finally:
+        server.shutdown()

@@ -287,6 +287,29 @@ class TestHandleTranscribeRequestResponses:
         assert json.loads(resp) == {"text": "hello world"}
 
     @pytest.mark.asyncio
+    async def test_omitted_model_uses_configured_default_batch_model(self, monkeypatch: pytest.MonkeyPatch):
+        # LS-13: batch transcription (POST /v1/audio/transcriptions) must fall back
+        # to Settings.default_batch_model (which may be a batch-only model such as
+        # parakeet-tdt-0.6b-v3 or whisper-*) rather than Settings.default_model.
+        seen_specs = []
+
+        async def fake_run(pcm, *, settings, spec, language, budget):
+            seen_specs.append(spec.key)
+            return "batch transcript", [], 1.0, 1
+
+        monkeypatch.setattr(transcribe_http, "_run_transcription", fake_run)
+        body = _multipart_body({}, file_field="file", file_bytes=_wav_bytes())
+        settings = _settings(
+            default_model="realtime_eou_120m-v1",
+            default_batch_model="parakeet-tdt-0.6b-v3",
+        )
+        status, resp, ct = await transcribe_http.handle_transcribe_request(
+            content_type=CONTENT_TYPE, body=body, settings=settings, budget=_budget(), draining=False, tracker=_tracker()
+        )
+        assert status == 200
+        assert seen_specs == ["parakeet-tdt-0.6b-v3"]
+
+    @pytest.mark.asyncio
     async def test_verbose_json_response(self, monkeypatch: pytest.MonkeyPatch):
         self._patch(monkeypatch, total_audio_sec=3.2, generations=2)
         body = _multipart_body(

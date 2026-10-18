@@ -138,3 +138,35 @@ def test_vram_admission_fields_are_hot_reloadable() -> None:
     for field in ("vram_per_worker_mb", "vram_reserve_mb", "vram_reserve_pct", "vram_overrides", "tts_vram_mb", "diarization_vram_mb"):
         assert field in HOT_RELOAD_FIELDS
 
+
+def test_default_model_fields_are_hot_reloadable() -> None:
+    # LS-13: all default model pickers are resolved per-request and should take
+    # effect immediately without a server restart.
+    for field in ("default_model", "default_batch_model", "diarization_model", "tts_model"):
+        assert field in HOT_RELOAD_FIELDS
+
+
+def test_apply_update_validates_default_models_and_rejects_invalid_choices() -> None:
+    store = _store()
+    settings = Settings(_env_file=None)
+
+    # Streaming default model accepts streaming-capable ASR models
+    validated = apply_update(store, settings, {"default_model": "nemotron-3.5-asr-streaming-0.6b"})
+    assert validated.default_model == "nemotron-3.5-asr-streaming-0.6b"
+
+    # Streaming default model rejects batch-only ASR models
+    with pytest.raises(ValueError, match="batch-only"):
+        apply_update(store, settings, {"default_model": "whisper-base.en-q8_0"})
+    with pytest.raises(ValueError, match="batch-only"):
+        apply_update(store, settings, {"default_model": "parakeet-tdt-0.6b-v3"})
+
+    # Batch default model accepts both batch-only and streaming ASR models
+    validated_batch = apply_update(store, settings, {"default_batch_model": "parakeet-tdt-0.6b-v3"})
+    assert validated_batch.default_batch_model == "parakeet-tdt-0.6b-v3"
+
+    # Diarization and TTS default models validate against their registries
+    with pytest.raises(ValueError, match="unknown diarization model"):
+        apply_update(store, settings, {"diarization_model": "not-a-diarizer"})
+    with pytest.raises(ValueError, match="unknown TTS model"):
+        apply_update(store, settings, {"tts_model": "not-a-tts"})
+

@@ -205,9 +205,9 @@ async def handle_transcribe_request(
         return 400, _err(str(exc)), "application/json"
 
     model_field = fields.get("model")
-    model_key = model_field.decode("utf-8", "replace") if model_field else None
+    model_key = model_field.decode("utf-8", "replace").strip() if model_field else None
     try:
-        spec = models.resolve(model_key)
+        spec = models.resolve(model_key or settings.default_batch_model)
     except KeyError as exc:
         return 400, _err(str(exc)), "application/json"
 

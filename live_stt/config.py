@@ -12,7 +12,7 @@ from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from live_stt.diarization_models import DEFAULT_DIARIZATION_MODEL_KEY
-from live_stt.models import DEFAULT_MODEL_KEY
+from live_stt.models import DEFAULT_BATCH_MODEL_KEY, DEFAULT_MODEL_KEY, MODELS, STREAMING_MODELS
 from live_stt.tts_models import DEFAULT_TTS_MODEL_KEY
 
 
@@ -47,7 +47,12 @@ class Settings(BaseSettings):
     parakeet_backend: str = "cpu"
     whisper_backend: str = "cpu"
     parakeet_tdt_backend: str = "cpu"
+    # LS-13: separate default models for Streaming ASR (gRPC Transcribe,
+    # restricted to streaming_capable=True models in live_stt/models.py) vs.
+    # Batch ASR (POST /v1/audio/transcriptions, any registered ASR model
+    # including batch-only parakeet_tdt and whisper models).
     default_model: str = DEFAULT_MODEL_KEY
+    default_batch_model: str = DEFAULT_BATCH_MODEL_KEY
     models_dir: str = "/models"
 
     # SQLite-backed runtime settings store (LS-5). Lives under the same
@@ -352,6 +357,21 @@ class Settings(BaseSettings):
             raise ValueError("tts_idle_timeout_sec must be non-negative")
         if self.stt_idle_timeout_sec < 0:
             raise ValueError("stt_idle_timeout_sec must be non-negative")
+        if self.default_model not in MODELS:
+            raise ValueError(
+                f"unknown default_model {self.default_model!r}; available streaming models: "
+                f"{sorted(STREAMING_MODELS)}"
+            )
+        if not MODELS[self.default_model].streaming_capable:
+            raise ValueError(
+                f"default_model {self.default_model!r} is batch-only (streaming_capable=False); "
+                "use default_batch_model for batch ASR, and pick a streaming-capable model for default_model: "
+                f"{sorted(STREAMING_MODELS)}"
+            )
+        if self.default_batch_model not in MODELS:
+            raise ValueError(
+                f"unknown default_batch_model {self.default_batch_model!r}; available models: {sorted(MODELS)}"
+            )
         return self
 
 

@@ -196,6 +196,7 @@ MODELS: dict[str, ModelSpec] = {
 }
 
 DEFAULT_MODEL_KEY = "realtime_eou_120m-v1"
+DEFAULT_BATCH_MODEL_KEY = "realtime_eou_120m-v1"
 # Canonical key for the Parakeet TDT batch model.
 DEFAULT_PARAKEET_TDT_MODEL_KEY = "parakeet-tdt-0.6b-v3"
 # Not wired into Settings.default_model (that stays realtime_eou_120m-v1,
@@ -203,6 +204,10 @@ DEFAULT_PARAKEET_TDT_MODEL_KEY = "parakeet-tdt-0.6b-v3"
 # one canonical whisper key to point at without repeating the string. This
 # is also the exact model the user asked to add support for.
 DEFAULT_WHISPER_MODEL_KEY = "whisper-large-v3-turbo-q8_0"
+
+STREAMING_MODELS: dict[str, ModelSpec] = {
+    key: spec for key, spec in MODELS.items() if spec.streaming_capable
+}
 
 
 def resolve(model_key: str | None) -> ModelSpec:

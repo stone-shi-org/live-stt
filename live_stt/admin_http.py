@@ -1129,7 +1129,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         .settings-table tr:hover:not(.section-divider-row) {
             background: rgba(255, 255, 255, 0.02);
         }
-        .settings-table input[type=text], .settings-table input[type=number] {
+        .settings-table input[type=text], .settings-table input[type=number], .settings-table select {
             background: var(--input-bg);
             color: var(--text-main);
             border: 1px solid var(--panel-border);
@@ -1140,7 +1140,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             font-size: 0.85rem;
             box-sizing: border-box;
         }
-        .settings-table input[type=text]:focus, .settings-table input[type=number]:focus {
+        .settings-table input[type=text]:focus, .settings-table input[type=number]:focus, .settings-table select:focus {
             border-color: var(--accent-blue);
             outline: none;
         }
@@ -1740,6 +1740,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                             <tr><td class="kv-key">whisper_backend</td><td class="kv-val" id="cfgBackendWhisper">-</td></tr>
                             <tr><td class="kv-key">parakeet_tdt_backend</td><td class="kv-val" id="cfgBackendParakeetTdt">-</td></tr>
                             <tr><td class="kv-key">default_model</td><td class="kv-val" id="cfgModel">-</td></tr>
+                            <tr><td class="kv-key">default_batch_model</td><td class="kv-val" id="cfgBatchModel">-</td></tr>
                             <tr><td class="kv-key">diarization_model</td><td class="kv-val" id="cfgDiarizationModel">-</td></tr>
                             <tr><td class="kv-key">tts_model</td><td class="kv-val" id="cfgTtsModel">-</td></tr>
                             <tr><td class="kv-key">models_dir</td><td class="kv-val" id="cfgModelsDir">-</td></tr>
@@ -2213,6 +2214,8 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 document.getElementById('cfgBackendWhisper').innerText = config.whisper_backend || 'cpu';
                 document.getElementById('cfgBackendParakeetTdt').innerText = config.parakeet_tdt_backend || 'cpu';
                 document.getElementById('cfgModel').innerText = config.default_model || '-';
+                const cfgBatchEl = document.getElementById('cfgBatchModel');
+                if (cfgBatchEl) cfgBatchEl.innerText = config.default_batch_model || '-';
                 document.getElementById('cfgDiarizationModel').innerText = config.diarization_model || '-';
                 document.getElementById('cfgTtsModel').innerText = config.tts_model || '-';
                 document.getElementById('cfgModelsDir').innerText = config.models_dir || '-';
@@ -2269,7 +2272,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 document.getElementById('svcLiveCallTbody').innerHTML =
                     liveCallModels.length
                         ? liveCallModels.map(m => modelRow(m, [
-                              m.default && 'default',
+                              (m.default_streaming ?? m.default) && 'default',
                               m.has_eou && 'EOU',
                               m.multilingual && 'multilingual',
                           ])).join('')
@@ -2278,7 +2281,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 document.getElementById('svcTranscriptTbody').innerHTML =
                     asrModels.length
                         ? asrModels.map(m => modelRow(m, [
-                              m.default && 'default',
+                              (m.default_batch ?? m.default) && 'default',
                               m.streaming_capable === false && 'batch-only',
                               m.multilingual && 'multilingual',
                           ])).join('')
@@ -2324,7 +2327,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 icon: "🎙️",
                 keys: [
                     "parakeet_backend", "whisper_backend", "parakeet_tdt_backend",
-                    "default_model", "models_dir",
+                    "default_model", "default_batch_model", "models_dir",
                     "worker_bin", "worker_ggml_lib_dir",
                     "worker_bin_whisper", "worker_ggml_lib_dir_whisper",
                     "worker_bin_parakeet_tdt", "worker_ggml_lib_dir_parakeet_tdt"
@@ -2382,16 +2385,38 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             }
         ];
 
+        const SETTING_DESCRIPTIONS = {
+            default_model: "Streaming ASR default model (gRPC Transcribe — streaming-capable models only)",
+            default_batch_model: "Batch ASR default model (POST /v1/audio/transcriptions — all ASR models)",
+            diarization_model: "Speaker Diarization default model (POST /v1/audio/diarization)",
+            tts_model: "Text-to-Speech default model (POST /v1/audio/speech)"
+        };
+
         let original = {};
         let hotFields = new Set();
+        let fieldOptions = {};
         const dirty = {};
         let activeCategory = 'all';
 
         function cell(key, value, secId) {
             const isBool = (typeof value === 'boolean');
             const isNum = (typeof value === 'number');
+            const opts = fieldOptions[key];
             let input;
-            if (isBool) {
+            if (Array.isArray(opts) && opts.length > 0) {
+                const currentVal = value === null || value === undefined ? '' : String(value);
+                const hasCurrent = opts.some(o => (typeof o === 'string' ? o : o.value) === currentVal);
+                const optionList = hasCurrent || !currentVal
+                    ? opts
+                    : [{ value: currentVal, label: `${currentVal} (custom)` }, ...opts];
+                const optionsHtml = optionList.map(o => {
+                    const optVal = typeof o === 'string' ? o : o.value;
+                    const optLabel = typeof o === 'string' ? o : (o.label || o.value);
+                    const selected = optVal === currentVal ? 'selected' : '';
+                    return `<option value="${optVal}" ${selected}>${optLabel}</option>`;
+                }).join('');
+                input = `<select data-key="${key}">${optionsHtml}</select>`;
+            } else if (isBool) {
                 input = `<input type="checkbox" data-key="${key}" ${value ? 'checked' : ''}>`;
             } else if (isNum) {
                 input = `<input type="number" step="any" data-key="${key}" value="${value}">`;
@@ -2401,7 +2426,10 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             const badge = hotFields.has(key)
                 ? '<span class="badge hot">hot</span>'
                 : '<span class="badge restart">restart required</span>';
-            return `<tr class="setting-row" data-key="${key}" data-section="${secId}"><td><code>${key}</code></td><td>${input}</td><td>${badge}</td></tr>`;
+            const desc = SETTING_DESCRIPTIONS[key]
+                ? `<div class="card-subtext" style="font-size:0.74rem;margin-top:0.2rem;">${SETTING_DESCRIPTIONS[key]}</div>`
+                : '';
+            return `<tr class="setting-row" data-key="${key}" data-section="${secId}"><td><code>${key}</code>${desc}</td><td>${input}</td><td>${badge}</td></tr>`;
         }
 
         function markDirty(key, value) {
@@ -2418,6 +2446,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             const doc = await resp.json();
             original = doc.settings || {};
             hotFields = new Set(doc.hot_reload_fields || []);
+            fieldOptions = doc.field_options || {};
             const tbody = document.getElementById('settingsBody');
 
             const allKeys = new Set(Object.keys(original));
@@ -2441,14 +2470,16 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
 
             tbody.innerHTML = html || '<tr><td colspan="3" class="card-subtext">No settings found</td></tr>';
 
-            tbody.querySelectorAll('input').forEach(el => {
-                el.addEventListener('input', () => {
+            tbody.querySelectorAll('input, select').forEach(el => {
+                const onChange = () => {
                     const key = el.dataset.key;
                     let val = el.value;
                     if (el.type === 'checkbox') val = el.checked;
                     else if (el.type === 'number') val = val === '' ? null : Number(val);
                     markDirty(key, val);
-                });
+                };
+                el.addEventListener('input', onChange);
+                el.addEventListener('change', onChange);
             });
 
             renderCategoryPills(SETTINGS_SECTIONS, remainingKeys.length > 0);
@@ -2522,6 +2553,7 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 for (const k of Object.keys(dirty)) delete dirty[k];
                 document.getElementById('saveBtn').disabled = true;
                 await load();
+                await updateDashboard();
             } else {
                 showBanner('err', doc.error || 'save failed');
             }
@@ -2682,6 +2714,52 @@ HTML_SETTINGS_PAGE = HTML_STATS_PAGE
 
 
 
+def _field_options() -> dict[str, list[dict[str, str]]]:
+    """Picker options for model-selection settings fields (LS-13).
+
+    - ``default_model`` is restricted to streaming-capable ASR models
+      (``spec.streaming_capable=True``), since batch-only models cannot serve
+      the gRPC ``Transcribe`` RPC.
+    - ``default_batch_model`` lists all registered ASR models (streaming +
+      batch-only), since ``POST /v1/audio/transcriptions`` supports every ASR
+      engine.
+    - ``diarization_model`` and ``tts_model`` list their respective registries.
+    """
+    return {
+        "default_model": [
+            {
+                "value": spec.key,
+                "label": f"{spec.key} ({spec.engine}, {spec.model_chunk_ms}ms, streaming)",
+            }
+            for spec in models.STREAMING_MODELS.values()
+        ],
+        "default_batch_model": [
+            {
+                "value": spec.key,
+                "label": (
+                    f"{spec.key} ({spec.engine}, "
+                    f"{'streaming + batch' if spec.streaming_capable else 'batch-only'})"
+                ),
+            }
+            for spec in models.MODELS.values()
+        ],
+        "diarization_model": [
+            {
+                "value": spec.key,
+                "label": f"{spec.key} ({spec.engine}{', gated' if spec.gated else ''})",
+            }
+            for spec in diarization_models.DIARIZATION_MODELS.values()
+        ],
+        "tts_model": [
+            {
+                "value": spec.key,
+                "label": f"{spec.key} ({spec.engine}, {spec.sample_rate}Hz)",
+            }
+            for spec in tts_models.TTS_MODELS.values()
+        ],
+    }
+
+
 def _settings_doc(state: ServerState) -> dict:
     current = state.settings.model_dump()
     return {
@@ -2689,6 +2767,7 @@ def _settings_doc(state: ServerState) -> dict:
         "hot_reload_fields": sorted(HOT_RELOAD_FIELDS),
         "restart_required_fields": sorted(set(current) - HOT_RELOAD_FIELDS),
         "store_available": state.settings_store is not None,
+        "field_options": _field_options(),
     }
 
 
@@ -2974,6 +3053,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                             "parakeet_tdt": state.settings.parakeet_tdt_backend,
                         },
                         "model": state.settings.default_model,
+                        "batch_model": state.settings.default_batch_model,
                         "capacity": {
                             "used": state.budget.active_calls,
                             "total": state.settings.max_concurrent_calls,
@@ -3067,6 +3147,8 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         "object": "model",
                         "type": "asr",
                         "default": spec.key == state.settings.default_model,
+                        "default_streaming": spec.key == state.settings.default_model,
+                        "default_batch": spec.key == state.settings.default_batch_model,
                         "model_chunk_ms": spec.model_chunk_ms,
                         "has_eou": spec.has_eou,
                         "has_punctuation": spec.has_punctuation,

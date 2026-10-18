@@ -26,7 +26,7 @@ import sqlite3
 import threading
 from typing import Any
 
-from live_stt import db
+from live_stt import db, diarization_models, tts_models
 from live_stt.config import Settings, get_settings
 from live_stt.redaction import validate as validate_redaction_config
 
@@ -51,6 +51,10 @@ from live_stt.redaction import validate as validate_redaction_config
 # about; requiring a conscious restart for that one is a feature.
 HOT_RELOAD_FIELDS: frozenset[str] = frozenset(
     {
+        "default_model",
+        "default_batch_model",
+        "diarization_model",
+        "tts_model",
         "diarization_num_speakers",
         "diarization_min_speakers",
         "diarization_max_speakers",
@@ -197,6 +201,18 @@ def apply_update(store: SettingsStore, live_settings: Settings, updates: dict[st
         validated = Settings(_env_file=None, **merged)
     except Exception as exc:  # pydantic's ValidationError, re-raised as plain ValueError
         raise ValueError(str(exc)) from exc
+
+    if "diarization_model" in updates:
+        try:
+            diarization_models.resolve(validated.diarization_model)
+        except KeyError as exc:
+            raise ValueError(str(exc)) from exc
+
+    if "tts_model" in updates:
+        try:
+            tts_models.resolve(validated.tts_model)
+        except KeyError as exc:
+            raise ValueError(str(exc)) from exc
 
     if updates.keys() & _REDACTION_FIELDS:
         try:

@@ -133,7 +133,7 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
                 return
 
             try:
-                spec = models.resolve(config.model or None)
+                spec = models.resolve(config.model or self._settings.default_model)
             except KeyError as exc:
                 metrics.stream_init_failures_total.labels(reason="bad_config").inc()
                 outcome = "invalid_argument"
