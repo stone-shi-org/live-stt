@@ -40,7 +40,7 @@ from live_stt.events import worker_json_to_events
 from live_stt.logging_config import get_logger
 from live_stt.models import ModelSpec, strip_language_tag
 from live_stt.pb.livestt.v1 import asr_pb2
-from live_stt.worker import StandbyKey, WorkerError, WorkerHandle
+from live_stt.worker import StandbyKey, WorkerError, WorkerHandle, WorkerOOMError
 from live_stt.worker_pool import STTWorkerPool
 
 logger = get_logger("session")
@@ -223,13 +223,13 @@ class CallSession:
             extra_env=self._extra_env(),
         )
 
-    async def _spawn_worker(self) -> WorkerHandle:
+    async def _spawn_worker(self, *, allow_standby: bool = True) -> WorkerHandle:
         worker_bin, gguf_path, language, n_threads, ggml_lib_dir, ggml_backend_path, use_gpu, engine_backend = (
             self._resolve_spawn_params()
         )
         self._use_gpu = use_gpu
         # LS-10: check if a warmed-up standby worker is already waiting in memory/GPU
-        if self._worker_pool is not None and self._settings.stt_idle_timeout_sec > 0:
+        if allow_standby and self._worker_pool is not None and self._settings.stt_idle_timeout_sec > 0:
             key = StandbyKey(
                 worker_bin=str(worker_bin),
                 gguf_path=gguf_path,
@@ -246,18 +246,30 @@ class CallSession:
                 standby = await asyncio.to_thread(self._worker_pool.acquire, key, wait_inflight=True)
             if standby is not None:
                 metrics.stt_standby_workers_active.set(self._worker_pool.count())
-                handle = await WorkerHandle.from_standby(standby)
-                metrics.model_load_duration_seconds.observe(0.0)
-                version = __about__.info()
-                metrics.set_build_info(
-                    version=version["hash"],
-                    parakeet_ref=version["parakeet_ref"],
-                    backend=engine_backend,
-                    model=self._model_spec.key,
-                    n_threads=n_threads,
-                    ggml_features=handle.ready.get("ggml_features", ""),
-                )
-                return handle
+                try:
+                    handle = await WorkerHandle.from_standby(standby)
+                except Exception as exc:
+                    rc = standby.proc.poll()
+                    logger.warning(
+                        "discarded standby worker for %s (pid=%s, exit_code=%s) after health check failed: %s; spawning fresh worker",
+                        self._model_spec.key,
+                        standby.proc.pid,
+                        rc,
+                        exc,
+                    )
+                    standby.kill()
+                else:
+                    metrics.model_load_duration_seconds.observe(0.0)
+                    version = __about__.info()
+                    metrics.set_build_info(
+                        version=version["hash"],
+                        parakeet_ref=version["parakeet_ref"],
+                        backend=engine_backend,
+                        model=self._model_spec.key,
+                        n_threads=n_threads,
+                        ggml_features=handle.ready.get("ggml_features", ""),
+                    )
+                    return handle
 
         start = time.monotonic()
         handle = await WorkerHandle.spawn(
@@ -281,6 +293,26 @@ class CallSession:
             ggml_features=handle.ready.get("ggml_features", ""),
         )
         return handle
+
+    async def _replace_failed_standby(self, exc: WorkerError) -> None:
+        """Fall back to a freshly spawned worker when a reused standby fails on
+        its very first request (LS-15)."""
+        assert self._worker is not None
+        failed = self._worker
+        rc = failed.proc.poll()
+        logger.warning(
+            "discarded standby worker for %s (pid=%s, exit_code=%s) after first request failed: %s; spawning fresh worker",
+            self._model_spec.key,
+            failed.proc.pid,
+            rc,
+            exc,
+        )
+        failed.kill()
+        try:
+            await failed.wait_closed()
+        except Exception:
+            pass
+        self._worker = await self._spawn_worker(allow_standby=False)
 
     async def feed_audio(self, pcm16le: bytes) -> list[asr_pb2.TranscriptionEvent]:
         assert self._worker is not None, "feed_audio called before start()"
@@ -306,10 +338,26 @@ class CallSession:
         try:
             doc = await self._worker.feed(chunk)
         except WorkerError as exc:
-            self._fed_samples += n_samples
-            metrics.asr_errors_total.labels(code="feed_failed").inc()
-            events.extend(await self._recover_from_crash(exc))
-            return events
+            if (
+                self._fed_samples == 0
+                and getattr(self._worker, "reused_standby", False)
+                and not isinstance(exc, WorkerOOMError)
+            ):
+                await self._replace_failed_standby(exc)
+                feed_start = time.monotonic()
+                try:
+                    doc = await self._worker.feed(chunk)
+                except WorkerError as retry_exc:
+                    self._fed_samples += n_samples
+                    metrics.asr_errors_total.labels(code="feed_failed").inc()
+                    events.extend(await self._recover_from_crash(retry_exc))
+                    return events
+            else:
+                self._fed_samples += n_samples
+                metrics.asr_errors_total.labels(code="feed_failed").inc()
+                events.extend(await self._recover_from_crash(exc))
+                return events
+        self._worker.reused_standby = False
         metrics.feed_duration_seconds.observe(time.monotonic() - feed_start)
 
         self._fed_samples += n_samples
@@ -584,9 +632,24 @@ class CallSession:
                 feed_start = time.monotonic()
                 try:
                     feed_doc = await self._worker.feed(chunk)
-                except WorkerError:
-                    metrics.asr_errors_total.labels(code="feed_failed").inc()
-                    raise
+                except WorkerError as exc:
+                    if (
+                        win_idx == 0
+                        and offset == 0
+                        and getattr(self._worker, "reused_standby", False)
+                        and not isinstance(exc, WorkerOOMError)
+                    ):
+                        await self._replace_failed_standby(exc)
+                        feed_start = time.monotonic()
+                        try:
+                            feed_doc = await self._worker.feed(chunk)
+                        except WorkerError:
+                            metrics.asr_errors_total.labels(code="feed_failed").inc()
+                            raise
+                    else:
+                        metrics.asr_errors_total.labels(code="feed_failed").inc()
+                        raise
+                self._worker.reused_standby = False
                 metrics.feed_duration_seconds.observe(time.monotonic() - feed_start)
                 self._last_rss_kb = feed_doc.get("rss_kb", self._last_rss_kb)
                 feed_text = feed_doc.get("text", "")
@@ -604,7 +667,19 @@ class CallSession:
                         )
                     )
 
-            doc = await self._worker.finalize()
+            try:
+                doc = await self._worker.finalize()
+            except WorkerError as exc:
+                if (
+                    win_idx == 0
+                    and getattr(self._worker, "reused_standby", False)
+                    and not isinstance(exc, WorkerOOMError)
+                ):
+                    await self._replace_failed_standby(exc)
+                    doc = await self._worker.finalize()
+                else:
+                    raise
+            self._worker.reused_standby = False
             self._last_finalize_doc = doc
             self._last_rss_kb = doc.get("rss_kb", self._last_rss_kb)
             final_text = doc.get("text", "")
@@ -676,7 +751,19 @@ class CallSession:
             # call that keeps going.
             await self._abandon_rotation()
 
-        doc = await self._worker.finalize()
+        try:
+            doc = await self._worker.finalize()
+        except WorkerError as exc:
+            if (
+                self._fed_samples == 0
+                and getattr(self._worker, "reused_standby", False)
+                and not isinstance(exc, WorkerOOMError)
+            ):
+                await self._replace_failed_standby(exc)
+                doc = await self._worker.finalize()
+            else:
+                raise
+        self._worker.reused_standby = False
         self._last_finalize_doc = doc
         text = doc.get("text", "")
         if self._model_spec.strip_language_tag:

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -52,14 +55,37 @@ def _make_key(model_key: str = "realtime_eou_120m-v1", language: str = "") -> St
     )
 
 
-def _spawn_fake_standby(model_key: str = "realtime_eou_120m-v1", language: str = "") -> StandbyWorker:
+def _spawn_fake_standby(
+    model_key: str = "realtime_eou_120m-v1",
+    language: str = "",
+    extra_env: tuple[tuple[str, str], ...] = (),
+) -> StandbyWorker:
     return spawn_standby_sync(
         worker_bin=FAKE_WORKER,
         gguf_path=f"/fake/{_model_filename(model_key)}",
         language=language,
         n_threads=1,
         model_key=model_key,
+        extra_env=extra_env,
     )
+
+
+def _is_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        status_path = Path(f"/proc/{pid}/status")
+        if status_path.exists():
+            for line in status_path.read_text().splitlines():
+                if line.startswith("State:") and "Z" in line:
+                    return False
+    except OSError:
+        return False
+    return True
 
 
 class TestSTTWorkerPoolCore:
@@ -114,19 +140,54 @@ class TestSTTWorkerPoolCore:
         finally:
             pool.close()
 
-    def test_crashed_worker_is_discarded_on_acquire(self) -> None:
+    def test_crashed_worker_is_discarded_on_acquire_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         pool = STTWorkerPool()
         try:
             worker = _spawn_fake_standby()
             key = worker.key
+            dead_pid = worker.proc.pid
             pool.put(worker, timeout_sec=600.0)
 
             # Simulate worker death while idling in pool
             worker.proc.kill()
             worker.proc.wait(timeout=2.0)
 
-            assert pool.acquire(key) is None
+            with caplog.at_level(logging.WARNING):
+                assert pool.acquire(key) is None
             assert pool.count() == 0
+            assert any(
+                "discarded standby" in rec.message
+                and f"pid={dead_pid}" in rec.message
+                and "exit_code=" in rec.message
+                for rec in caplog.records
+            )
+        finally:
+            pool.close()
+
+    def test_has_warm_discards_dead_standby_and_logs(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pool = STTWorkerPool()
+        try:
+            worker = _spawn_fake_standby()
+            key = worker.key
+            dead_pid = worker.proc.pid
+            pool.put(worker, timeout_sec=600.0)
+
+            worker.proc.kill()
+            worker.proc.wait(timeout=2.0)
+
+            with caplog.at_level(logging.WARNING):
+                assert pool.has_warm(key) is False
+            assert pool.count() == 0
+            assert any(
+                "discarded standby" in rec.message
+                and f"pid={dead_pid}" in rec.message
+                and "exit_code=" in rec.message
+                for rec in caplog.records
+            )
         finally:
             pool.close()
 
@@ -175,29 +236,89 @@ class TestSTTWorkerPoolCore:
         finally:
             pool.close()
 
-    def test_acquire_waits_for_inflight_background_spawn_instead_of_duplicating(self) -> None:
+    @pytest.mark.asyncio
+    async def test_maintain_warm_async_survives_after_spawn_completes_and_runs_feed_finalize(
+        self,
+    ) -> None:
+        """LS-15 regression: a worker pre-warmed via maintain_warm_async must not
+        be SIGKILLed by PR_SET_PDEATHSIG after the background spawn task finishes."""
         pool = STTWorkerPool()
-        os.environ["FAKE_LOAD_DELAY_SEC"] = "0.15"
+        os.environ["FAKE_WORDS_PER_SEC"] = "10"
         try:
             key = _make_key("parakeet-tdt-0.6b-v3")
             pool.maintain_warm_async(key=key, timeout_sec=600.0)
-            # Wait briefly so background thread registers _spawning_keys
+            for _ in range(100):
+                if pool.count() == 1:
+                    break
+                await asyncio.sleep(0.02)
+            assert pool.count() == 1
+
+            # Wait past when a short-lived spawner thread would have exited and
+            # triggered the kernel's PR_SET_PDEATHSIG(SIGKILL).
+            await asyncio.sleep(0.1)
+            assert pool._spawner_thread.is_alive()
+
+            acquired = pool.acquire(key, wait_inflight=False)
+            assert acquired is not None
+            assert acquired.proc.poll() is None
+
+            handle = await WorkerHandle.from_standby(acquired)
+            try:
+                feed_doc = await handle.feed(b"\x00\x00" * 1600)
+                assert feed_doc["fed_samples"] == 1600
+                final_doc = await handle.finalize()
+                assert final_doc["fed_samples"] == 1600
+                assert acquired.proc.poll() is None
+            finally:
+                handle.kill()
+                await handle.wait_closed()
+        finally:
+            os.environ.pop("FAKE_WORDS_PER_SEC", None)
+            pool.close()
+
+    @pytest.mark.asyncio
+    async def test_acquire_waits_for_inflight_background_spawn_and_runs_feed_finalize(
+        self,
+    ) -> None:
+        """LS-15 wait-for-in-flight regression: claiming an in-flight standby via
+        acquire(wait_inflight=True) must yield a worker that stays alive and
+        completes feed() + finalize() without ConnectionResetError."""
+        pool = STTWorkerPool()
+        os.environ["FAKE_LOAD_DELAY_SEC"] = "0.15"
+        os.environ["FAKE_WORDS_PER_SEC"] = "10"
+        try:
+            key = _make_key("parakeet-tdt-0.6b-v3")
+            pool.maintain_warm_async(key=key, timeout_sec=600.0)
             for _ in range(20):
                 if pool.has_warm(key):
                     break
-                time.sleep(0.01)
+                await asyncio.sleep(0.01)
             assert pool.has_warm(key) is True
 
-            # Acquire with wait_timeout_sec should receive the worker once it finishes loading
-            acquired = pool.acquire(key, wait_timeout_sec=3.0)
+            acquired = await asyncio.to_thread(
+                pool.acquire, key, wait_inflight=True, wait_timeout_sec=3.0
+            )
             assert acquired is not None
+            assert pool.count() == 0
+
+            # Give the kernel time to deliver PDEATHSIG if the spawner thread had exited
+            await asyncio.sleep(0.1)
+            assert acquired.proc.poll() is None
+
+            handle = await WorkerHandle.from_standby(acquired)
             try:
                 assert acquired.key == key
-                assert pool.count() == 0
+                feed_doc = await handle.feed(b"\x00\x00" * 1600)
+                assert feed_doc["fed_samples"] == 1600
+                final_doc = await handle.finalize()
+                assert final_doc["fed_samples"] == 1600
+                assert acquired.proc.poll() is None
             finally:
-                acquired.kill()
+                handle.kill()
+                await handle.wait_closed()
         finally:
             os.environ.pop("FAKE_LOAD_DELAY_SEC", None)
+            os.environ.pop("FAKE_WORDS_PER_SEC", None)
             pool.close()
 
     def test_maintain_warm_async_skips_gpu_prewarm_when_vram_budget_is_tight(
@@ -246,11 +367,68 @@ class TestSTTWorkerPoolCore:
         finally:
             pool.close()
 
+    def test_pdeathsig_kills_standby_worker_when_server_process_dies(self) -> None:
+        """LS-15: PR_SET_PDEATHSIG remains active on standby workers spawned by
+        STTWorkerPool so that if the parent server process dies abruptly (SIGKILL),
+        its standby workers are automatically SIGKILLed by the kernel."""
+        repo_root = Path(__file__).resolve().parent.parent
+        script = (
+            "import sys, time; "
+            f"sys.path.insert(0, {str(repo_root)!r}); "
+            "from pathlib import Path; "
+            "from live_stt.worker import StandbyKey; "
+            "from live_stt.worker_pool import STTWorkerPool; "
+            f"key = StandbyKey(worker_bin={str(FAKE_WORKER)!r}, gguf_path='/fake/m.gguf', "
+            "language='', n_threads=1, model_key='realtime_eou_120m-v1'); "
+            "pool = STTWorkerPool(); "
+            "pool.maintain_warm_async(key=key, timeout_sec=600.0); "
+            "w = pool.acquire(key, wait_inflight=True, wait_timeout_sec=5.0); "
+            "assert w is not None and w.proc.poll() is None; "
+            "print(w.proc.pid, flush=True); "
+            "time.sleep(30)"
+        )
+        parent = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        worker_pid: int | None = None
+        try:
+            assert parent.stdout is not None
+            line = parent.stdout.readline().strip()
+            assert line, f"child server failed to report worker pid: {parent.stderr.read() if parent.stderr else ''}"
+            worker_pid = int(line)
+
+            # While parent server is alive, the standby worker must remain alive
+            time.sleep(0.1)
+            assert _is_pid_alive(worker_pid) is True
+
+            # Abruptly SIGKILL the parent server process (no atexit or Python cleanup runs)
+            parent.kill()
+            parent.wait(timeout=5.0)
+
+            # Kernel PDEATHSIG must kill the standby worker
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and _is_pid_alive(worker_pid):
+                time.sleep(0.02)
+            assert _is_pid_alive(worker_pid) is False
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.wait(timeout=2.0)
+            if worker_pid is not None and _is_pid_alive(worker_pid):
+                try:
+                    os.kill(worker_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
 
 class TestCallSessionWorkerPoolIntegration:
     @pytest.mark.asyncio
-    async def test_session_acquires_prewarmed_worker(self) -> None:
+    async def test_session_acquires_prewarmed_worker_and_reuses_replenished_standby(self) -> None:
         pool = STTWorkerPool()
+        os.environ["FAKE_WORDS_PER_SEC"] = "20"
         try:
             settings = Settings(
                 _env_file=None,
@@ -276,9 +454,9 @@ class TestCallSessionWorkerPoolIntegration:
             assert session._worker.proc is standby.proc
 
             # Run feed + finalize
-            feed_events = await session.feed_audio(b"\x00\x00" * 1600)
+            feed_events = await session.feed_audio(b"\x00\x00" * 2560)
             final_events = await session.finalize()
-            assert len(feed_events) >= 0
+            assert len(feed_events) == 1
             assert len(final_events) == 1
 
             proc = session._worker.proc
@@ -292,7 +470,168 @@ class TestCallSessionWorkerPoolIntegration:
                     break
                 await asyncio.sleep(0.05)
             assert pool.count() == 1
+            await asyncio.sleep(0.1)
+            replenished_pid = pool.snapshot()[0]["pid"]
+
+            # Second session must successfully reuse the replenished standby worker
+            session2 = CallSession(settings, spec, config, budget, worker_pool=pool)
+            await session2.start()
+            assert session2._worker is not None
+            assert session2._worker.proc.pid == replenished_pid
+            await session2.feed_audio(b"\x00\x00" * 2560)
+            final_events2 = await session2.finalize()
+            assert len(final_events2) == 1
+            await session2.close()
         finally:
+            os.environ.pop("FAKE_WORDS_PER_SEC", None)
+            pool.close()
+
+    @pytest.mark.asyncio
+    async def test_dead_standby_in_pool_falls_back_to_fresh_worker_and_logs(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """LS-15 fallback (pool check): a standby that died while idle in the pool
+        is logged as discarded and CallSession transparently spawns a fresh worker."""
+        pool = STTWorkerPool()
+        os.environ["FAKE_WORDS_PER_SEC"] = "20"
+        try:
+            settings = Settings(
+                _env_file=None,
+                worker_bin=str(FAKE_WORKER),
+                models_dir="/fake",
+                stt_idle_timeout_sec=600.0,
+            )
+            spec = resolve("realtime_eou_120m-v1")
+            config = asr_pb2.StreamConfig(encoding=asr_pb2.AUDIO_ENCODING_LINEAR16, sample_rate_hz=16000)
+            budget = WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots)
+            budget.try_admit_call()
+
+            standby = _spawn_fake_standby(spec.key)
+            dead_pid = standby.proc.pid
+            pool.put(standby, timeout_sec=600.0)
+            standby.proc.kill()
+            standby.proc.wait(timeout=2.0)
+
+            session = CallSession(settings, spec, config, budget, worker_pool=pool)
+            with caplog.at_level(logging.WARNING):
+                await session.start()
+                await session.feed_audio(b"\x00\x00" * 2560)
+                final_events = await session.finalize()
+            assert len(final_events) == 1
+            assert session._worker is not None
+            assert session._worker.proc.pid != dead_pid
+            assert any(
+                "discarded standby" in rec.message and f"pid={dead_pid}" in rec.message
+                for rec in caplog.records
+            )
+            await session.close()
+        finally:
+            os.environ.pop("FAKE_WORDS_PER_SEC", None)
+            pool.close()
+
+    @pytest.mark.asyncio
+    async def test_standby_dying_after_acquire_before_attach_falls_back_to_fresh_worker(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """LS-15 fallback (attach/PING check): if a standby dies in the window
+        between acquire() and WorkerHandle.from_standby(), CallSession logs the
+        discarded standby, kills it, and spawns a fresh worker."""
+        pool = STTWorkerPool()
+        os.environ["FAKE_BATCH_WORDS_PER_SEC"] = "10"
+        try:
+            settings = Settings(
+                _env_file=None,
+                worker_bin_parakeet_tdt=str(FAKE_WORKER),
+                models_dir="/fake",
+                n_threads_parakeet_tdt=1,
+                stt_idle_timeout_sec=600.0,
+            )
+            spec = resolve("parakeet-tdt-0.6b-v3")
+            config = asr_pb2.StreamConfig(encoding=asr_pb2.AUDIO_ENCODING_LINEAR16, sample_rate_hz=16000)
+            budget = WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots)
+            budget.try_admit_call()
+
+            session = CallSession(settings, spec, config, budget, worker_pool=pool)
+            standby = _spawn_fake_standby(spec.key, extra_env=session._extra_env())
+            dead_pid = standby.proc.pid
+            pool.put(standby, timeout_sec=600.0)
+
+            orig_acquire = pool.acquire
+
+            def _acquire_then_kill(*args, **kwargs):
+                w = orig_acquire(*args, **kwargs)
+                if w is not None:
+                    w.proc.kill()
+                    w.proc.wait(timeout=2.0)
+                return w
+
+            monkeypatch.setattr(pool, "acquire", _acquire_then_kill)
+
+            with caplog.at_level(logging.WARNING):
+                await session.start()
+                await session.feed_audio(b"\x00\x00" * 3200)
+                final_events = await session.finalize()
+            assert len(final_events) == 1
+            assert final_events[0].final.text
+            assert session._worker is not None
+            assert session._worker.proc.pid != dead_pid
+            assert any(
+                "discarded standby" in rec.message and f"pid={dead_pid}" in rec.message
+                for rec in caplog.records
+            )
+            await session.close()
+        finally:
+            os.environ.pop("FAKE_BATCH_WORDS_PER_SEC", None)
+            pool.close()
+
+    @pytest.mark.asyncio
+    async def test_standby_dying_after_start_before_first_feed_falls_back_to_fresh_worker(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """LS-15 fallback (first-request check): if a reused standby passes
+        start() / PING and then dies before its first feed() in _finalize_batch,
+        CallSession replaces it with a fresh worker instead of failing."""
+        pool = STTWorkerPool()
+        os.environ["FAKE_BATCH_WORDS_PER_SEC"] = "10"
+        try:
+            settings = Settings(
+                _env_file=None,
+                worker_bin_parakeet_tdt=str(FAKE_WORKER),
+                models_dir="/fake",
+                n_threads_parakeet_tdt=1,
+                stt_idle_timeout_sec=600.0,
+            )
+            spec = resolve("parakeet-tdt-0.6b-v3")
+            config = asr_pb2.StreamConfig(encoding=asr_pb2.AUDIO_ENCODING_LINEAR16, sample_rate_hz=16000)
+            budget = WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots)
+            budget.try_admit_call()
+
+            session = CallSession(settings, spec, config, budget, worker_pool=pool)
+            standby = _spawn_fake_standby(spec.key, extra_env=session._extra_env())
+            dead_pid = standby.proc.pid
+            pool.put(standby, timeout_sec=600.0)
+
+            await session.start()
+            assert session._worker is not None
+            assert session._worker.proc.pid == dead_pid
+
+            # Kill the worker after start() succeeded, before finalize() feeds the first chunk
+            session._worker.proc.kill()
+            session._worker.proc.wait(timeout=2.0)
+
+            await session.feed_audio(b"\x00\x00" * 3200)
+            with caplog.at_level(logging.WARNING):
+                final_events = await session.finalize()
+            assert len(final_events) == 1
+            assert final_events[0].final.text
+            assert session._worker.proc.pid != dead_pid
+            assert any(
+                "discarded standby" in rec.message and f"pid={dead_pid}" in rec.message
+                for rec in caplog.records
+            )
+            await session.close()
+        finally:
+            os.environ.pop("FAKE_BATCH_WORDS_PER_SEC", None)
             pool.close()
 
     @pytest.mark.asyncio
@@ -325,7 +664,9 @@ class TestCallSessionWorkerPoolIntegration:
 
 class TestTranscribeHttpWorkerPoolIntegration:
     @pytest.mark.asyncio
-    async def test_transcribe_http_uses_and_replenishes_worker_pool(self) -> None:
+    async def test_transcribe_http_uses_and_replenishes_worker_pool_across_consecutive_requests(
+        self,
+    ) -> None:
         import io
         import json
         import wave
@@ -344,30 +685,28 @@ class TestTranscribeHttpWorkerPoolIntegration:
         boundary = "----pool-test"
         body = (
             f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="model"\r\n\r\n'
+            "parakeet-tdt-0.6b-v3\r\n"
+            f"--{boundary}\r\n"
             'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
             "Content-Type: audio/wav\r\n\r\n"
         ).encode() + _wav_bytes() + f"\r\n--{boundary}--\r\n".encode()
 
         pool = STTWorkerPool()
-        os.environ["FAKE_WORDS_PER_SEC"] = "50"
+        os.environ["FAKE_BATCH_WORDS_PER_SEC"] = "50"
         try:
             settings = Settings(
                 _env_file=None,
                 worker_bin=str(FAKE_WORKER),
+                worker_bin_parakeet_tdt=str(FAKE_WORKER),
                 models_dir="/fake",
                 stt_idle_timeout_sec=600.0,
             )
             budget = WorkerBudget(3, 1)
             tracker = TranscribeSessionTracker()
 
-            # Pre-warm worker into pool
-            spec = resolve(settings.default_model)
-            standby = _spawn_fake_standby(spec.key)
-            pool.put(standby, timeout_sec=600.0)
-            assert pool.count() == 1
-            original_proc = standby.proc
-
-            status, resp, _ = await transcribe_http.handle_transcribe_request(
+            # Request 1 starts cold (no standby in pool yet) and triggers background pre-warm on close
+            status1, resp1, _ = await transcribe_http.handle_transcribe_request(
                 content_type=f"multipart/form-data; boundary={boundary}",
                 body=body,
                 settings=settings,
@@ -377,25 +716,44 @@ class TestTranscribeHttpWorkerPoolIntegration:
                 worker_pool=pool,
             )
 
-            assert status == 200
-            doc = json.loads(resp)
-            assert doc["text"]
-            # The original worker ran and then terminated on session close
-            original_proc.wait(timeout=2.0)
-            assert original_proc.returncode is not None
+            assert status1 == 200
+            doc1 = json.loads(resp1)
+            assert doc1["text"]
 
-            # Pool was replenished in background with a fresh warm worker
+            # Pool is replenished in background with a warm standby worker
             for _ in range(50):
                 if pool.count() == 1:
                     break
                 await asyncio.sleep(0.05)
             assert pool.count() == 1
+            await asyncio.sleep(0.1)
+            snap = pool.snapshot()[0]
+            assert snap["model"] == "parakeet-tdt-0.6b-v3"
+            warm_pid = snap["pid"]
 
-            # A subsequent request can acquire the new standby worker
-            key = pool.snapshot()[0]
-            assert key["model"] == spec.key
+            # Request 2 reuses the background-spawned standby worker and must succeed (LS-15)
+            status2, resp2, _ = await transcribe_http.handle_transcribe_request(
+                content_type=f"multipart/form-data; boundary={boundary}",
+                body=body,
+                settings=settings,
+                budget=budget,
+                draining=False,
+                tracker=tracker,
+                worker_pool=pool,
+            )
+            assert status2 == 200
+            doc2 = json.loads(resp2)
+            assert doc2["text"] == doc1["text"]
+
+            # The warm worker from Request 1's replenishment was used and then killed on close
+            for _ in range(50):
+                if not _is_pid_alive(warm_pid):
+                    break
+                await asyncio.sleep(0.02)
+            assert _is_pid_alive(warm_pid) is False
         finally:
-            os.environ.pop("FAKE_WORDS_PER_SEC", None)
+            os.environ.pop("FAKE_BATCH_WORDS_PER_SEC", None)
             pool.close()
+
 
 

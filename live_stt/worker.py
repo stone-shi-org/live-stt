@@ -371,11 +371,18 @@ class WorkerHandle:
         self._reader = reader
         self._writer = writer
         self.ready: dict[str, Any] = {}
+        self.reused_standby: bool = False
         self.stderr_tail: deque[str] = stderr_tail if stderr_tail is not None else deque(maxlen=64)
         self._stderr_thread = stderr_thread
 
     @classmethod
     async def from_standby(cls, standby: StandbyWorker) -> "WorkerHandle":
+        rc = standby.proc.poll()
+        if rc is not None:
+            standby.kill()
+            raise WorkerError(
+                f"standby worker already exited before attach (pid={standby.proc.pid}, exit_code={rc})"
+            )
         standby.sock.setblocking(False)
         reader, writer = await asyncio.open_connection(sock=standby.sock)
         handle = cls(
@@ -386,6 +393,12 @@ class WorkerHandle:
             stderr_thread=standby.stderr_thread,
         )
         handle.ready = standby.ready
+        handle.reused_standby = True
+        try:
+            await handle.ping()
+        except Exception:
+            handle.kill()
+            raise
         return handle
 
     @classmethod
@@ -505,6 +518,9 @@ class WorkerHandle:
             )
         handle.ready = doc
         return handle
+
+    async def ping(self) -> dict[str, Any]:
+        return await self._request(FrameType.PING, b"")
 
     async def feed(self, pcm16le: bytes) -> dict[str, Any]:
         return await self._request(FrameType.AUDIO, pcm16le)
