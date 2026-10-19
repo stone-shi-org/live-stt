@@ -90,6 +90,19 @@ class ModelSpec:
     # 1828 MB plateau over a long call, far above its 20s figure. None => fall
     # back to Settings.vram_per_worker_mb.
     vram_mb: int | None = None
+    # LS-14: Windowed batch inference for streaming_capable=False engines
+    # (parakeet_tdt, whisper). Audio longer than batch_window_sec is sliced
+    # into overlapping windows of batch_window_sec with batch_overlap_sec
+    # overlap at finalize(), bounding the CUDA compute graph to one window
+    # instead of the full recording length. 0.0 => disabled (streaming models).
+    batch_window_sec: float = 0.0
+    batch_overlap_sec: float = 0.0
+    # Per-second CUDA compute buffer growth rate (MiB/s of window audio) for
+    # batch engines whose ggml_gallocr graph scales with window length
+    # (parakeet-tdt: 3103.92 MiB / 460.9 s = 6.73 MiB/s on Quadro P1000 -> 7.0
+    # MiB/s). Included by live_stt/vram.py alongside vram_mb so admission and
+    # standby pre-warming account for the active window's compute buffer.
+    vram_compute_mb_per_sec: float = 0.0
 
 
 MODELS: dict[str, ModelSpec] = {
@@ -126,6 +139,9 @@ MODELS: dict[str, ModelSpec] = {
         assumed_leak_mb_per_audio_sec=0.0,
         engine="parakeet_tdt",
         streaming_capable=False,
+        batch_window_sec=90.0,
+        batch_overlap_sec=5.0,
+        vram_compute_mb_per_sec=7.0,
     ),
     # --- whisper.cpp family (batch-only, see this module's docstring) -----
     # Files/checksums verified live against the real ggerganov/whisper.cpp
@@ -144,6 +160,8 @@ MODELS: dict[str, ModelSpec] = {
         assumed_leak_mb_per_audio_sec=0.0,
         engine="whisper",
         streaming_capable=False,
+        batch_window_sec=120.0,
+        batch_overlap_sec=5.0,
     ),
     "whisper-small-q8_0": ModelSpec(
         key="whisper-small-q8_0",
@@ -156,6 +174,8 @@ MODELS: dict[str, ModelSpec] = {
         assumed_leak_mb_per_audio_sec=0.0,
         engine="whisper",
         streaming_capable=False,
+        batch_window_sec=120.0,
+        batch_overlap_sec=5.0,
     ),
     "whisper-medium-q8_0": ModelSpec(
         key="whisper-medium-q8_0",
@@ -168,6 +188,8 @@ MODELS: dict[str, ModelSpec] = {
         assumed_leak_mb_per_audio_sec=0.0,
         engine="whisper",
         streaming_capable=False,
+        batch_window_sec=120.0,
+        batch_overlap_sec=5.0,
     ),
     "whisper-large-v3-q5_0": ModelSpec(
         key="whisper-large-v3-q5_0",
@@ -180,6 +202,8 @@ MODELS: dict[str, ModelSpec] = {
         assumed_leak_mb_per_audio_sec=0.0,
         engine="whisper",
         streaming_capable=False,
+        batch_window_sec=120.0,
+        batch_overlap_sec=5.0,
     ),
     "whisper-large-v3-turbo-q8_0": ModelSpec(
         key="whisper-large-v3-turbo-q8_0",
@@ -192,6 +216,8 @@ MODELS: dict[str, ModelSpec] = {
         assumed_leak_mb_per_audio_sec=0.0,
         engine="whisper",
         streaming_capable=False,
+        batch_window_sec=120.0,
+        batch_overlap_sec=5.0,
     ),
 }
 

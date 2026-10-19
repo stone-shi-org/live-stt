@@ -489,3 +489,51 @@ class TestRealCallSessionIntegration:
         assert status == 200
         doc = json.loads(resp)
         assert doc["text"]
+
+    @pytest.mark.asyncio
+    async def test_audio_exceeding_max_call_sec_returns_413_without_spawning_worker(self):
+        # 2 seconds of 16kHz audio = 32000 frames; max_call_sec=1.0 -> HTTP 413
+        body = _multipart_body(
+            {"model": "parakeet-tdt-0.6b-v3"},
+            file_field="file",
+            file_bytes=_wav_bytes(n_frames=32000),
+        )
+        status, resp, ct = await transcribe_http.handle_transcribe_request(
+            content_type=CONTENT_TYPE,
+            body=body,
+            settings=_settings(max_call_sec=1.0, worker_bin_parakeet_tdt="/nonexistent/bin"),
+            budget=_budget(),
+            draining=False,
+            tracker=_tracker(),
+        )
+        assert status == 413
+        msg = json.loads(resp)["error"]["message"]
+        assert "audio too long for model parakeet-tdt-0.6b-v3" in msg
+        assert "2.0s > 1s limit" in msg
+
+    @pytest.mark.asyncio
+    async def test_worker_cuda_oom_returns_507_with_clear_oom_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("FAKE_CUDA_OOM_MIB", "3103.92")
+        tracker = _tracker()
+        body = _multipart_body(
+            {"model": "parakeet-tdt-0.6b-v3"},
+            file_field="file",
+            file_bytes=_wav_bytes(n_frames=16000),
+        )
+        status, resp, ct = await transcribe_http.handle_transcribe_request(
+            content_type=CONTENT_TYPE,
+            body=body,
+            settings=_settings(worker_bin_parakeet_tdt=str(FAKE_WORKER), stt_idle_timeout_sec=0),
+            budget=_budget(),
+            draining=False,
+            tracker=tracker,
+        )
+        assert status == 507
+        err = json.loads(resp)["error"]
+        assert "CUDA OOM" in err["message"]
+        assert "3103.92 MiB" in err["message"]
+        assert tracker.failed_total == 1
+        assert tracker.active == 0
+

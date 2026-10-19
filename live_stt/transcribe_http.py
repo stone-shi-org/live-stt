@@ -70,7 +70,7 @@ from live_stt.multipart import MultipartError, parse_multipart_form
 from live_stt.pb.livestt.v1 import asr_pb2
 from live_stt.session import CallSession
 from live_stt.transcribe_sessions import TranscribeSessionTracker
-from live_stt.worker import WorkerError
+from live_stt.worker import WorkerError, WorkerOOMError
 from live_stt.worker_pool import STTWorkerPool
 
 logger = get_logger("transcribe_http")
@@ -90,6 +90,10 @@ class TranscribeUnavailableError(TranscribeError):
     """The engine could not be started/used for this request at all --
     spawn failure. Maps to 503, not 500: the request itself was fine, the
     service just couldn't serve it right now."""
+
+
+class TranscribeMemoryError(TranscribeError):
+    """The engine ran out of GPU/host memory during transcription. Maps to 507."""
 
 
 def _pcm16_mono_16k_from_wav(wav_bytes: bytes) -> bytes:
@@ -146,6 +150,8 @@ async def _run_transcription(
     session = CallSession(settings, spec, config, budget, worker_pool=worker_pool)
     try:
         await session.start()
+    except WorkerOOMError as exc:
+        raise TranscribeMemoryError(f"{exc} while starting model {spec.key}") from exc
     except WorkerError as exc:
         raise TranscribeUnavailableError(f"engine failed to start: {exc}") from exc
 
@@ -162,6 +168,8 @@ async def _run_transcription(
             result = _accumulate(event, text_parts, words)
             if result:
                 total_audio_sec, worker_generations = result
+    except WorkerOOMError as exc:
+        raise TranscribeMemoryError(f"{exc} while transcribing with model {spec.key}") from exc
     except WorkerError as exc:
         raise TranscribeError(f"engine error during transcription: {exc}") from exc
     finally:
@@ -219,6 +227,16 @@ async def handle_transcribe_request(
             "application/json",
         )
 
+    audio_sec = (len(pcm) // 2) / 16000.0
+    if settings.max_call_sec > 0 and audio_sec > settings.max_call_sec:
+        return (
+            413,
+            _err(
+                f"audio too long for model {spec.key} ({audio_sec:.1f}s > {settings.max_call_sec:g}s limit)"
+            ),
+            "application/json",
+        )
+
     stream = fields.get("stream", b"false").decode("utf-8", "replace").strip().lower() == "true"
     language_field = fields.get("language")
     language = language_field.decode("utf-8", "replace") if language_field else None
@@ -245,20 +263,27 @@ async def handle_transcribe_request(
         "parakeet_tdt": settings.parakeet_tdt_backend,
     }.get(spec.engine, settings.parakeet_backend)
     if engine_backend == "cuda":
-        # Per-model requirement + reclaim of idle warm workers (live_stt/vram.py).
+        already_warm = bool(
+            worker_pool is not None
+            and settings.stt_idle_timeout_sec > 0
+            and worker_pool.has_warm(spec.key, use_gpu=True)
+        )
+        # Per-model requirement + window compute buffer + reclaim of idle warm workers (live_stt/vram.py).
         admission = await asyncio.to_thread(
             vram.admit,
             settings,
             model_key=spec.key,
             model_mb=spec.vram_mb,
             fallback_mb=settings.vram_per_worker_mb,
+            audio_sec=audio_sec,
+            already_warm=already_warm,
         )
         if admission.free_mb is not None:
             metrics.gpu_free_vram_mb.set(admission.free_mb)
         if not admission.ok:
             tracker.record_rejected_vram()
             metrics.transcribe_requests_total.labels(outcome="rejected_vram").inc()
-            return 503, _err(admission.message()), "application/json"
+            return 503, _err(admission.message(spec.key)), "application/json"
 
     if not budget.try_admit_call():
         tracker.record_rejected_capacity()
@@ -277,6 +302,12 @@ async def handle_transcribe_request(
         text, words, total_audio_sec, worker_generations = await _run_transcription(
             pcm, settings=settings, spec=spec, language=language, budget=budget, **run_kwargs
         )
+    except TranscribeMemoryError as exc:
+        tracker.finish(request_id, ok=False)
+        metrics.transcribe_sessions_active.dec()
+        metrics.transcribe_requests_total.labels(outcome="failed").inc()
+        logger.error("transcription failed with OOM: %s", exc)
+        return 507, _err(str(exc)), "application/json"
     except TranscribeUnavailableError as exc:
         tracker.finish(request_id, ok=False)
         metrics.transcribe_sessions_active.dec()

@@ -46,6 +46,9 @@ bool SessionParakeetTDT::finalize(std::string* json_out, std::string* error) {
     // decoder: 2 = TDT (transducer)
     char* json_res = parakeet_capi_transcribe_pcm_batch_json_lang(
         ctx_, buffer_.data(), &n_samples, 1, 16000, 2, lang);
+    // Clear the sample buffer so subsequent windows on the same worker session
+    // start fresh while reusing parakeet.cpp's persistent ggml_gallocr buffer.
+    buffer_.clear();
 
     if (!json_res) {
         std::string err = parakeet_capi_last_error(ctx_);

@@ -37,11 +37,13 @@ moment can both pass before either allocates.
 from __future__ import annotations
 
 import logging
+import math
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 
-from live_stt import gpu
+from live_stt import gpu, models
 
 logger = logging.getLogger("stt.vram")
 
@@ -52,6 +54,9 @@ RECLAIM_WAIT_SEC = 3.0
 RECLAIM_POLL_SEC = 0.2
 
 _total_mb_cache: int | None = None
+
+_active_compute_lock = threading.Lock()
+_active_compute_reservations: dict[str, int] = {}
 
 
 def _total_mb() -> int | None:
@@ -71,16 +76,125 @@ def reserve_mb(settings: Any, total_mb: int | None = None) -> int:
     return max(floor, int(total * float(settings.vram_reserve_pct) / 100.0))
 
 
-def need_mb(settings: Any, model_key: str, model_mb: int | None, fallback_mb: int) -> int:
-    """VRAM one instance of `model_key` needs, before the reserve."""
+def effective_batch_window_sec(settings: Any, model_key: str) -> float:
+    """Effective batch inference window size (seconds) for ``model_key``."""
+    override = getattr(settings, "batch_window_sec", None)
+    if override is not None:
+        return float(override)
+    spec = models.MODELS.get(model_key)
+    return float(spec.batch_window_sec) if spec is not None else 0.0
+
+
+def compute_mb(settings: Any, model_key: str, *, audio_sec: float | None = None) -> int:
+    """Per-window CUDA compute buffer allowance for ``model_key`` (MiB).
+
+    For batch engines whose compute graph scales with window duration
+    (``parakeet-tdt``: ~6.73 MiB/s -> 7.0 MiB/s), peak compute memory is
+    bounded by ``batch_window_sec`` (or ``audio_sec`` when shorter than one
+    window). When windowing is disabled (``window_sec == 0``), compute memory
+    scales with the full ``audio_sec``.
+    """
+    spec = models.MODELS.get(model_key)
+    if spec is None or spec.vram_compute_mb_per_sec <= 0:
+        return 0
+    window_sec = effective_batch_window_sec(settings, model_key)
+    if window_sec > 0:
+        span_sec = min(audio_sec, window_sec) if audio_sec is not None else window_sec
+    else:
+        span_sec = audio_sec if audio_sec is not None else 0.0
+    return math.ceil(max(0.0, span_sec) * spec.vram_compute_mb_per_sec)
+
+
+def weights_mb(settings: Any, model_key: str, model_mb: int | None, fallback_mb: int) -> int:
+    """Base model weights / fixed working VRAM for ``model_key``, before window compute."""
     override = (settings.vram_overrides or {}).get(model_key)
     if override is not None:
         return int(override)
     return int(model_mb) if model_mb else int(fallback_mb)
 
 
-def required_mb(settings: Any, model_key: str, model_mb: int | None, fallback_mb: int) -> int:
-    return need_mb(settings, model_key, model_mb, fallback_mb) + reserve_mb(settings)
+def need_mb(
+    settings: Any,
+    model_key: str,
+    model_mb: int | None,
+    fallback_mb: int,
+    *,
+    audio_sec: float | None = None,
+    include_weights: bool = True,
+) -> int:
+    """VRAM one instance of ``model_key`` needs (weights + per-window compute), before the reserve."""
+    override = (settings.vram_overrides or {}).get(model_key)
+    if override is not None:
+        return int(override) if include_weights else compute_mb(settings, model_key, audio_sec=audio_sec)
+    base = (int(model_mb) if model_mb else int(fallback_mb)) if include_weights else 0
+    return base + compute_mb(settings, model_key, audio_sec=audio_sec)
+
+
+def required_mb(
+    settings: Any,
+    model_key: str,
+    model_mb: int | None,
+    fallback_mb: int,
+    *,
+    audio_sec: float | None = None,
+    include_weights: bool = True,
+) -> int:
+    return (
+        need_mb(
+            settings,
+            model_key,
+            model_mb,
+            fallback_mb,
+            audio_sec=audio_sec,
+            include_weights=include_weights,
+        )
+        + reserve_mb(settings)
+    )
+
+
+def reserve_active_compute(token_id: str, mb: int) -> None:
+    """Register an active GPU session's pending compute buffer requirement (MiB)."""
+    if mb <= 0:
+        return
+    with _active_compute_lock:
+        _active_compute_reservations[token_id] = int(mb)
+
+
+def release_active_compute(token_id: str) -> None:
+    """Release an active GPU session's compute buffer reservation."""
+    with _active_compute_lock:
+        _active_compute_reservations.pop(token_id, None)
+
+
+def active_compute_mb(exclude_token_id: str | None = None) -> int:
+    """Total compute buffer VRAM (MiB) reserved by currently active GPU jobs."""
+    with _active_compute_lock:
+        if exclude_token_id is None:
+            return sum(_active_compute_reservations.values())
+        return sum(v for k, v in _active_compute_reservations.items() if k != exclude_token_id)
+
+
+def can_prewarm_standby(
+    settings: Any,
+    *,
+    model_key: str,
+    weights_already_allocated: bool = False,
+) -> bool:
+    """Return True if pre-warming (or keeping) a standby GPU worker for
+    ``model_key`` fits alongside active jobs' compute buffers and the card reserve.
+    """
+    free = gpu.free_vram_mb()
+    if free is None:
+        return True
+    spec = models.MODELS.get(model_key)
+    model_mb = spec.vram_mb if spec is not None else None
+    standby_weights = (
+        0
+        if weights_already_allocated
+        else weights_mb(settings, model_key, model_mb, settings.vram_per_worker_mb)
+    )
+    needed = standby_weights + active_compute_mb() + reserve_mb(settings)
+    return free >= needed
 
 
 @dataclass(frozen=True)
@@ -95,7 +209,7 @@ class Admission:
         return f"insufficient VRAM{suffix}: {self.free_mb}MB free, {self.required_mb}MB required"
 
 
-def reclaim_idle_workers() -> int:
+def reclaim_idle_workers(*, exclude_model_key: str | None = None) -> int:
     """Kill idle warm workers to give their VRAM back. Returns how many were
     stopped. Never touches a worker serving a request: standby STT workers are
     by definition unassigned, and the TTS worker is only stopped if idle (a
@@ -104,9 +218,46 @@ def reclaim_idle_workers() -> int:
     # imported by the request paths that those modules' callers also import.
     from live_stt import tts, worker_pool
 
-    stopped = worker_pool.evict_idle_workers(0.0)
+    stopped = worker_pool.evict_idle_workers(0.0, exclude_model_key=exclude_model_key)
     if tts.get_tts_worker_manager().stop_if_idle():
         stopped += 1
+    return stopped
+
+
+def ensure_compute_headroom(
+    settings: Any,
+    *,
+    model_key: str,
+    compute_needed_mb: int,
+) -> int:
+    """Ensure active GPU job's compute buffer takes priority over warm spares.
+    If free VRAM is below ``compute_needed_mb + reserve_mb(settings)``, evicts
+    idle warm workers and waits briefly for the driver to release their VRAM.
+    """
+    if compute_needed_mb <= 0:
+        return 0
+    free = gpu.free_vram_mb()
+    if free is None:
+        return 0
+    needed = compute_needed_mb + reserve_mb(settings)
+    if free >= needed:
+        return 0
+    stopped = reclaim_idle_workers()
+    if stopped <= 0:
+        return 0
+    logger.info(
+        "active job %s needs %dMB compute headroom (%dMB free): evicted %d idle warm worker(s)",
+        model_key,
+        needed,
+        free,
+        stopped,
+    )
+    deadline = time.monotonic() + RECLAIM_WAIT_SEC
+    while time.monotonic() < deadline:
+        free = gpu.free_vram_mb()
+        if free is None or free >= needed:
+            break
+        time.sleep(RECLAIM_POLL_SEC)
     return stopped
 
 
@@ -117,11 +268,23 @@ def admit(
     model_mb: int | None,
     fallback_mb: int,
     reclaim: bool = True,
+    audio_sec: float | None = None,
+    already_warm: bool = False,
 ) -> Admission:
     """Blocking (shells out to nvidia-smi and may poll for up to
     RECLAIM_WAIT_SEC). Call from an event loop via asyncio.to_thread."""
     free = gpu.free_vram_mb()
-    required = required_mb(settings, model_key, model_mb, fallback_mb)
+    required = (
+        required_mb(
+            settings,
+            model_key,
+            model_mb,
+            fallback_mb,
+            audio_sec=audio_sec,
+            include_weights=not already_warm,
+        )
+        + active_compute_mb()
+    )
     if free is None:
         return Admission(True, None, required)
     if free >= required:
@@ -129,7 +292,11 @@ def admit(
     if not reclaim:
         return Admission(False, free, required)
 
-    stopped = reclaim_idle_workers()
+    stopped = (
+        reclaim_idle_workers(exclude_model_key=model_key)
+        if already_warm
+        else reclaim_idle_workers()
+    )
     if stopped == 0:
         return Admission(False, free, required)
     logger.info(
@@ -147,3 +314,4 @@ def admit(
         if time.monotonic() >= deadline:
             return Admission(False, free, required, stopped)
         time.sleep(RECLAIM_POLL_SEC)
+

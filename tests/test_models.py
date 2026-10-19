@@ -111,3 +111,19 @@ def test_strip_language_tag_removes_locale_marker() -> None:
 
 def test_strip_language_tag_is_noop_without_a_tag() -> None:
     assert strip_language_tag("hello world") == "hello world"
+
+
+def test_batch_models_configure_windowed_inference_and_tdt_compute_vram() -> None:
+    tdt = resolve("parakeet-tdt-0.6b-v3")
+    assert tdt.batch_window_sec == 90.0
+    assert tdt.batch_overlap_sec == 5.0
+    assert tdt.vram_compute_mb_per_sec == 7.0
+
+    for key, spec in MODELS.items():
+        if spec.engine == "whisper":
+            assert spec.batch_window_sec == 120.0, key
+            assert spec.batch_overlap_sec == 5.0, key
+        elif spec.streaming_capable:
+            assert spec.batch_window_sec == 0.0, key
+            assert spec.vram_compute_mb_per_sec == 0.0, key
+

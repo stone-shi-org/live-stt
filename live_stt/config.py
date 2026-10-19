@@ -156,6 +156,11 @@ class Settings(BaseSettings):
     # clips under ~20s fit inside the window, so their output is unchanged.
     # 0 = leave it to parakeet.cpp's auto threshold.
     parakeet_tdt_att_context: int = 128
+    # LS-14: Optional overrides for windowed batch inference on batch-only
+    # models (parakeet_tdt, whisper). None => use ModelSpec.batch_window_sec /
+    # ModelSpec.batch_overlap_sec (90s/5s for TDT, 120s/5s for whisper).
+    batch_window_sec: float | None = None
+    batch_overlap_sec: float | None = None
     max_concurrent_calls: int = 3
     # Admission always reserves this many slots so a mid-call rotation has
     # somewhere to put its overlap shadow. Never hand the reserve to a call.
@@ -357,6 +362,17 @@ class Settings(BaseSettings):
             raise ValueError("tts_idle_timeout_sec must be non-negative")
         if self.stt_idle_timeout_sec < 0:
             raise ValueError("stt_idle_timeout_sec must be non-negative")
+        if self.batch_window_sec is not None and self.batch_window_sec < 0:
+            raise ValueError("batch_window_sec must be non-negative")
+        if self.batch_overlap_sec is not None and self.batch_overlap_sec < 0:
+            raise ValueError("batch_overlap_sec must be non-negative")
+        if (
+            self.batch_window_sec is not None
+            and self.batch_window_sec > 0
+            and self.batch_overlap_sec is not None
+            and self.batch_overlap_sec >= self.batch_window_sec
+        ):
+            raise ValueError("batch_overlap_sec must be strictly less than batch_window_sec")
         if self.default_model not in MODELS:
             raise ValueError(
                 f"unknown default_model {self.default_model!r}; available streaming models: "

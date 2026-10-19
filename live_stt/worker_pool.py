@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from live_stt import vram
 from live_stt.config import Settings
 from live_stt.logging_config import get_logger
 from live_stt.models import ModelSpec
@@ -42,6 +43,8 @@ class STTWorkerPool:
         self._lock = threading.Lock()
         self._workers: dict[StandbyKey, StandbyWorker] = {}
         self._spawning_keys: set[StandbyKey] = set()
+        self._spawning_events: dict[StandbyKey, threading.Event] = {}
+        self._spawning_waiters: dict[StandbyKey, int] = {}
         self._reaper_timer: threading.Timer | None = None
         self._closed: bool = False
         self._epoch: int = 0
@@ -51,8 +54,41 @@ class STTWorkerPool:
         with self._lock:
             return self._closed
 
-    def acquire(self, key: StandbyKey) -> StandbyWorker | None:
-        """Acquires and returns a warm standby worker matching `key`, or None if absent."""
+    def has_warm(self, model_key: str | StandbyKey, *, use_gpu: bool | None = None) -> bool:
+        """Return True if a live standby worker (or in-flight warm spawn) for ``model_key`` is in the pool."""
+        target_model = model_key.model_key if isinstance(model_key, StandbyKey) else model_key
+        with self._lock:
+            if self._closed:
+                return False
+            for key, worker in list(self._workers.items()):
+                if key.model_key != target_model:
+                    continue
+                if use_gpu is not None and key.use_gpu != use_gpu:
+                    continue
+                if worker.proc.poll() is not None:
+                    self._workers.pop(key, None)
+                    worker.kill()
+                    continue
+                return True
+            for key in self._spawning_keys:
+                if key.model_key == target_model and (use_gpu is None or key.use_gpu == use_gpu):
+                    return True
+            return False
+
+    def acquire(
+        self,
+        key: StandbyKey,
+        *,
+        wait_inflight: bool = True,
+        wait_timeout_sec: float = 30.0,
+    ) -> StandbyWorker | None:
+        """Acquires and returns a warm standby worker matching `key`, or None if absent.
+
+        When a background warm spawn for `key` is already in flight (`key in _spawning_keys`),
+        waits for that spawn to complete and claims it directly instead of returning None
+        and causing the caller to spawn a duplicate worker in parallel (LS-14).
+        """
+        inflight_event: threading.Event | None = None
         with self._lock:
             if self._closed:
                 return None
@@ -69,7 +105,40 @@ class STTWorkerPool:
                     time.monotonic() - worker.idle_since,
                 )
                 return worker
-            return None
+            if wait_inflight and key in self._spawning_events:
+                inflight_event = self._spawning_events[key]
+                self._spawning_waiters[key] = self._spawning_waiters.get(key, 0) + 1
+
+        if inflight_event is not None:
+            logger.info(
+                "waiting for in-flight standby worker spawn for %s",
+                key.model_key or key.gguf_path,
+            )
+            try:
+                inflight_event.wait(timeout=wait_timeout_sec)
+            finally:
+                with self._lock:
+                    rem = self._spawning_waiters.get(key, 1) - 1
+                    if rem <= 0:
+                        self._spawning_waiters.pop(key, None)
+                    else:
+                        self._spawning_waiters[key] = rem
+
+            with self._lock:
+                if self._closed:
+                    return None
+                worker = self._workers.pop(key, None)
+                if worker is not None:
+                    if worker.proc.poll() is not None:
+                        worker.kill()
+                        return None
+                    logger.info(
+                        "reusing newly warmed standby worker for %s (pid=%s)",
+                        key.model_key or key.gguf_path,
+                        worker.proc.pid,
+                    )
+                    return worker
+        return None
 
     def put(self, worker: StandbyWorker, timeout_sec: float) -> bool:
         """Registers a newly warmed standby worker into the pool and schedules the idle reaper."""
@@ -89,6 +158,7 @@ class STTWorkerPool:
         *,
         key: StandbyKey,
         timeout_sec: float,
+        settings: Settings | None = None,
     ) -> None:
         """Schedules background pre-warming of a standby worker if none exists for this key."""
         if timeout_sec <= 0:
@@ -105,9 +175,31 @@ class STTWorkerPool:
             if key in self._spawning_keys:
                 return
             self._spawning_keys.add(key)
+            done_event = threading.Event()
+            self._spawning_events[key] = done_event
             spawn_epoch = self._epoch
 
+        def _finish_inflight() -> None:
+            with self._lock:
+                if self._epoch == spawn_epoch:
+                    self._spawning_keys.discard(key)
+                    self._spawning_events.pop(key, None)
+            done_event.set()
+
         def _do_spawn() -> None:
+            if key.use_gpu and settings is not None:
+                with self._lock:
+                    has_waiters = self._spawning_waiters.get(key, 0) > 0
+                if not has_waiters and not vram.can_prewarm_standby(
+                    settings, model_key=key.model_key
+                ):
+                    logger.info(
+                        "skipping STT standby pre-warm for %s: active GPU compute + standby weights would exceed VRAM budget",
+                        key.model_key or key.gguf_path,
+                    )
+                    _finish_inflight()
+                    return
+
             worker: StandbyWorker | None = None
             try:
                 worker = spawn_standby_sync(
@@ -127,17 +219,34 @@ class STTWorkerPool:
                     key.model_key or key.gguf_path,
                     exc,
                 )
-                with self._lock:
-                    if self._epoch == spawn_epoch:
-                        self._spawning_keys.discard(key)
+                _finish_inflight()
                 return
+
+            if key.use_gpu and settings is not None:
+                with self._lock:
+                    has_waiters = self._spawning_waiters.get(key, 0) > 0
+                if not has_waiters and not vram.can_prewarm_standby(
+                    settings,
+                    model_key=key.model_key,
+                    weights_already_allocated=True,
+                ):
+                    logger.info(
+                        "discarding newly warmed STT standby worker for %s (pid=%s): active GPU job needs VRAM headroom",
+                        key.model_key or key.gguf_path,
+                        worker.proc.pid,
+                    )
+                    worker.kill()
+                    _finish_inflight()
+                    return
 
             with self._lock:
                 if self._epoch == spawn_epoch:
                     self._spawning_keys.discard(key)
+                    self._spawning_events.pop(key, None)
                 if self._closed or self._epoch != spawn_epoch or key in self._workers:
                     if worker is not None:
                         worker.kill()
+                    done_event.set()
                     return
                 self._workers[key] = worker
                 self._reschedule_reaper_locked(timeout_sec)
@@ -146,11 +255,12 @@ class STTWorkerPool:
                     key.model_key or key.gguf_path,
                     worker.proc.pid,
                 )
+            done_event.set()
 
         thread = threading.Thread(target=_do_spawn, daemon=True)
         thread.start()
 
-    def evict_idle(self, timeout_sec: float) -> int:
+    def evict_idle(self, timeout_sec: float, *, exclude_model_key: str | None = None) -> int:
         """Evicts and kills any standby workers that have been idle >= timeout_sec.
         Returns the number of workers evicted.
         """
@@ -158,6 +268,8 @@ class STTWorkerPool:
         to_kill: list[StandbyWorker] = []
         with self._lock:
             for key, worker in list(self._workers.items()):
+                if exclude_model_key is not None and key.model_key == exclude_model_key:
+                    continue
                 if (now - worker.idle_since) >= timeout_sec or timeout_sec <= 0:
                     to_kill.append(self._workers.pop(key))
             if self._workers and timeout_sec > 0:
@@ -198,8 +310,13 @@ class STTWorkerPool:
                 self._reaper_timer.cancel()
                 self._reaper_timer = None
             to_kill = list(self._workers.values())
+            events = list(self._spawning_events.values())
             self._workers.clear()
             self._spawning_keys.clear()
+            self._spawning_events.clear()
+            self._spawning_waiters.clear()
+        for ev in events:
+            ev.set()
         for w in to_kill:
             w.kill()
         return len(to_kill)
@@ -244,8 +361,8 @@ def clear_worker_pool() -> int:
     return _STT_WORKER_POOL.clear()
 
 
-def evict_idle_workers(timeout_sec: float) -> int:
-    return _STT_WORKER_POOL.evict_idle(timeout_sec)
+def evict_idle_workers(timeout_sec: float, *, exclude_model_key: str | None = None) -> int:
+    return _STT_WORKER_POOL.evict_idle(timeout_sec, exclude_model_key=exclude_model_key)
 
 
 atexit.register(stop_worker_pool)

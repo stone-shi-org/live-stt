@@ -597,3 +597,117 @@ def test_standby_key_changes_with_att_context_so_stale_workers_are_not_reused() 
     ka, kb = a._resolve_standby_key(), b._resolve_standby_key()  # noqa: SLF001
     assert ka.extra_env == (("PARAKEET_ATT_CONTEXT", "128"),)
     assert ka != kb
+
+
+def _tagged_pcm(duration_sec: int) -> bytes:
+    import struct
+
+    pcm = bytearray(duration_sec * 16000 * 2)
+    for sec in range(duration_sec):
+        struct.pack_into("<H", pcm, sec * 16000 * 2, sec + 1)
+    return bytes(pcm)
+
+
+@pytest.mark.asyncio
+async def test_batch_tdt_windowed_inference_handles_461s_mtg32005_and_bounds_window_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Reproduces the exact LS-14 MTG_32005 length (461s) that previously fed
+    # the entire recording in one pass at finalize() and OOMed a 4 GiB P1000.
+    # With 90s windows and 5s overlap (stride 85s), 461s is split across 6
+    # windows; no single finalize() pass ever sees more than 90s (1,440,000
+    # samples), and overlapping words are deduplicated cleanly.
+    monkeypatch.setenv("FAKE_BATCH_WORDS_PER_SEC", "1")
+    session = _session(settings=_tdt_settings(), model_key="parakeet-tdt-0.6b-v3")
+    try:
+        await session.start()
+        pcm = _tagged_pcm(461)
+        feed_events = await session.feed_audio(pcm)
+        assert feed_events == []
+        # Batch sessions buffer in Python until finalize() so the worker is
+        # only fed bounded windows.
+        assert session.audio_offset_sec == 0.0
+
+        events = await session.finalize()
+    finally:
+        await session.close()
+
+    assert len(events) == 1
+    final = events[0].final
+    assert final.total_audio_sec == pytest.approx(461.0)
+    assert session._last_finalize_doc["finalize_count"] == 6  # noqa: SLF001
+    assert session._last_finalize_doc["max_window_samples"] == 90 * 16000  # noqa: SLF001
+
+    expected_words = [f"w{i}" for i in range(1, 462)]
+    assert [w.text for w in final.words] == expected_words
+    assert final.text == " ".join(expected_words)
+    starts = [w.start_sec for w in final.words]
+    assert starts == sorted(starts)
+    assert starts[0] == pytest.approx(0.0)
+    assert starts[-1] == pytest.approx(460.0)
+
+
+@pytest.mark.asyncio
+async def test_batch_tdt_windowed_inference_handles_20_minute_1200s_recording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # LS-14 target: >=20-minute (1200s) batch transcription completes with
+    # bounded per-window memory (<=90s per window across 15 windows) and
+    # exact word timestamp continuity across all 14 window boundaries.
+    monkeypatch.setenv("FAKE_BATCH_WORDS_PER_SEC", "1")
+    session = _session(settings=_tdt_settings(), model_key="parakeet-tdt-0.6b-v3")
+    try:
+        await session.start()
+        await session.feed_audio(_tagged_pcm(1200))
+        events = await session.finalize()
+    finally:
+        await session.close()
+
+    final = events[0].final
+    assert final.total_audio_sec == pytest.approx(1200.0)
+    assert session._last_finalize_doc["finalize_count"] == 15  # noqa: SLF001
+    assert session._last_finalize_doc["max_window_samples"] == 90 * 16000  # noqa: SLF001
+    assert [w.text for w in final.words] == [f"w{i}" for i in range(1, 1201)]
+
+
+@pytest.mark.asyncio
+async def test_batch_whisper_windowed_inference_merges_windows_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FAKE_BATCH_WORDS_PER_SEC", "1")
+    settings = _settings(
+        worker_bin_whisper=str(FAKE_WORKER),
+        stt_idle_timeout_sec=0,
+        batch_window_sec=30.0,
+        batch_overlap_sec=5.0,
+    )
+    session = _session(settings=settings, model_key="whisper-base.en-q8_0")
+    try:
+        await session.start()
+        await session.feed_audio(_tagged_pcm(80))
+        events = await session.finalize()
+    finally:
+        await session.close()
+
+    final = events[0].final
+    assert session._last_finalize_doc["finalize_count"] == 3  # noqa: SLF001
+    assert session._last_finalize_doc["max_window_samples"] == 30 * 16000  # noqa: SLF001
+    assert [w.text for w in final.words] == [f"w{i}" for i in range(1, 81)]
+
+
+@pytest.mark.asyncio
+async def test_worker_cuda_oom_stderr_raises_worker_oom_error_with_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from live_stt.worker import WorkerOOMError
+
+    monkeypatch.setenv("FAKE_CUDA_OOM_MIB", "3103.92")
+    session = _session(settings=_tdt_settings(), model_key="parakeet-tdt-0.6b-v3")
+    try:
+        await session.start()
+        await session.feed_audio(b"\x00\x00" * 1600)
+        with pytest.raises(WorkerOOMError, match=r"3103\.92 MiB"):
+            await session.finalize()
+    finally:
+        await session.close()
+

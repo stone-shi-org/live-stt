@@ -53,10 +53,16 @@ bool WhisperSession::feed(const float* samples, int n_samples, std::string* json
 }
 
 bool WhisperSession::finalize(std::string* json_out, std::string* error) {
+    if (buffer_.empty()) {
+        *json_out = "{\"text\":\"\",\"words\":[]}";
+        return true;
+    }
+
     whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
     wparams.n_threads = n_threads_;
     wparams.language = language_.c_str();
     wparams.translate = false;
+    wparams.no_context = true;
     wparams.token_timestamps = true;
     wparams.print_progress = false;
     wparams.print_realtime = false;
@@ -65,6 +71,7 @@ bool WhisperSession::finalize(std::string* json_out, std::string* error) {
     wparams.single_segment = false;
 
     int rc = whisper_full(ctx_, wparams, buffer_.data(), static_cast<int>(buffer_.size()));
+    buffer_.clear();
     if (rc != 0) {
         *error = "whisper_full failed with code " + std::to_string(rc);
         return false;

@@ -69,6 +69,9 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset(
         # Read at each worker spawn; StandbyKey carries it, so a standby spawned
         # under the old value is never handed out after a change.
         "parakeet_tdt_att_context",
+        "batch_window_sec",
+        "batch_overlap_sec",
+        "max_call_sec",
         "tts_voice",
         "tts_idle_timeout_sec",
         "stt_idle_timeout_sec",

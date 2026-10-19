@@ -23,13 +23,18 @@ cut point (an <EOU> if one arrives, else the hard deadline).
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
-from live_stt import __about__, metrics
+from live_stt import __about__, metrics, vram
 from live_stt.admission import WorkerBudget
 from live_stt.backends import installer
-from live_stt.boundary import dedup_incoming_words
+from live_stt.boundary import (
+    dedup_incoming_words,
+    iter_batch_windows,
+    merge_batch_window_words,
+)
 from live_stt.config import Settings
 from live_stt.events import worker_json_to_events
 from live_stt.logging_config import get_logger
@@ -68,6 +73,10 @@ class CallSession:
         self._active_generation_start_sec = 0.0
         self._worker_generations = 1
         self._last_rss_kb = 0
+        self._use_gpu = False
+        self._vram_reservation_id = f"session-{id(self)}"
+        self._reserved_compute_mb = 0
+        self._last_finalize_doc: dict[str, object] = {}
 
         # Rotation-in-progress state. self._incoming is the shadow worker;
         # non-None exactly while a rotation is underway.
@@ -83,6 +92,11 @@ class CallSession:
 
     async def start(self) -> asr_pb2.TranscriptionEvent:
         self._worker = await self._spawn_worker()
+        if self._use_gpu:
+            compute_needed = vram.compute_mb(self._settings, self._model_spec.key)
+            if compute_needed > 0:
+                self._reserved_compute_mb = compute_needed
+                vram.reserve_active_compute(self._vram_reservation_id, compute_needed)
         return asr_pb2.TranscriptionEvent(
             ready=asr_pb2.Ready(
                 model=self._model_spec.key,
@@ -213,6 +227,7 @@ class CallSession:
         worker_bin, gguf_path, language, n_threads, ggml_lib_dir, ggml_backend_path, use_gpu, engine_backend = (
             self._resolve_spawn_params()
         )
+        self._use_gpu = use_gpu
         # LS-10: check if a warmed-up standby worker is already waiting in memory/GPU
         if self._worker_pool is not None and self._settings.stt_idle_timeout_sec > 0:
             key = StandbyKey(
@@ -226,7 +241,9 @@ class CallSession:
                 model_key=self._model_spec.key,
                 extra_env=self._extra_env(),
             )
-            standby = self._worker_pool.acquire(key)
+            standby = self._worker_pool.acquire(key, wait_inflight=False)
+            if standby is None:
+                standby = await asyncio.to_thread(self._worker_pool.acquire, key, wait_inflight=True)
             if standby is not None:
                 metrics.stt_standby_workers_active.set(self._worker_pool.count())
                 handle = await WorkerHandle.from_standby(standby)
@@ -268,6 +285,12 @@ class CallSession:
     async def feed_audio(self, pcm16le: bytes) -> list[asr_pb2.TranscriptionEvent]:
         assert self._worker is not None, "feed_audio called before start()"
         self._buf += pcm16le
+        if not self._model_spec.streaming_capable:
+            # LS-14: batch-only models (parakeet_tdt, whisper) buffer in Python
+            # until finalize(), which feeds and finalizes one window at a time
+            # so the worker's sample buffer and GPU compute graph stay bounded
+            # by batch_window_sec instead of the full recording length.
+            return []
         events: list[asr_pb2.TranscriptionEvent] = []
         while len(self._buf) >= self._chunk_bytes:
             chunk = bytes(self._buf[: self._chunk_bytes])
@@ -514,8 +537,132 @@ class CallSession:
             strip_tag=self._model_spec.strip_language_tag,
         )
 
+    async def _finalize_batch(self) -> list[asr_pb2.TranscriptionEvent]:
+        assert self._worker is not None
+        raw_pcm = bytes(self._buf)
+        self._buf.clear()
+        if len(raw_pcm) % 2:
+            raw_pcm = raw_pcm[:-1]
+        total_samples = len(raw_pcm) // 2
+
+        window_sec = vram.effective_batch_window_sec(self._settings, self._model_spec.key)
+        overlap_override = getattr(self._settings, "batch_overlap_sec", None)
+        overlap_sec = (
+            float(overlap_override)
+            if overlap_override is not None
+            else float(self._model_spec.batch_overlap_sec)
+        )
+        if window_sec > 0:
+            overlap_sec = min(max(0.0, overlap_sec), window_sec * 0.5)
+        window_samples = int(round(window_sec * 16000)) if window_sec > 0 else 0
+        overlap_samples = int(round(overlap_sec * 16000)) if window_sec > 0 else 0
+
+        windows = iter_batch_windows(total_samples, window_samples, overlap_samples)
+
+        if self._use_gpu and self._reserved_compute_mb > 0:
+            await asyncio.to_thread(
+                vram.ensure_compute_headroom,
+                self._settings,
+                model_key=self._model_spec.key,
+                compute_needed_mb=self._reserved_compute_mb,
+            )
+
+        merged_words: list[asr_pb2.Word] = []
+        window_texts: list[str] = []
+        prev_win_end_sec = 0.0
+
+        for win_idx, (win_start_sample, win_end_sample) in enumerate(windows):
+            win_start_sec = win_start_sample / 16000.0
+            win_end_sec = win_end_sample / 16000.0
+            win_pcm = raw_pcm[win_start_sample * 2 : win_end_sample * 2]
+
+            win_words: list[asr_pb2.Word] = []
+            feed_texts: list[str] = []
+
+            for offset in range(0, len(win_pcm), self._chunk_bytes):
+                chunk = win_pcm[offset : offset + self._chunk_bytes]
+                feed_start = time.monotonic()
+                try:
+                    feed_doc = await self._worker.feed(chunk)
+                except WorkerError:
+                    metrics.asr_errors_total.labels(code="feed_failed").inc()
+                    raise
+                metrics.feed_duration_seconds.observe(time.monotonic() - feed_start)
+                self._last_rss_kb = feed_doc.get("rss_kb", self._last_rss_kb)
+                feed_text = feed_doc.get("text", "")
+                if self._model_spec.strip_language_tag and feed_text:
+                    feed_text = strip_language_tag(feed_text)
+                if feed_text:
+                    feed_texts.append(feed_text)
+                for w in feed_doc.get("words", []):
+                    win_words.append(
+                        asr_pb2.Word(
+                            text=w["w"],
+                            start_sec=w["start"] + win_start_sec,
+                            end_sec=w["end"] + win_start_sec,
+                            confidence=w.get("conf", 0.0),
+                        )
+                    )
+
+            doc = await self._worker.finalize()
+            self._last_finalize_doc = doc
+            self._last_rss_kb = doc.get("rss_kb", self._last_rss_kb)
+            final_text = doc.get("text", "")
+            if self._model_spec.strip_language_tag and final_text:
+                final_text = strip_language_tag(final_text)
+            for w in doc.get("words", []):
+                win_words.append(
+                    asr_pb2.Word(
+                        text=w["w"],
+                        start_sec=w["start"] + win_start_sec,
+                        end_sec=w["end"] + win_start_sec,
+                        confidence=w.get("conf", 0.0),
+                    )
+                )
+
+            win_text = " ".join([*feed_texts, *([final_text] if final_text else [])])
+            window_texts.append(win_text)
+
+            if win_idx == 0:
+                merged_words = win_words
+            else:
+                merged_words = merge_batch_window_words(
+                    merged_words,
+                    win_words,
+                    win_start_sec=win_start_sec,
+                    prev_end_sec=prev_win_end_sec,
+                )
+            prev_win_end_sec = win_end_sec
+
+        self._fed_samples = total_samples
+        if total_samples > 0:
+            metrics.audio_seconds_total.inc(total_samples / 16000.0)
+
+        if len(windows) == 1:
+            text = window_texts[0] if window_texts else ""
+        elif merged_words:
+            text = " ".join(w.text for w in merged_words)
+            if self._model_spec.strip_language_tag:
+                text = strip_language_tag(text)
+        else:
+            text = " ".join(t.strip() for t in window_texts if t.strip())
+
+        return [
+            asr_pb2.TranscriptionEvent(
+                final=asr_pb2.Final(
+                    text=text,
+                    words=merged_words,
+                    total_audio_sec=self.audio_offset_sec,
+                    worker_generations=self._worker_generations,
+                )
+            )
+        ]
+
     async def finalize(self) -> list[asr_pb2.TranscriptionEvent]:
         assert self._worker is not None, "finalize called before start()"
+        if not self._model_spec.streaming_capable:
+            return await self._finalize_batch()
+
         events: list[asr_pb2.TranscriptionEvent] = []
         if self._buf:
             # n_samples == 0 is legal per parakeet_capi.h, and so is any
@@ -530,6 +677,7 @@ class CallSession:
             await self._abandon_rotation()
 
         doc = await self._worker.finalize()
+        self._last_finalize_doc = doc
         text = doc.get("text", "")
         if self._model_spec.strip_language_tag:
             text = strip_language_tag(text)
@@ -562,6 +710,8 @@ class CallSession:
         (the client-disconnect path, which must NOT finalize -- there is
         nowhere to send the output).
         """
+        vram.release_active_compute(self._vram_reservation_id)
+        self._reserved_compute_mb = 0
         await self._abandon_rotation()
         if self._worker is not None:
             self._worker.kill()
@@ -576,6 +726,8 @@ class CallSession:
                 self._worker_pool.maintain_warm_async(
                     key=key,
                     timeout_sec=self._settings.stt_idle_timeout_sec,
+                    settings=self._settings,
                 )
             except Exception as exc:
                 logger.debug("could not maintain warm worker for pool: %s", exc)
+

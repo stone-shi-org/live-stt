@@ -175,6 +175,77 @@ class TestSTTWorkerPoolCore:
         finally:
             pool.close()
 
+    def test_acquire_waits_for_inflight_background_spawn_instead_of_duplicating(self) -> None:
+        pool = STTWorkerPool()
+        os.environ["FAKE_LOAD_DELAY_SEC"] = "0.15"
+        try:
+            key = _make_key("parakeet-tdt-0.6b-v3")
+            pool.maintain_warm_async(key=key, timeout_sec=600.0)
+            # Wait briefly so background thread registers _spawning_keys
+            for _ in range(20):
+                if pool.has_warm(key):
+                    break
+                time.sleep(0.01)
+            assert pool.has_warm(key) is True
+
+            # Acquire with wait_timeout_sec should receive the worker once it finishes loading
+            acquired = pool.acquire(key, wait_timeout_sec=3.0)
+            assert acquired is not None
+            try:
+                assert acquired.key == key
+                assert pool.count() == 0
+            finally:
+                acquired.kill()
+        finally:
+            os.environ.pop("FAKE_LOAD_DELAY_SEC", None)
+            pool.close()
+
+    def test_maintain_warm_async_skips_gpu_prewarm_when_vram_budget_is_tight(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from live_stt import vram
+
+        monkeypatch.setattr(vram, "can_prewarm_standby", lambda settings, *, model_key: False)
+        pool = STTWorkerPool()
+        try:
+            gpu_key = StandbyKey(
+                worker_bin=str(FAKE_WORKER),
+                gguf_path=f"/fake/{_model_filename('parakeet-tdt-0.6b-v3')}",
+                language="",
+                n_threads=1,
+                ggml_lib_dir=None,
+                ggml_backend_path=None,
+                use_gpu=True,
+                model_key="parakeet-tdt-0.6b-v3",
+            )
+            pool.maintain_warm_async(
+                key=gpu_key,
+                timeout_sec=600.0,
+                settings=Settings(_env_file=None),
+            )
+            time.sleep(0.2)
+            assert pool.count() == 0
+        finally:
+            pool.close()
+
+    def test_evict_idle_respects_exclude_model_key(self) -> None:
+        pool = STTWorkerPool()
+        try:
+            w_tdt = _spawn_fake_standby("parakeet-tdt-0.6b-v3")
+            w_eou = _spawn_fake_standby("realtime_eou_120m-v1")
+            pool.put(w_tdt, 600.0)
+            pool.put(w_eou, 600.0)
+            assert pool.count() == 2
+
+            evicted = pool.evict_idle(timeout_sec=0.0, exclude_model_key="parakeet-tdt-0.6b-v3")
+            assert evicted == 1
+            assert pool.count() == 1
+            assert pool.snapshot()[0]["model"] == "parakeet-tdt-0.6b-v3"
+            w_eou.proc.wait(timeout=2.0)
+            assert w_eou.proc.returncode is not None
+        finally:
+            pool.close()
+
 
 class TestCallSessionWorkerPoolIntegration:
     @pytest.mark.asyncio

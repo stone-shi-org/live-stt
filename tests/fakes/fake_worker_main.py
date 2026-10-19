@@ -30,12 +30,23 @@ Env vars (all optional):
                              entry in "events") every time this much audio
                              has been fed since the last one -- for testing
                              rotation's early-cutover-at-EOU path
+    FAKE_BATCH_WORDS_PER_SEC buffer AUDIO frames per window and emit words
+                             only on FINALIZE with window-relative timestamps
+                             [0, window_sec], clearing the window buffer on
+                             each FINALIZE (mirrors ParakeetTdtSession and
+                             WhisperSession). If a word's starting int16
+                             sample is non-zero (uint16 tag), emits "w{tag}"
+                             so overlapping windows over tagged PCM produce
+                             matching words in the overlap region.
+    FAKE_CUDA_OOM_MIB       on FINALIZE, print a ggml cudaMalloc OOM line for
+                             this many MiB to stderr and exit(1)
 """
 
 from __future__ import annotations
 
 import json
 import os
+import struct
 import sys
 import time
 from pathlib import Path
@@ -71,6 +82,8 @@ def _write_frame(frame_type: FrameType, payload: bytes = b"") -> None:
 def main() -> None:
     load_delay = float(os.environ.get("FAKE_LOAD_DELAY_SEC", "0"))
     words_per_sec = float(os.environ.get("FAKE_WORDS_PER_SEC", "0"))
+    batch_words_per_sec = float(os.environ.get("FAKE_BATCH_WORDS_PER_SEC", "0"))
+    cuda_oom_mib = os.environ.get("FAKE_CUDA_OOM_MIB")
     rtf = float(os.environ.get("FAKE_RTF", "0"))
     leak_mb_per_sec = float(os.environ.get("FAKE_LEAK_MB_PER_SEC", "0"))
     crash_after_sec = os.environ.get("FAKE_CRASH_AFTER_SEC")
@@ -126,6 +139,10 @@ def main() -> None:
     )
 
     fed_samples = 0
+    window_samples = 0
+    window_buf = bytearray()
+    max_window_samples = 0
+    finalize_count = 0
     leaked_chunks: list[bytes] = []  # retained on purpose, to simulate a real leak
     word_counter = 0
     words_owed = 0.0
@@ -148,7 +165,13 @@ def main() -> None:
             n_samples = len(payload) // 2 if frame_type == FrameType.AUDIO else 0
             audio_sec_this_feed = n_samples / 16000.0
             fed_samples += n_samples
+            window_samples += n_samples
+            if frame_type == FrameType.AUDIO and batch_words_per_sec:
+                window_buf.extend(payload[: n_samples * 2])
+            if window_samples > max_window_samples:
+                max_window_samples = window_samples
             fed_audio_sec = fed_samples / 16000.0
+            window_audio_sec = window_samples / 16000.0
 
             if rtf:
                 time.sleep(rtf * audio_sec_this_feed)
@@ -163,6 +186,16 @@ def main() -> None:
                 while True:
                     time.sleep(3600)
 
+            if frame_type == FrameType.FINALIZE and cuda_oom_mib is not None:
+                sys.stderr.write(
+                    f"ggml_backend_cuda_buffer_type_alloc_buffer: allocating {cuda_oom_mib} MiB "
+                    f"on device 0: cudaMalloc failed: out of memory\n"
+                    f"ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer\n"
+                    f"[parakeet] Backend::compute: ggml_gallocr_alloc_graph failed\n"
+                )
+                sys.stderr.flush()
+                os._exit(1)
+
             text = ""
             words = []
             if words_per_sec:
@@ -172,9 +205,27 @@ def main() -> None:
                     w = f"word{word_counter}"
                     text += (" " if text else "") + w
                     words.append(
-                        {"w": w, "start": fed_audio_sec, "end": fed_audio_sec, "conf": 0.9}
+                        {"w": w, "start": window_audio_sec, "end": window_audio_sec, "conf": 0.9}
                     )
                     words_owed -= 1.0
+
+            if frame_type == FrameType.FINALIZE and batch_words_per_sec and window_samples > 0:
+                n_words = int(round(window_audio_sec * batch_words_per_sec))
+                step_sec = 1.0 / batch_words_per_sec
+                for k in range(n_words):
+                    w_start = round(k * step_sec, 4)
+                    w_end = round(min(window_audio_sec, (k + 0.8) * step_sec), 4)
+                    sample_idx = min(int(round(w_start * 16000)), window_samples - 1)
+                    tag = 0
+                    if sample_idx * 2 + 2 <= len(window_buf):
+                        tag = struct.unpack_from("<H", window_buf, sample_idx * 2)[0]
+                    if tag > 0:
+                        w = f"w{tag}"
+                    else:
+                        word_counter += 1
+                        w = f"word{word_counter}"
+                    text += (" " if text else "") + w
+                    words.append({"w": w, "start": w_start, "end": w_end, "conf": 0.9})
 
             eou_fired = 0
             events = []
@@ -183,12 +234,20 @@ def main() -> None:
                 threshold = float(eou_every_sec)
                 if threshold > 0 and audio_sec_since_last_eou >= threshold:
                     eou_fired = 1
-                    events.append({"type": "eou", "frame": 0, "t": fed_audio_sec})
+                    events.append({"type": "eou", "frame": 0, "t": window_audio_sec})
                     audio_sec_since_last_eou = 0.0
+
+            if frame_type == FrameType.FINALIZE:
+                finalize_count += 1
+                window_samples = 0
+                window_buf.clear()
+                words_owed = 0.0
 
             doc = {
                 "rss_kb": rss_kb(),
                 "fed_samples": fed_samples,
+                "max_window_samples": max_window_samples,
+                "finalize_count": finalize_count,
                 "text": text,
                 "eou": eou_fired,
                 "eob": 0,
