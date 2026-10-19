@@ -91,6 +91,7 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
         call_ref_hash = "unset"
         outcome = "internal"
         session: CallSession | None = None
+        admission: vram.Admission | None = None
         final_text_parts: list[str] = []
 
         try:
@@ -169,12 +170,18 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
                 # models (the streaming_capable gate just above). In a thread:
                 # admit() shells out to nvidia-smi and may poll while idle
                 # workers are reclaimed -- never block the event loop on that.
+                already_warm = bool(
+                    self._state.worker_pool is not None
+                    and self._settings.stt_idle_timeout_sec > 0
+                    and self._state.worker_pool.has_warm(spec.key, use_gpu=True)
+                )
                 admission = await asyncio.to_thread(
                     vram.admit,
                     self._settings,
                     model_key=spec.key,
                     model_mb=spec.vram_mb,
                     fallback_mb=self._settings.vram_per_worker_mb,
+                    already_warm=already_warm,
                 )
                 if admission.free_mb is not None:
                     metrics.gpu_free_vram_mb.set(admission.free_mb)
@@ -257,6 +264,8 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
             # after a client disconnect that never got to finalize().
             if session is not None:
                 await session.close()
+            if admission is not None:
+                admission.release()
             self._budget.release_call()
             metrics.streams_active.dec()
             metrics.streams_total.labels(outcome=outcome).inc()

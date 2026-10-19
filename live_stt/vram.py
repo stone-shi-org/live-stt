@@ -30,8 +30,12 @@ Fails OPEN when nvidia-smi is unavailable (``gpu.free_vram_mb()`` is None),
 the same contract every gate here already had: "cannot check" is never
 treated as "zero free".
 
-Not handled (same as before this module): two requests checked at the same
-moment can both pass before either allocates.
+4. **In-process VRAM reservation (LS-17).** Admission checks and records a
+   reservation (weights for a cold spawn + compute buffer for the active
+   window) atomically under a lock before returning, and callers release it in
+   ``try/finally`` when the call ends. Concurrent requests arriving in a burst
+   see earlier requests' reservations immediately, before their workers have
+   allocated on the GPU.
 """
 
 from __future__ import annotations
@@ -55,8 +59,27 @@ RECLAIM_POLL_SEC = 0.2
 
 _total_mb_cache: int | None = None
 
-_active_compute_lock = threading.Lock()
+_lock = threading.Lock()
+_active_compute_lock = _lock
+
+
+@dataclass
+class _Reservation:
+    reservation_id: str
+    model_key: str
+    weights_mb: int
+    compute_mb: int
+    warm_claim: bool = False
+
+    @property
+    def total_mb(self) -> int:
+        return self.weights_mb + self.compute_mb
+
+
+_reservations: dict[str, _Reservation] = {}
 _active_compute_reservations: dict[str, int] = {}
+_baseline_free_mb: int | None = None
+_reservation_seq: int = 0
 
 
 def _total_mb() -> int | None:
@@ -152,26 +175,158 @@ def required_mb(
     )
 
 
+def _can_claim_warm_locked(model_key: str, already_warm: bool) -> bool:
+    """At most one in-flight reservation per model may claim the warm-standby
+    weights discount: STTWorkerPool holds at most one warm standby worker per
+    key, so concurrent requests beyond the first must spawn cold workers."""
+    if not already_warm:
+        return False
+    return not any(r.model_key == model_key and r.warm_claim for r in _reservations.values())
+
+
+def _compute_requirement_locked(
+    settings: Any,
+    *,
+    model_key: str,
+    model_mb: int | None,
+    fallback_mb: int,
+    audio_sec: float | None,
+    already_warm: bool,
+) -> tuple[int, int, int]:
+    """Return ``(weights_needed_mb, compute_needed_mb, required_total_mb)``."""
+    c_mb = compute_mb(settings, model_key, audio_sec=audio_sec)
+    if already_warm:
+        w_mb = 0
+    else:
+        total_need = need_mb(
+            settings,
+            model_key,
+            model_mb,
+            fallback_mb,
+            audio_sec=audio_sec,
+            include_weights=True,
+        )
+        w_mb = max(0, total_need - c_mb)
+    required = w_mb + c_mb + reserve_mb(settings)
+    return w_mb, c_mb, required
+
+
+def _effective_free_locked(live_free: int, *, pre_reclaim_free: int | None = None) -> int:
+    """Compute available VRAM (MiB) accounting for active reservations.
+
+    Let ``F_0`` be the GPU's free VRAM before active reservations allocated,
+    and ``R`` be the sum of all active reservations. When some fraction ``A``
+    of ``R`` has already been allocated in ``nvidia-smi`` (so ``live_free =
+    F_0 - A``) and ``R - A`` is still pending allocation, the remaining free
+    VRAM is ``live_free - (R - A) = F_0 - R`` -- independent of ``A``. Taking
+    ``min(F_0 - R, live_free)`` handles both unallocated reservations (bursts,
+    fake workers) and external GPU allocations without double-counting workers
+    that have already loaded.
+    """
+    global _baseline_free_mb
+    admit_reserved = sum(r.total_mb for r in _reservations.values())
+    compute_only_reserved = sum(_active_compute_reservations.values())
+    if not _reservations or _baseline_free_mb is None:
+        _baseline_free_mb = live_free
+    else:
+        if pre_reclaim_free is not None and live_free > pre_reclaim_free:
+            _baseline_free_mb += live_free - pre_reclaim_free
+        if live_free > _baseline_free_mb:
+            _baseline_free_mb = live_free
+    total_reserved = admit_reserved + compute_only_reserved
+    return max(0, min(_baseline_free_mb - total_reserved, live_free - compute_only_reserved))
+
+
+def _record_reservation_locked(
+    *,
+    model_key: str,
+    weights_mb: int,
+    compute_mb: int,
+    warm_claim: bool,
+) -> str:
+    global _reservation_seq
+    _reservation_seq += 1
+    res_id = f"vram-res-{_reservation_seq}"
+    _reservations[res_id] = _Reservation(
+        reservation_id=res_id,
+        model_key=model_key,
+        weights_mb=weights_mb,
+        compute_mb=compute_mb,
+        warm_claim=warm_claim,
+    )
+    return res_id
+
+
+def release(reservation_id: str | None) -> None:
+    """Release an admission VRAM reservation (idempotent)."""
+    if reservation_id is None:
+        return
+    global _baseline_free_mb
+    with _lock:
+        _reservations.pop(reservation_id, None)
+        if not _reservations:
+            _baseline_free_mb = None
+
+
+def reserved_mb() -> int:
+    """Total VRAM (MiB) reserved across all in-flight admissions and active compute buffers."""
+    with _lock:
+        return sum(r.total_mb for r in _reservations.values()) + sum(
+            _active_compute_reservations.values()
+        )
+
+
+def active_reservations_count() -> int:
+    """Number of currently active admission reservations."""
+    with _lock:
+        return len(_reservations)
+
+
+def has_admit_reservation(model_key: str | None = None) -> bool:
+    """Return True if an active admission reservation exists (for ``model_key`` if given)."""
+    with _lock:
+        if model_key is None:
+            return bool(_reservations)
+        return any(r.model_key == model_key for r in _reservations.values())
+
+
+def clear_reservations() -> None:
+    """Clear all active VRAM reservations (used by test fixtures)."""
+    global _baseline_free_mb
+    with _lock:
+        _reservations.clear()
+        _active_compute_reservations.clear()
+        _baseline_free_mb = None
+
+
 def reserve_active_compute(token_id: str, mb: int) -> None:
     """Register an active GPU session's pending compute buffer requirement (MiB)."""
     if mb <= 0:
         return
-    with _active_compute_lock:
+    with _lock:
         _active_compute_reservations[token_id] = int(mb)
 
 
 def release_active_compute(token_id: str) -> None:
     """Release an active GPU session's compute buffer reservation."""
-    with _active_compute_lock:
+    with _lock:
         _active_compute_reservations.pop(token_id, None)
 
 
 def active_compute_mb(exclude_token_id: str | None = None) -> int:
     """Total compute buffer VRAM (MiB) reserved by currently active GPU jobs."""
-    with _active_compute_lock:
-        if exclude_token_id is None:
-            return sum(_active_compute_reservations.values())
-        return sum(v for k, v in _active_compute_reservations.items() if k != exclude_token_id)
+    with _lock:
+        standalone = (
+            sum(_active_compute_reservations.values())
+            if exclude_token_id is None
+            else sum(v for k, v in _active_compute_reservations.items() if k != exclude_token_id)
+        )
+        admitted = (
+            sum(r.compute_mb for r in _reservations.values())
+            if exclude_token_id is None
+            else sum(r.compute_mb for k, r in _reservations.items() if k != exclude_token_id)
+        )
+        return standalone + admitted
 
 
 def can_prewarm_standby(
@@ -181,20 +336,22 @@ def can_prewarm_standby(
     weights_already_allocated: bool = False,
 ) -> bool:
     """Return True if pre-warming (or keeping) a standby GPU worker for
-    ``model_key`` fits alongside active jobs' compute buffers and the card reserve.
+    ``model_key`` fits alongside active jobs' reservations and the card reserve.
     """
-    free = gpu.free_vram_mb()
-    if free is None:
-        return True
-    spec = models.MODELS.get(model_key)
-    model_mb = spec.vram_mb if spec is not None else None
-    standby_weights = (
-        0
-        if weights_already_allocated
-        else weights_mb(settings, model_key, model_mb, settings.vram_per_worker_mb)
-    )
-    needed = standby_weights + active_compute_mb() + reserve_mb(settings)
-    return free >= needed
+    with _lock:
+        live_free = gpu.free_vram_mb()
+        if live_free is None:
+            return True
+        free = _effective_free_locked(live_free)
+        spec = models.MODELS.get(model_key)
+        model_mb = spec.vram_mb if spec is not None else None
+        standby_weights = (
+            0
+            if weights_already_allocated
+            else weights_mb(settings, model_key, model_mb, settings.vram_per_worker_mb)
+        )
+        needed = standby_weights + reserve_mb(settings)
+        return free >= needed
 
 
 @dataclass(frozen=True)
@@ -203,10 +360,16 @@ class Admission:
     free_mb: int | None
     required_mb: int
     reclaimed: int = 0
+    reservation_id: str | None = None
+    reserved_mb: int = 0
 
     def message(self, what: str = "") -> str:
         suffix = f" for {what}" if what else ""
         return f"insufficient VRAM{suffix}: {self.free_mb}MB free, {self.required_mb}MB required"
+
+    def release(self) -> None:
+        if self.reservation_id is not None:
+            release(self.reservation_id)
 
 
 def reclaim_idle_workers(*, exclude_model_key: str | None = None) -> int:
@@ -272,25 +435,45 @@ def admit(
     already_warm: bool = False,
 ) -> Admission:
     """Blocking (shells out to nvidia-smi and may poll for up to
-    RECLAIM_WAIT_SEC). Call from an event loop via asyncio.to_thread."""
-    free = gpu.free_vram_mb()
-    required = (
-        required_mb(
+    RECLAIM_WAIT_SEC). Call from an event loop via asyncio.to_thread.
+
+    When admitted (``ok=True`` and ``free_mb is not None``), records an
+    in-process reservation for this call's weights + compute buffer under
+    ``_lock`` so concurrent callers cannot race past the check before workers
+    allocate on the GPU. Callers must invoke ``admission.release()`` in a
+    ``try/finally`` block when the call finishes.
+    """
+    with _lock:
+        live_free = gpu.free_vram_mb()
+        effective_warm = _can_claim_warm_locked(model_key, already_warm)
+        w_mb, c_mb, required = _compute_requirement_locked(
             settings,
-            model_key,
-            model_mb,
-            fallback_mb,
+            model_key=model_key,
+            model_mb=model_mb,
+            fallback_mb=fallback_mb,
             audio_sec=audio_sec,
-            include_weights=not already_warm,
+            already_warm=effective_warm,
         )
-        + active_compute_mb()
-    )
-    if free is None:
-        return Admission(True, None, required)
-    if free >= required:
-        return Admission(True, free, required)
-    if not reclaim:
-        return Admission(False, free, required)
+        if live_free is None:
+            return Admission(True, None, required)
+        free = _effective_free_locked(live_free)
+        if free >= required:
+            res_id = _record_reservation_locked(
+                model_key=model_key,
+                weights_mb=w_mb,
+                compute_mb=c_mb,
+                warm_claim=effective_warm,
+            )
+            return Admission(
+                True,
+                free,
+                required,
+                reservation_id=res_id,
+                reserved_mb=w_mb + c_mb,
+            )
+        if not reclaim:
+            return Admission(False, free, required)
+        pre_reclaim_free = live_free
 
     stopped = (
         reclaim_idle_workers(exclude_model_key=model_key)
@@ -308,10 +491,38 @@ def admit(
     )
     deadline = time.monotonic() + RECLAIM_WAIT_SEC
     while True:
-        free = gpu.free_vram_mb()
-        if free is None or free >= required:
-            return Admission(True, free, required, stopped)
-        if time.monotonic() >= deadline:
-            return Admission(False, free, required, stopped)
+        with _lock:
+            live_free = gpu.free_vram_mb()
+            effective_warm = _can_claim_warm_locked(model_key, already_warm)
+            w_mb, c_mb, required = _compute_requirement_locked(
+                settings,
+                model_key=model_key,
+                model_mb=model_mb,
+                fallback_mb=fallback_mb,
+                audio_sec=audio_sec,
+                already_warm=effective_warm,
+            )
+            if live_free is None:
+                return Admission(True, None, required, stopped)
+            free = _effective_free_locked(live_free, pre_reclaim_free=pre_reclaim_free)
+            pre_reclaim_free = live_free
+            if free >= required:
+                res_id = _record_reservation_locked(
+                    model_key=model_key,
+                    weights_mb=w_mb,
+                    compute_mb=c_mb,
+                    warm_claim=effective_warm,
+                )
+                return Admission(
+                    True,
+                    free,
+                    required,
+                    stopped,
+                    reservation_id=res_id,
+                    reserved_mb=w_mb + c_mb,
+                )
+            if time.monotonic() >= deadline:
+                return Admission(False, free, required, stopped)
         time.sleep(RECLAIM_POLL_SEC)
+
 

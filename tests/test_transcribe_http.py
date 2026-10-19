@@ -537,3 +537,233 @@ class TestRealCallSessionIntegration:
         assert tracker.failed_total == 1
         assert tracker.active == 0
 
+    @pytest.mark.asyncio
+    async def test_concurrent_over_budget_burst_returns_only_200_and_503_never_507(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # LS-17 integration test (fake worker): 22 concurrent requests arrive
+        # at once against max_concurrent_calls=20 and a fake GPU budget that can
+        # hold only 5 realtime_eou_120m-v1 workers (1800 MB free, 4096 MB total
+        # -> 409 MB reserve -> 1391 MB usable / 260 MB per worker = 5 workers).
+        # If a 6th worker were ever spawned concurrently, the fake spawn guard
+        # below raises WorkerOOMError (which would map to HTTP 507), reproducing
+        # the exact Quadro P1000 failure mode from test-center run 26.
+        import asyncio
+        import types
+        from live_stt import session as session_mod, vram
+        from live_stt.worker import WorkerHandle, WorkerOOMError
+
+        monkeypatch.setattr(vram, "_total_mb_cache", None)
+        monkeypatch.setattr(transcribe_http.gpu, "total_vram_mb", lambda: 4096)
+        monkeypatch.setattr(transcribe_http.gpu, "free_vram_mb", lambda: 1800)
+        monkeypatch.setattr(vram, "reclaim_idle_workers", lambda *a, **kw: 0)
+        monkeypatch.setattr(
+            session_mod.installer,
+            "get_active_backend",
+            lambda _db, _eng: types.SimpleNamespace(flavor="cuda", path="/fake/cuda"),
+        )
+        monkeypatch.setenv("FAKE_LOAD_DELAY_SEC", "0.15")
+        monkeypatch.setenv("FAKE_WORDS_PER_SEC", "50")
+
+        orig_spawn = WorkerHandle.spawn
+        active_gpu_spawns = 0
+        peak_gpu_spawns = 0
+
+        async def _guarded_spawn(**kwargs):
+            nonlocal active_gpu_spawns, peak_gpu_spawns
+            active_gpu_spawns += 1
+            peak_gpu_spawns = max(peak_gpu_spawns, active_gpu_spawns)
+            if active_gpu_spawns > 5:
+                active_gpu_spawns -= 1
+                raise WorkerOOMError("CUDA OOM allocating 167.8 MiB (simulated over-budget spawn)")
+            handle = await orig_spawn(**kwargs)
+            orig_kill = handle.kill
+
+            def _wrapped_kill() -> None:
+                nonlocal active_gpu_spawns
+                active_gpu_spawns = max(0, active_gpu_spawns - 1)
+                orig_kill()
+
+            handle.kill = _wrapped_kill  # type: ignore[method-assign]
+            return handle
+
+        monkeypatch.setattr(WorkerHandle, "spawn", staticmethod(_guarded_spawn))
+
+        body = _multipart_body(
+            {"model": "realtime_eou_120m-v1"},
+            file_field="file",
+            file_bytes=_wav_bytes(n_frames=2560),
+        )
+        settings = _settings(parakeet_backend="cuda", stt_idle_timeout_sec=0)
+        budget = _budget(max_concurrent_calls=20, reserve_slots=2)
+        tracker = _tracker()
+
+        responses = await asyncio.gather(
+            *[
+                transcribe_http.handle_transcribe_request(
+                    content_type=CONTENT_TYPE,
+                    body=body,
+                    settings=settings,
+                    budget=budget,
+                    draining=False,
+                    tracker=tracker,
+                )
+                for _ in range(22)
+            ]
+        )
+
+        statuses = [status for status, _, _ in responses]
+        assert 507 not in statuses, f"got 507 OOM in burst: {statuses}"
+        assert set(statuses) <= {200, 503}
+        assert statuses.count(200) == 5
+        assert statuses.count(503) == 17
+        assert peak_gpu_spawns == 5
+        assert tracker.rejected_vram_total == 17
+        assert tracker.completed_total == 5
+        assert tracker.failed_total == 0
+        assert tracker.active == 0
+        assert vram.reserved_mb() == 0
+        assert vram.active_reservations_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_vram_reservation_released_on_success_error_and_cancellation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        import asyncio
+        from live_stt import vram
+
+        monkeypatch.setattr(vram, "_total_mb_cache", None)
+        monkeypatch.setattr(transcribe_http.gpu, "total_vram_mb", lambda: 4096)
+        monkeypatch.setattr(transcribe_http.gpu, "free_vram_mb", lambda: 1000)
+        monkeypatch.setattr(vram, "reclaim_idle_workers", lambda *a, **kw: 0)
+
+        body = _multipart_body(
+            {"model": "realtime_eou_120m-v1"},
+            file_field="file",
+            file_bytes=_wav_bytes(n_frames=2560),
+        )
+        settings = _settings(parakeet_backend="cuda", stt_idle_timeout_sec=0)
+        budget = _budget(max_concurrent_calls=5, reserve_slots=1)
+        tracker = _tracker()
+
+        # 1. Success releases reservation
+        async def _ok_run(pcm, *, settings, spec, language, budget):
+            assert vram.reserved_mb() == 260
+            return "ok", [], 0.16, 1
+
+        monkeypatch.setattr(transcribe_http, "_run_transcription", _ok_run)
+        status, _, _ = await transcribe_http.handle_transcribe_request(
+            content_type=CONTENT_TYPE, body=body, settings=settings, budget=budget, draining=False, tracker=tracker
+        )
+        assert status == 200
+        assert vram.reserved_mb() == 0
+
+        # 2. Error releases reservation
+        async def _err_run(pcm, *, settings, spec, language, budget):
+            assert vram.reserved_mb() == 260
+            raise transcribe_http.TranscribeError("engine crashed")
+
+        monkeypatch.setattr(transcribe_http, "_run_transcription", _err_run)
+        status, _, _ = await transcribe_http.handle_transcribe_request(
+            content_type=CONTENT_TYPE, body=body, settings=settings, budget=budget, draining=False, tracker=tracker
+        )
+        assert status == 500
+        assert vram.reserved_mb() == 0
+
+        # 3. Cancellation releases reservation
+        in_run = asyncio.Event()
+        hang = asyncio.Event()
+
+        async def _CancelRun(pcm, *, settings, spec, language, budget):
+            assert vram.reserved_mb() == 260
+            in_run.set()
+            await hang.wait()
+            return "", [], 0.0, 1
+
+        monkeypatch.setattr(transcribe_http, "_run_transcription", _CancelRun)
+        task = asyncio.create_task(
+            transcribe_http.handle_transcribe_request(
+                content_type=CONTENT_TYPE, body=body, settings=settings, budget=budget, draining=False, tracker=tracker
+            )
+        )
+        await in_run.wait()
+        assert vram.reserved_mb() == 260
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert vram.reserved_mb() == 0
+
+    @pytest.mark.asyncio
+    async def test_single_request_warm_standby_path_has_no_weights_reservation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        # LS-17 regression: a single request when a warm GPU standby worker is in
+        # the pool uses the warm standby path (already_warm=True), reserving 0 MB
+        # for weights, so it succeeds even when free VRAM (500 MB) is only enough
+        # for the card reserve (409 MB) and below cold weights + reserve (669 MB).
+        import types
+        from live_stt import session as session_mod, vram
+        from live_stt.worker import spawn_standby_sync
+        from live_stt.worker_pool import STTWorkerPool
+
+        monkeypatch.setattr(vram, "_total_mb_cache", None)
+        monkeypatch.setattr(transcribe_http.gpu, "total_vram_mb", lambda: 4096)
+        monkeypatch.setattr(transcribe_http.gpu, "free_vram_mb", lambda: 500)
+        monkeypatch.setattr(vram, "reclaim_idle_workers", lambda *a, **kw: 0)
+        monkeypatch.setattr(
+            session_mod.installer,
+            "get_active_backend",
+            lambda _db, _eng: types.SimpleNamespace(flavor="cuda", path="/fake/cuda"),
+        )
+        monkeypatch.setenv("FAKE_WORDS_PER_SEC", "50")
+
+        pool = STTWorkerPool()
+        try:
+            standby = spawn_standby_sync(
+                worker_bin=FAKE_WORKER,
+                gguf_path="/fake/realtime_eou_120m-v1-q8_0.gguf",
+                language="",
+                n_threads=1,
+                ggml_lib_dir=Path("/fake/cuda"),
+                ggml_backend_path=None,
+                use_gpu=True,
+                model_key="realtime_eou_120m-v1",
+            )
+            warm_pid = standby.proc.pid
+            pool.put(standby, timeout_sec=600.0)
+            assert pool.has_warm("realtime_eou_120m-v1", use_gpu=True)
+
+            observed_reserved: list[int] = []
+            orig_run = transcribe_http._run_transcription
+
+            async def _spy_run(*args, **kwargs):
+                observed_reserved.append(vram.reserved_mb())
+                return await orig_run(*args, **kwargs)
+
+            monkeypatch.setattr(transcribe_http, "_run_transcription", _spy_run)
+
+            body = _multipart_body(
+                {"model": "realtime_eou_120m-v1"},
+                file_field="file",
+                file_bytes=_wav_bytes(n_frames=2560),
+            )
+            settings = _settings(parakeet_backend="cuda", stt_idle_timeout_sec=600.0)
+            status, resp, _ = await transcribe_http.handle_transcribe_request(
+                content_type=CONTENT_TYPE,
+                body=body,
+                settings=settings,
+                budget=_budget(),
+                draining=False,
+                tracker=_tracker(),
+                worker_pool=pool,
+            )
+            assert status == 200, resp
+            assert json.loads(resp)["text"]
+            assert observed_reserved == [0]
+            assert vram.reserved_mb() == 0
+            standby.proc.wait(timeout=2.0)
+            assert standby.proc.pid == warm_pid
+        finally:
+            pool.close()
+
+

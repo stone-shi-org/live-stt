@@ -186,6 +186,7 @@ def handle_diarize_request(
             "incompatibility' note)"
         )
 
+    admission: vram.Admission | None = None
     if effective_settings.diarization_device == "cuda":
         # Per-model requirement + reclaim of idle warm workers (live_stt/vram.py).
         try:
@@ -208,32 +209,36 @@ def handle_diarize_request(
             metrics.diarization_requests_total.labels(outcome="rejected_vram").inc()
             return 503, {"error": {"message": admission.message("diarization")}}
 
-    with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
-        tmp.write(fields["file"])
-        tmp.flush()
-        request_id = tracker.start(device=effective_settings.diarization_device)
-        metrics.diarization_sessions_active.inc()
-        try:
-            result = diarize_file(tmp.name, settings=effective_settings, words=words)
-        except DiarizationError as exc:
-            tracker.finish(request_id, ok=False)
-            metrics.diarization_sessions_active.dec()
-            metrics.diarization_requests_total.labels(outcome="failed").inc()
-            # A missing dependency or missing/bad token is a deployment
-            # problem, not a bad request -- 503, mirroring admin_http.py's
-            # own convention of reserving non-200s for structural failure.
-            msg = str(exc)
-            status = 503 if ("not installed" in msg or "HF_TOKEN" in msg or "Failed to load" in msg) else 400
-            return status, {"error": {"message": msg}}
-        except Exception as exc:  # noqa: BLE001 -- last-resort boundary; never crash the admin thread
-            tracker.finish(request_id, ok=False)
-            metrics.diarization_sessions_active.dec()
-            metrics.diarization_requests_total.labels(outcome="failed").inc()
-            logger.exception("unexpected diarization failure")
-            return 500, {"error": {"message": f"internal error: {exc}"}}
-        else:
-            tracker.finish(request_id, ok=True)
-            metrics.diarization_sessions_active.dec()
-            metrics.diarization_requests_total.labels(outcome="ok").inc()
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
+            tmp.write(fields["file"])
+            tmp.flush()
+            request_id = tracker.start(device=effective_settings.diarization_device)
+            metrics.diarization_sessions_active.inc()
+            try:
+                result = diarize_file(tmp.name, settings=effective_settings, words=words)
+            except DiarizationError as exc:
+                tracker.finish(request_id, ok=False)
+                metrics.diarization_sessions_active.dec()
+                metrics.diarization_requests_total.labels(outcome="failed").inc()
+                # A missing dependency or missing/bad token is a deployment
+                # problem, not a bad request -- 503, mirroring admin_http.py's
+                # own convention of reserving non-200s for structural failure.
+                msg = str(exc)
+                status = 503 if ("not installed" in msg or "HF_TOKEN" in msg or "Failed to load" in msg) else 400
+                return status, {"error": {"message": msg}}
+            except Exception as exc:  # noqa: BLE001 -- last-resort boundary; never crash the admin thread
+                tracker.finish(request_id, ok=False)
+                metrics.diarization_sessions_active.dec()
+                metrics.diarization_requests_total.labels(outcome="failed").inc()
+                logger.exception("unexpected diarization failure")
+                return 500, {"error": {"message": f"internal error: {exc}"}}
+            else:
+                tracker.finish(request_id, ok=True)
+                metrics.diarization_sessions_active.dec()
+                metrics.diarization_requests_total.labels(outcome="ok").inc()
 
-    return 200, result
+        return 200, result
+    finally:
+        if admission is not None:
+            admission.release()

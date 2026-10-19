@@ -96,7 +96,8 @@ class CallSession:
             compute_needed = vram.compute_mb(self._settings, self._model_spec.key)
             if compute_needed > 0:
                 self._reserved_compute_mb = compute_needed
-                vram.reserve_active_compute(self._vram_reservation_id, compute_needed)
+                if not vram.has_admit_reservation(self._model_spec.key):
+                    vram.reserve_active_compute(self._vram_reservation_id, compute_needed)
         return asr_pb2.TranscriptionEvent(
             ready=asr_pb2.Ready(
                 model=self._model_spec.key,

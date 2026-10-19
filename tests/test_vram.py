@@ -16,8 +16,7 @@ def _no_card(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(vram, "_total_mb_cache", None)
     monkeypatch.setattr(gpu, "total_vram_mb", lambda: None)
     monkeypatch.setattr(vram, "RECLAIM_POLL_SEC", 0.0)
-    with vram._active_compute_lock:
-        vram._active_compute_reservations.clear()
+    vram.clear_reservations()
 
 
 def _s(**kw) -> Settings:
@@ -114,11 +113,11 @@ def test_tts_stop_if_idle_is_a_noop_with_no_worker() -> None:
 def test_parakeet_tdt_vram_budget_includes_window_compute_buffer(monkeypatch) -> None:
     monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
     spec = models.MODELS["parakeet-tdt-0.6b-v3"]
-    # 90s default window * 7 MB/s = 630 MB compute + 2300 MB weights = 2930 MB
+    # 90s default window * 7 MB/s = 630 MB compute + 1100 MB weights = 1730 MB
     assert vram.compute_mb(_s(), spec.key) == 630
-    assert vram.need_mb(_s(), spec.key, spec.vram_mb, 3000) == 2300 + 630
-    # On a 4 GiB Quadro P1000 (reserve 409 MB), required_mb = 3339 MB <= 4004 MB free
-    assert vram.required_mb(_s(), spec.key, spec.vram_mb, 3000) == 2930 + 409
+    assert vram.need_mb(_s(), spec.key, spec.vram_mb, 3000) == 1100 + 630
+    # On a 4 GiB Quadro P1000 (reserve 409 MB), required_mb = 2139 MB <= 4004 MB free
+    assert vram.required_mb(_s(), spec.key, spec.vram_mb, 3000) == 1730 + 409
 
     # Overriding batch_window_sec scales the compute allowance
     assert vram.compute_mb(_s(batch_window_sec=60.0), spec.key) == 420
@@ -128,7 +127,7 @@ def test_parakeet_tdt_vram_budget_includes_window_compute_buffer(monkeypatch) ->
 
 def test_admit_already_warm_only_charges_compute_buffer_and_keeps_same_model_standby(monkeypatch) -> None:
     # Quadro P1000 (4096 MB total, 409 MB reserve) with a warm TDT standby
-    # worker already holding 2300 MB of weights in VRAM -> ~1700 MB free.
+    # worker already holding 1100 MB of weights in VRAM -> ~1700 MB free.
     monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
     monkeypatch.setattr(gpu, "free_vram_mb", lambda: 1700)
     reclaimed_excludes: list[str | None] = []
@@ -139,7 +138,7 @@ def test_admit_already_warm_only_charges_compute_buffer_and_keeps_same_model_sta
     )
     spec = models.MODELS["parakeet-tdt-0.6b-v3"]
 
-    # Cold admission would need 2300 + 630 + 409 = 3339 MB > 1700 MB -> rejected
+    # Cold admission would need 1100 + 630 + 409 = 2139 MB > 1700 MB -> rejected
     cold = vram.admit(_s(), model_key=spec.key, model_mb=spec.vram_mb, fallback_mb=3000, already_warm=False)
     assert not cold.ok
 
@@ -147,14 +146,15 @@ def test_admit_already_warm_only_charges_compute_buffer_and_keeps_same_model_sta
     warm = vram.admit(_s(), model_key=spec.key, model_mb=spec.vram_mb, fallback_mb=3000, already_warm=True)
     assert warm.ok
     assert warm.required_mb == 630 + 409
+    warm.release()
 
 
 def test_can_prewarm_standby_blocks_duplicate_worker_when_active_compute_is_reserved(monkeypatch) -> None:
     # Reproduces the exact LS-14 Quadro P1000 scenario: an active TDT worker is
     # running (weights in VRAM, 1700 MB currently free before finalize() allocates
-    # its 630 MB compute buffer). Pre-warming a second standby TDT worker (2300 MB)
+    # its 630 MB compute buffer). Pre-warming a second standby TDT worker (1100 MB)
     # alongside the active 630 MB compute reservation + 409 MB reserve requires
-    # 3339 MB > 1700 MB free, so can_prewarm_standby must return False.
+    # 2139 MB > 1700 MB free, so can_prewarm_standby must return False.
     monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
     monkeypatch.setattr(gpu, "free_vram_mb", lambda: 1700)
     vram.reserve_active_compute("session-1", 630)
@@ -164,4 +164,130 @@ def test_can_prewarm_standby_blocks_duplicate_worker_when_active_compute_is_rese
     finally:
         vram.release_active_compute("session-1")
     assert vram.active_compute_mb() == 0
+
+
+def test_concurrent_admit_calls_admit_only_what_fits_before_workers_load(monkeypatch) -> None:
+    # LS-17: 22 concurrent admit() calls arrive before any worker has allocated
+    # CUDA memory (gpu.free_vram_mb() still reports the pre-load 1800 MB).
+    # With total=4096 (reserve=409), usable budget = 1800 - 409 = 1391 MB.
+    # For realtime_eou_120m-v1 (vram_mb=260), floor(1391 / 260) = 5 fit.
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
+    gpu_state = {"free": 1800}
+    monkeypatch.setattr(gpu, "free_vram_mb", lambda: gpu_state["free"])
+    monkeypatch.setattr(vram, "reclaim_idle_workers", lambda *a, **kw: 0)
+
+    spec = models.MODELS["realtime_eou_120m-v1"]
+    assert spec.vram_mb == 260
+
+    barrier = threading.Barrier(22)
+    results: list[vram.Admission] = []
+    results_lock = threading.Lock()
+
+    def _caller() -> None:
+        barrier.wait(timeout=5)
+        adm = vram.admit(_s(), model_key=spec.key, model_mb=spec.vram_mb, fallback_mb=3000)
+        with results_lock:
+            results.append(adm)
+
+    threads = [threading.Thread(target=_caller) for _ in range(22)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    admitted = [r for r in results if r.ok]
+    rejected = [r for r in results if not r.ok]
+    assert len(admitted) == 5  # floor((1800 - 409) / 260) = 5
+    assert len(rejected) == 17
+    assert vram.reserved_mb() == 5 * 260
+    assert vram.active_reservations_count() == 5
+
+    # Even after the 5 admitted workers actually load on the GPU (dropping
+    # nvidia-smi free VRAM by 5 * 260 = 1300 MB -> 500 MB), they are not
+    # double-counted, and a 6th request still does not fit (500 < 260 + 409).
+    gpu_state["free"] = 1800 - 5 * 260  # 500 MB
+    sixth = vram.admit(_s(), model_key=spec.key, model_mb=spec.vram_mb, fallback_mb=3000)
+    assert not sixth.ok
+
+    # Releasing one worker's reservation (and freeing its GPU memory) allows
+    # exactly one new request to be admitted.
+    admitted[0].release()
+    gpu_state["free"] += 260  # 760 MB
+    next_adm = vram.admit(_s(), model_key=spec.key, model_mb=spec.vram_mb, fallback_mb=3000)
+    assert next_adm.ok
+
+    # Release all remaining reservations
+    next_adm.release()
+    for r in admitted[1:]:
+        r.release()
+    assert vram.reserved_mb() == 0
+    assert vram.active_reservations_count() == 0
+
+
+def test_only_one_concurrent_request_can_claim_warm_standby_discount(monkeypatch) -> None:
+    # LS-17: If 1 warm standby worker is in the pool when a burst arrives,
+    # multiple callers may pass already_warm=True concurrently. Only the first
+    # may claim the 0-weights discount; subsequent concurrent callers must
+    # reserve cold weights because they will spawn fresh workers.
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
+    # 500 MB free: enough for 1 warm worker (0 weights + 409 reserve = 409 <= 500),
+    # not enough for a cold worker (260 weights + 409 reserve = 669 > 500).
+    monkeypatch.setattr(gpu, "free_vram_mb", lambda: 500)
+    monkeypatch.setattr(vram, "reclaim_idle_workers", lambda *a, **kw: 0)
+    spec = models.MODELS["realtime_eou_120m-v1"]
+
+    first = vram.admit(
+        _s(), model_key=spec.key, model_mb=spec.vram_mb, fallback_mb=3000, already_warm=True
+    )
+    assert first.ok
+    assert first.reserved_mb == 0
+    assert first.required_mb == 409
+
+    # Second concurrent caller passing already_warm=True cannot reuse the same
+    # single standby worker and must be gated on cold weights (669 > 500).
+    second = vram.admit(
+        _s(), model_key=spec.key, model_mb=spec.vram_mb, fallback_mb=3000, already_warm=True
+    )
+    assert not second.ok
+    assert second.required_mb == 260 + 409
+
+    # Once the first request finishes and releases its claim, a new warm request fits again.
+    first.release()
+    third = vram.admit(
+        _s(), model_key=spec.key, model_mb=spec.vram_mb, fallback_mb=3000, already_warm=True
+    )
+    assert third.ok
+    third.release()
+
+
+def test_can_prewarm_standby_accounts_for_inflight_admission_reservations(monkeypatch) -> None:
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
+    monkeypatch.setattr(gpu, "free_vram_mb", lambda: 900)
+    monkeypatch.setattr(vram, "reclaim_idle_workers", lambda *a, **kw: 0)
+    spec = models.MODELS["realtime_eou_120m-v1"]
+
+    # Before any reservation: 900 MB >= 260 + 409 = 669 MB -> standby pre-warm allowed
+    assert vram.can_prewarm_standby(_s(), model_key=spec.key) is True
+
+    # After 1 cold admission reserves 260 MB (effective free = 640 MB < 669 MB):
+    # standby pre-warm is blocked until the active request releases its reservation.
+    adm = vram.admit(_s(), model_key=spec.key, model_mb=spec.vram_mb, fallback_mb=3000)
+    assert adm.ok
+    assert vram.can_prewarm_standby(_s(), model_key=spec.key) is False
+
+    adm.release()
+    assert vram.can_prewarm_standby(_s(), model_key=spec.key) is True
+
+
+def test_warn_if_concurrency_exceeds_gpu_logs_warning(monkeypatch, caplog) -> None:
+    import logging
+    from live_stt.server import _warn_if_concurrency_exceeds_gpu
+
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
+    # 4096 - 409 reserve = 3687 MB usable -> floor(3687 / 260) = 14 workers
+    with caplog.at_level(logging.WARNING):
+        _warn_if_concurrency_exceeds_gpu(_s(parakeet_backend="cuda", max_concurrent_calls=20))
+    assert any("max_concurrent_calls=20 exceeds estimated GPU capacity" in r.message for r in caplog.records)
+
+
 

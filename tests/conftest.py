@@ -70,8 +70,11 @@ def fixtures_dir() -> str:
 
 @pytest.fixture(autouse=True)
 def _clear_worker_pool_fixture():
+    from live_stt import vram
     from live_stt.worker_pool import clear_worker_pool
 
     clear_worker_pool()
+    vram.clear_reservations()
     yield
     clear_worker_pool()
+    vram.clear_reservations()

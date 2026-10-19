@@ -9,7 +9,7 @@ import grpc
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
-from live_stt import tts
+from live_stt import gpu, models, tts, vram
 from live_stt.admin_http import serve_admin_http
 from live_stt.admission import WorkerBudget
 from live_stt.backends.upgrade_checker import run_periodic_upgrade_check
@@ -23,6 +23,38 @@ from live_stt.state import ServerState
 from live_stt import worker_pool
 
 logger = get_logger("server")
+
+
+def _warn_if_concurrency_exceeds_gpu(settings: Settings) -> None:
+    if "cuda" not in (
+        settings.parakeet_backend,
+        settings.whisper_backend,
+        settings.parakeet_tdt_backend,
+    ):
+        return
+    total_mb = gpu.total_vram_mb()
+    if not total_mb:
+        return
+    try:
+        spec = models.resolve(settings.default_model)
+    except KeyError:
+        return
+    per_worker = vram.need_mb(
+        settings, spec.key, spec.vram_mb, settings.vram_per_worker_mb
+    )
+    if per_worker <= 0:
+        return
+    usable_mb = max(0, total_mb - vram.reserve_mb(settings, total_mb=total_mb))
+    max_gpu_workers = usable_mb // per_worker
+    if settings.max_concurrent_calls > max_gpu_workers:
+        logger.warning(
+            "max_concurrent_calls=%d exceeds estimated GPU capacity for %s (~%d workers on %dMB GPU); "
+            "VRAM admission will reject excess concurrent requests with 503",
+            settings.max_concurrent_calls,
+            spec.key,
+            max_gpu_workers,
+            total_mb,
+        )
 
 
 async def serve(settings: Settings | None = None) -> None:
@@ -74,6 +106,7 @@ async def serve(settings: Settings | None = None) -> None:
         settings.default_batch_model,
         settings.max_concurrent_calls,
     )
+    _warn_if_concurrency_exceeds_gpu(settings)
 
     await server.start()
 

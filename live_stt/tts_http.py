@@ -106,6 +106,7 @@ def handle_speech_request(
     # Skipped when the warm worker already holds THIS model on the GPU: the
     # request reuses that VRAM rather than allocating more, and reclaiming would
     # only kill the very worker it is about to use.
+    admission: vram.Admission | None = None
     if settings.tts_device == "cuda" and (model_spec.measured_peak_vram_mb or 0) > 0:
         warm = tts.get_tts_worker_manager().snapshot()
         already_warm = bool(warm) and warm.get("model") == model_spec.key and warm.get("device") == "cuda"
@@ -166,6 +167,9 @@ def handle_speech_request(
                 metrics.tts_requests_total.labels(outcome="failed").inc()
                 logger.error("TTS stream synthesis failed: %s", exc)
                 raise
+            finally:
+                if admission is not None:
+                    admission.release()
 
         ct = "audio/mpeg" if response_format.lower() == "mp3" else f"audio/{response_format.lower()}"
         return 200, stream_generator(), ct, {}
@@ -200,3 +204,6 @@ def handle_speech_request(
         metrics.tts_requests_total.labels(outcome="failed").inc()
         logger.error("TTS synthesis failed: %s", exc)
         return 500, json.dumps({"error": f"TTS synthesis failed: {exc}"}).encode(), "application/json", {}
+    finally:
+        if admission is not None:
+            admission.release()

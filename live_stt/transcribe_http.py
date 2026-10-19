@@ -262,6 +262,7 @@ async def handle_transcribe_request(
         "whisper": settings.whisper_backend,
         "parakeet_tdt": settings.parakeet_tdt_backend,
     }.get(spec.engine, settings.parakeet_backend)
+    admission: vram.Admission | None = None
     if engine_backend == "cuda":
         already_warm = bool(
             worker_pool is not None
@@ -285,52 +286,56 @@ async def handle_transcribe_request(
             metrics.transcribe_requests_total.labels(outcome="rejected_vram").inc()
             return 503, _err(admission.message(spec.key)), "application/json"
 
-    if not budget.try_admit_call():
-        tracker.record_rejected_capacity()
-        metrics.transcribe_requests_total.labels(outcome="rejected_capacity").inc()
-        return 503, _err("at capacity, try again shortly"), "application/json"
-
-    # Dashboard/metrics visibility only (see live_stt/transcribe_sessions.py) --
-    # separate from budget's own admission slot, which this request already
-    # holds regardless of this tracker's bookkeeping.
-    request_id = tracker.start(model=spec.key)
-    metrics.transcribe_sessions_active.inc()
     try:
-        run_kwargs: dict[str, Any] = {}
-        if worker_pool is not None:
-            run_kwargs["worker_pool"] = worker_pool
-        text, words, total_audio_sec, worker_generations = await _run_transcription(
-            pcm, settings=settings, spec=spec, language=language, budget=budget, **run_kwargs
-        )
-    except TranscribeMemoryError as exc:
-        tracker.finish(request_id, ok=False)
-        metrics.transcribe_sessions_active.dec()
-        metrics.transcribe_requests_total.labels(outcome="failed").inc()
-        logger.error("transcription failed with OOM: %s", exc)
-        return 507, _err(str(exc)), "application/json"
-    except TranscribeUnavailableError as exc:
-        tracker.finish(request_id, ok=False)
-        metrics.transcribe_sessions_active.dec()
-        metrics.transcribe_requests_total.labels(outcome="failed").inc()
-        return 503, _err(str(exc)), "application/json"
-    except TranscribeError as exc:
-        tracker.finish(request_id, ok=False)
-        metrics.transcribe_sessions_active.dec()
-        metrics.transcribe_requests_total.labels(outcome="failed").inc()
-        logger.exception("transcription failed")
-        return 500, _err(str(exc)), "application/json"
-    except Exception as exc:  # noqa: BLE001 -- last-resort boundary; never crash the admin thread
-        tracker.finish(request_id, ok=False)
-        metrics.transcribe_sessions_active.dec()
-        metrics.transcribe_requests_total.labels(outcome="failed").inc()
-        logger.exception("unexpected transcription failure")
-        return 500, _err(f"internal error: {exc}"), "application/json"
-    else:
-        tracker.finish(request_id, ok=True)
-        metrics.transcribe_sessions_active.dec()
-        metrics.transcribe_requests_total.labels(outcome="ok").inc()
+        if not budget.try_admit_call():
+            tracker.record_rejected_capacity()
+            metrics.transcribe_requests_total.labels(outcome="rejected_capacity").inc()
+            return 503, _err("at capacity, try again shortly"), "application/json"
+
+        # Dashboard/metrics visibility only (see live_stt/transcribe_sessions.py) --
+        # separate from budget's own admission slot, which this request already
+        # holds regardless of this tracker's bookkeeping.
+        request_id = tracker.start(model=spec.key)
+        metrics.transcribe_sessions_active.inc()
+        try:
+            run_kwargs: dict[str, Any] = {}
+            if worker_pool is not None:
+                run_kwargs["worker_pool"] = worker_pool
+            text, words, total_audio_sec, worker_generations = await _run_transcription(
+                pcm, settings=settings, spec=spec, language=language, budget=budget, **run_kwargs
+            )
+        except TranscribeMemoryError as exc:
+            tracker.finish(request_id, ok=False)
+            metrics.transcribe_sessions_active.dec()
+            metrics.transcribe_requests_total.labels(outcome="failed").inc()
+            logger.error("transcription failed with OOM: %s", exc)
+            return 507, _err(str(exc)), "application/json"
+        except TranscribeUnavailableError as exc:
+            tracker.finish(request_id, ok=False)
+            metrics.transcribe_sessions_active.dec()
+            metrics.transcribe_requests_total.labels(outcome="failed").inc()
+            return 503, _err(str(exc)), "application/json"
+        except TranscribeError as exc:
+            tracker.finish(request_id, ok=False)
+            metrics.transcribe_sessions_active.dec()
+            metrics.transcribe_requests_total.labels(outcome="failed").inc()
+            logger.exception("transcription failed")
+            return 500, _err(str(exc)), "application/json"
+        except Exception as exc:  # noqa: BLE001 -- last-resort boundary; never crash the admin thread
+            tracker.finish(request_id, ok=False)
+            metrics.transcribe_sessions_active.dec()
+            metrics.transcribe_requests_total.labels(outcome="failed").inc()
+            logger.exception("unexpected transcription failure")
+            return 500, _err(f"internal error: {exc}"), "application/json"
+        else:
+            tracker.finish(request_id, ok=True)
+            metrics.transcribe_sessions_active.dec()
+            metrics.transcribe_requests_total.labels(outcome="ok").inc()
+        finally:
+            budget.release_call()
     finally:
-        budget.release_call()
+        if admission is not None:
+            admission.release()
 
     logger.info(
         "http-transcribe model=%s worker_generations=%d audio_sec=%.1f words=%d",
