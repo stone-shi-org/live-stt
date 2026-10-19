@@ -105,10 +105,8 @@ setup_venv() {
 run_native() {
     banner "pytest -m \"$MARK_EXPR\""
     setup_venv || return 1
-    if [ ! -d "live_stt/pb" ]; then
-        echo "--> Generating protobuf stubs"
-        bash scripts/gen_proto.sh || return 1
-    fi
+    echo "--> Generating protobuf stubs"
+    VENV_PYTHON="$VENV_PYTHON" bash scripts/gen_proto.sh || return 1
     "$VENV_PYTHON" -m pytest tests/ -v \
         -m "$MARK_EXPR" \
         --junitxml="$REPORT_DIR/unit-results.xml" \

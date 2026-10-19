@@ -21,8 +21,10 @@ PB_DIR="live_stt/pb"
 # Prefer the project venv (see test.sh) -- grpc_tools is not on the system
 # python's path, and cp314 wheel coverage for grpcio-tools is recent enough
 # that a stray system python may not have it either.
-PYTHON="python3"
-[ -x "venv/bin/python" ] && PYTHON="venv/bin/python"
+PYTHON="${VENV_PYTHON:-python3}"
+if [ -z "${VENV_PYTHON:-}" ] && [ -x "venv/bin/python" ]; then
+    PYTHON="venv/bin/python"
+fi
 
 rm -rf "$PB_DIR"
 mkdir -p "$PB_DIR"
