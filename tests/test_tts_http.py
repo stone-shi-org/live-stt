@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import sys
+import threading
 import time
 import types
 import urllib.error
 import urllib.request
+from pathlib import Path
 import pytest
 
-from live_stt import gpu, tts_http
+from live_stt import gpu, tts, tts_http
 from live_stt.admin_http import serve_admin_http
 from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
@@ -57,6 +60,28 @@ def _install_fake_kokoro(monkeypatch: pytest.MonkeyPatch) -> None:
 
     fake_kokoro.KPipeline = _FakeKPipeline  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "kokoro", fake_kokoro)
+
+
+def _install_fake_piper(monkeypatch: pytest.MonkeyPatch, models_dir: Path) -> None:
+    """Install a deterministic fake piper module and voice file so HTTP tests
+    can exercise the real piper-en-us code path without the runtime-installed
+    piper-tts dependency or model weights."""
+    fake_piper = types.ModuleType("piper")
+
+    class _FakePiperVoice:
+        @classmethod
+        def load(cls, model_path: str, use_cuda: bool = False):
+            return cls()
+
+        def synthesize(self, text: str, syn_config=None):
+            # Deterministic 16-bit PCM bytes whose length depends on the sentence
+            n_samples = max(64, len(text) * 16)
+            pcm = (b"\x12\x34" * n_samples)
+            return [types.SimpleNamespace(audio_int16_bytes=pcm)]
+
+    fake_piper.PiperVoice = _FakePiperVoice  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "piper", fake_piper)
+    (models_dir / "en_US-lessac-medium.onnx").write_bytes(b"fake-onnx")
 
 
 def test_missing_input_returns_400() -> None:
@@ -200,11 +225,162 @@ def test_happy_path_streaming(monkeypatch: pytest.MonkeyPatch) -> None:
         tracker=tracker,
     )
     assert status == 200
-    assert headers.get("Transfer-Encoding") == "chunked"
+    assert "Transfer-Encoding" not in headers
     chunks = list(generator)
     assert len(chunks) == 2
     assert tracker.completed_total == 1
     assert tracker.active == 0
+
+
+def _raw_http_post_speech(port: int, payload: dict) -> tuple[bytes, bytes]:
+    """Send a raw HTTP POST to /v1/audio/speech over a TCP socket and read all
+    bytes until the server closes the connection. Returns (raw_headers, raw_body)."""
+    body = json.dumps(payload).encode("utf-8")
+    req = (
+        f"POST /v1/audio/speech HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"\r\n"
+    ).encode("ascii") + body
+
+    chunks: list[bytes] = []
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+        sock.sendall(req)
+        while True:
+            data = sock.recv(65536)
+            if not data:
+                break
+            chunks.append(data)
+
+    raw = b"".join(chunks)
+    sep = b"\r\n\r\n"
+    idx = raw.find(sep)
+    assert idx != -1, f"missing HTTP header terminator in raw response: {raw[:200]!r}"
+    return raw[:idx], raw[idx + len(sep) :]
+
+
+@pytest.mark.parametrize("model_key", ["kokoro-82m-v1", "piper-en-us"])
+def test_live_http_server_streaming_raw_socket_matches_batch_without_chunk_framing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model_key: str
+) -> None:
+    """LS-16: On HTTP/1.0, streaming TTS must not send Transfer-Encoding: chunked
+    or write hex chunk markers ({len:X}\\r\\n ... \\r\\n0\\r\\n\\r\\n) into the wire body.
+    For both kokoro and piper across a multi-chunk (multi-sentence) stream, the raw
+    wire body must be byte-for-byte identical to stream=false and have 16-bit PCM
+    frame alignment (even byte length)."""
+    _install_fake_kokoro(monkeypatch)
+    _install_fake_piper(monkeypatch, tmp_path)
+
+    settings = Settings(_env_file=None, tts_in_subprocess=False, models_dir=str(tmp_path))
+    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+        multi_sentence_input = "First sentence here. Second sentence follows! Third sentence ends."
+
+        batch_headers, batch_body = _raw_http_post_speech(
+            port,
+            {
+                "input": multi_sentence_input,
+                "model": model_key,
+                "response_format": "pcm",
+                "stream": False,
+            },
+        )
+        stream_headers, stream_body = _raw_http_post_speech(
+            port,
+            {
+                "input": multi_sentence_input,
+                "model": model_key,
+                "response_format": "pcm",
+                "stream": True,
+            },
+        )
+
+        headers_text = stream_headers.decode("iso-8859-1")
+        assert headers_text.startswith("HTTP/1.0 200 OK")
+        assert "transfer-encoding" not in headers_text.lower()
+        assert "content-length" not in headers_text.lower()
+        assert "content-type: audio/pcm" in headers_text.lower()
+
+        assert len(stream_body) > 0
+        assert len(stream_body) % 2 == 0, f"unaligned 16-bit PCM byte length: {len(stream_body)}"
+        assert stream_body == batch_body
+        assert not stream_body.endswith(b"0\r\n\r\n")
+    finally:
+        server.shutdown()
+
+
+def test_live_http_server_streaming_delivers_audio_progressively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LS-16 regression: raw HTTP/1.0 streaming must still flush each synthesized
+    sentence chunk immediately so the client receives the first audio bytes before
+    synthesis of subsequent chunks finishes."""
+    chunk1_bytes = b"\x01\x02" * 500
+    chunk2_bytes = b"\x03\x04" * 600
+    chunk1_sent = threading.Event()
+    allow_chunk2 = threading.Event()
+
+    def slow_synthesize_stream(*args, **kwargs):
+        yield chunk1_bytes
+        chunk1_sent.set()
+        assert allow_chunk2.wait(timeout=5.0), "timed out waiting for test to release chunk 2"
+        yield chunk2_bytes
+
+    monkeypatch.setattr(tts, "synthesize_stream", slow_synthesize_stream)
+
+    settings = Settings(_env_file=None, tts_in_subprocess=False)
+    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+        body = json.dumps(
+            {"input": "First sentence. Second sentence.", "stream": True, "response_format": "pcm"}
+        ).encode("utf-8")
+        req = (
+            f"POST /v1/audio/speech HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{port}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"\r\n"
+        ).encode("ascii") + body
+
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(req)
+            assert chunk1_sent.wait(timeout=5.0), "first chunk was never yielded"
+
+            # Read while chunk 2 synthesis is still blocked on allow_chunk2
+            received = b""
+            sep = b"\r\n\r\n"
+            while True:
+                part = sock.recv(65536)
+                assert part, "socket closed prematurely before chunk 1 arrived"
+                received += part
+                idx = received.find(sep)
+                if idx != -1 and len(received) - (idx + len(sep)) >= len(chunk1_bytes):
+                    break
+
+            idx = received.find(sep)
+            early_body = received[idx + len(sep) :]
+            assert early_body == chunk1_bytes
+            assert not allow_chunk2.is_set()
+
+            # Now release chunk 2 and read until EOF
+            allow_chunk2.set()
+            rest: list[bytes] = []
+            while True:
+                part = sock.recv(65536)
+                if not part:
+                    break
+                rest.append(part)
+
+            full_body = early_body + b"".join(rest)
+            assert full_body == chunk1_bytes + chunk2_bytes
+    finally:
+        allow_chunk2.set()
+        server.shutdown()
 
 
 @pytest.mark.asyncio

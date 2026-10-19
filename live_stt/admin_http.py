@@ -3250,18 +3250,24 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     tracker=state.tts_sessions,
                     draining=state.draining,
                 )
-                if headers.get("Transfer-Encoding") == "chunked" and hasattr(response_data, "__iter__") and not isinstance(response_data, (bytes, bytearray)):
+                if hasattr(response_data, "__iter__") and not isinstance(response_data, (bytes, bytearray)):
+                    # BaseHTTPRequestHandler defaults to protocol_version = "HTTP/1.0".
+                    # Chunked transfer encoding is not defined for HTTP/1.0, so reverse
+                    # proxies drop Transfer-Encoding and forward raw chunk markers as
+                    # response body bytes into the audio stream (LS-16). Standard HTTP/1.0
+                    # streaming omits Content-Length and Transfer-Encoding, flushes raw
+                    # audio chunks as produced, and closes the connection when finished.
+                    self.close_connection = True
                     self.send_response(status)
                     self.send_header("Content-Type", resp_content_type)
-                    self.send_header("Transfer-Encoding", "chunked")
+                    for hdr_key, hdr_val in headers.items():
+                        self.send_header(hdr_key, hdr_val)
                     self.end_headers()
                     try:
                         for chunk in response_data:
                             if chunk:
-                                self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii") + chunk + b"\r\n")
+                                self.wfile.write(chunk)
                                 self.wfile.flush()
-                        self.wfile.write(b"0\r\n\r\n")
-                        self.wfile.flush()
                     except Exception:
                         pass
                 else:

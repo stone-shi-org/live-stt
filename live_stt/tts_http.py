@@ -168,7 +168,7 @@ def handle_speech_request(
                 raise
 
         ct = "audio/mpeg" if response_format.lower() == "mp3" else f"audio/{response_format.lower()}"
-        return 200, stream_generator(), ct, {"Transfer-Encoding": "chunked"}
+        return 200, stream_generator(), ct, {}
 
     try:
         audio_bytes, ct = tts.synthesize(
