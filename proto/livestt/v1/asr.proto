@@ -195,4 +195,8 @@ message ServerInfoResponse {
   uint32 max_concurrent_calls = 8;
   uint32 active_calls = 9;
   uint32 warm_spares = 10;
+  // Effective concurrency ceiling for default_model: min(max_concurrent_calls,
+  // max_calls_that_fit_in_gpu_vram_budget) when parakeet_backend is "cuda" and
+  // GPU VRAM is known, otherwise max_concurrent_calls (LS-18).
+  uint32 effective_max_concurrent_calls = 11;
 }

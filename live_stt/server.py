@@ -26,34 +26,24 @@ logger = get_logger("server")
 
 
 def _warn_if_concurrency_exceeds_gpu(settings: Settings) -> None:
-    if "cuda" not in (
-        settings.parakeet_backend,
-        settings.whisper_backend,
-        settings.parakeet_tdt_backend,
-    ):
+    cap = vram.gpu_capacity(settings)
+    if not cap:
         return
-    total_mb = gpu.total_vram_mb()
-    if not total_mb:
+    default_key = settings.default_model or models.DEFAULT_MODEL_KEY
+    model_cap = cap["models"].get(default_key)
+    if model_cap is None:
         return
-    try:
-        spec = models.resolve(settings.default_model)
-    except KeyError:
-        return
-    per_worker = vram.need_mb(
-        settings, spec.key, spec.vram_mb, settings.vram_per_worker_mb
-    )
-    if per_worker <= 0:
-        return
-    usable_mb = max(0, total_mb - vram.reserve_mb(settings, total_mb=total_mb))
-    max_gpu_workers = usable_mb // per_worker
-    if settings.max_concurrent_calls > max_gpu_workers:
+    if settings.max_concurrent_calls > model_cap["effective_max_calls"]:
         logger.warning(
-            "max_concurrent_calls=%d exceeds estimated GPU capacity for %s (~%d workers on %dMB GPU); "
-            "VRAM admission will reject excess concurrent requests with 503",
+            "max_concurrent_calls=%d exceeds estimated GPU capacity: "
+            "max_concurrent_calls=%d but only %d %s calls fit in %dMB VRAM "
+            "(per_call_mb=%d); VRAM admission will reject excess concurrent requests with 503",
             settings.max_concurrent_calls,
-            spec.key,
-            max_gpu_workers,
-            total_mb,
+            settings.max_concurrent_calls,
+            model_cap["max_calls"],
+            default_key,
+            cap["budget_mb"],
+            model_cap["per_call_mb"],
         )
 
 

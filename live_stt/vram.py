@@ -36,10 +36,18 @@ treated as "zero free".
    ``try/finally`` when the call ends. Concurrent requests arriving in a burst
    see earlier requests' reservations immediately, before their workers have
    allocated on the GPU.
+5. **Effective GPU capacity reporting (LS-18).** ``gpu_capacity()`` and
+   ``effective_max_calls()`` expose how many concurrent calls of each
+   GPU-backed ASR model fit in ``budget_mb = total_vram_mb - reserve_mb`` using
+   the exact same cold-worker figures ``admit()`` uses. These are static
+   idle-card estimates (live free VRAM on a shared card can be lower, and a
+   warm standby worker reduces a single call's weight allocation); ``admit()``
+   remains authoritative at request time.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 import logging
 import math
 import threading
@@ -99,16 +107,34 @@ def reserve_mb(settings: Any, total_mb: int | None = None) -> int:
     return max(floor, int(total * float(settings.vram_reserve_pct) / 100.0))
 
 
-def effective_batch_window_sec(settings: Any, model_key: str) -> float:
+def model_backend(settings: Any, spec: models.ModelSpec) -> str:
+    """Return the configured backend ('cpu' or 'cuda') for ASR model ``spec``."""
+    if spec.engine == "whisper":
+        return str(getattr(settings, "whisper_backend", "cpu"))
+    if spec.engine == "parakeet_tdt":
+        return str(getattr(settings, "parakeet_tdt_backend", "cpu"))
+    return str(getattr(settings, "parakeet_backend", "cpu"))
+
+
+def effective_batch_window_sec(
+    settings: Any, model_key: str, *, spec: models.ModelSpec | None = None
+) -> float:
     """Effective batch inference window size (seconds) for ``model_key``."""
     override = getattr(settings, "batch_window_sec", None)
     if override is not None:
         return float(override)
-    spec = models.MODELS.get(model_key)
+    if spec is None:
+        spec = models.MODELS.get(model_key)
     return float(spec.batch_window_sec) if spec is not None else 0.0
 
 
-def compute_mb(settings: Any, model_key: str, *, audio_sec: float | None = None) -> int:
+def compute_mb(
+    settings: Any,
+    model_key: str,
+    *,
+    audio_sec: float | None = None,
+    spec: models.ModelSpec | None = None,
+) -> int:
     """Per-window CUDA compute buffer allowance for ``model_key`` (MiB).
 
     For batch engines whose compute graph scales with window duration
@@ -117,10 +143,11 @@ def compute_mb(settings: Any, model_key: str, *, audio_sec: float | None = None)
     window). When windowing is disabled (``window_sec == 0``), compute memory
     scales with the full ``audio_sec``.
     """
-    spec = models.MODELS.get(model_key)
+    if spec is None:
+        spec = models.MODELS.get(model_key)
     if spec is None or spec.vram_compute_mb_per_sec <= 0:
         return 0
-    window_sec = effective_batch_window_sec(settings, model_key)
+    window_sec = effective_batch_window_sec(settings, model_key, spec=spec)
     if window_sec > 0:
         span_sec = min(audio_sec, window_sec) if audio_sec is not None else window_sec
     else:
@@ -144,13 +171,18 @@ def need_mb(
     *,
     audio_sec: float | None = None,
     include_weights: bool = True,
+    spec: models.ModelSpec | None = None,
 ) -> int:
     """VRAM one instance of ``model_key`` needs (weights + per-window compute), before the reserve."""
     override = (settings.vram_overrides or {}).get(model_key)
     if override is not None:
-        return int(override) if include_weights else compute_mb(settings, model_key, audio_sec=audio_sec)
+        return (
+            int(override)
+            if include_weights
+            else compute_mb(settings, model_key, audio_sec=audio_sec, spec=spec)
+        )
     base = (int(model_mb) if model_mb else int(fallback_mb)) if include_weights else 0
-    return base + compute_mb(settings, model_key, audio_sec=audio_sec)
+    return base + compute_mb(settings, model_key, audio_sec=audio_sec, spec=spec)
 
 
 def required_mb(
@@ -161,6 +193,7 @@ def required_mb(
     *,
     audio_sec: float | None = None,
     include_weights: bool = True,
+    spec: models.ModelSpec | None = None,
 ) -> int:
     return (
         need_mb(
@@ -170,6 +203,7 @@ def required_mb(
             fallback_mb,
             audio_sec=audio_sec,
             include_weights=include_weights,
+            spec=spec,
         )
         + reserve_mb(settings)
     )
@@ -192,9 +226,10 @@ def _compute_requirement_locked(
     fallback_mb: int,
     audio_sec: float | None,
     already_warm: bool,
+    spec: models.ModelSpec | None = None,
 ) -> tuple[int, int, int]:
     """Return ``(weights_needed_mb, compute_needed_mb, required_total_mb)``."""
-    c_mb = compute_mb(settings, model_key, audio_sec=audio_sec)
+    c_mb = compute_mb(settings, model_key, audio_sec=audio_sec, spec=spec)
     if already_warm:
         w_mb = 0
     else:
@@ -205,10 +240,41 @@ def _compute_requirement_locked(
             fallback_mb,
             audio_sec=audio_sec,
             include_weights=True,
+            spec=spec,
         )
         w_mb = max(0, total_need - c_mb)
     required = w_mb + c_mb + reserve_mb(settings)
     return w_mb, c_mb, required
+
+
+def per_call_mb(
+    settings: Any,
+    model_key: str,
+    model_mb: int | None = None,
+    fallback_mb: int | None = None,
+    *,
+    audio_sec: float | None = None,
+    spec: models.ModelSpec | None = None,
+) -> int:
+    """VRAM (MiB) reserved by ``admit()`` for one cold call of ``model_key``
+    (weights + active-window compute allowance, excluding the card reserve).
+    """
+    if spec is None:
+        spec = models.MODELS.get(model_key)
+    if model_mb is None and spec is not None:
+        model_mb = spec.vram_mb
+    if fallback_mb is None:
+        fallback_mb = int(getattr(settings, "vram_per_worker_mb", 3000))
+    w_mb, c_mb, _ = _compute_requirement_locked(
+        settings,
+        model_key=model_key,
+        model_mb=model_mb,
+        fallback_mb=fallback_mb,
+        audio_sec=audio_sec,
+        already_warm=False,
+        spec=spec,
+    )
+    return w_mb + c_mb
 
 
 def _effective_free_locked(live_free: int, *, pre_reclaim_free: int | None = None) -> int:
@@ -292,11 +358,105 @@ def has_admit_reservation(model_key: str | None = None) -> bool:
 
 def clear_reservations() -> None:
     """Clear all active VRAM reservations (used by test fixtures)."""
-    global _baseline_free_mb
+    global _baseline_free_mb, _total_mb_cache
     with _lock:
         _reservations.clear()
         _active_compute_reservations.clear()
         _baseline_free_mb = None
+        _total_mb_cache = None
+
+
+def gpu_capacity(
+    settings: Any,
+    *,
+    model_specs: Mapping[str, models.ModelSpec] | Iterable[models.ModelSpec] | None = None,
+    total_mb: int | None = None,
+) -> dict[str, Any] | None:
+    """Estimate concurrent call capacity per GPU-backed ASR model on an idle card (LS-18).
+
+    - ``budget_mb`` = ``total_vram_mb - reserve_mb``.
+    - ``reserved_mb`` = currently active admission + compute reservations.
+    - ``per_call_mb`` = what ``admit()`` reserves for one cold call (weights + window compute).
+    - ``max_calls`` = ``floor(budget_mb / per_call_mb)``.
+    - ``effective_max_calls`` = ``min(max_calls, max_concurrent_calls)``.
+
+    Only GPU-backed models are included. Returns ``None`` when no ASR model is
+    on a CUDA backend or when total GPU VRAM is unavailable.
+    Estimates assume an idle card and cold workers; ``vram.admit()`` remains
+    authoritative at admission time.
+    """
+    specs_iter: Iterable[models.ModelSpec]
+    if model_specs is None:
+        specs_list = [
+            spec for spec in models.MODELS.values() if model_backend(settings, spec) == "cuda"
+        ]
+    else:
+        specs_iter = (
+            model_specs.values() if isinstance(model_specs, Mapping) else model_specs
+        )
+        any_cuda_configured = "cuda" in (
+            getattr(settings, "parakeet_backend", "cpu"),
+            getattr(settings, "whisper_backend", "cpu"),
+            getattr(settings, "parakeet_tdt_backend", "cpu"),
+        )
+        if any_cuda_configured:
+            specs_list = [spec for spec in specs_iter if model_backend(settings, spec) == "cuda"]
+        else:
+            specs_list = list(specs_iter)
+
+    if not specs_list:
+        return None
+
+    total = total_mb if total_mb is not None else _total_mb()
+    if not total or total <= 0:
+        return None
+
+    budget = max(0, int(total) - reserve_mb(settings, total_mb=int(total)))
+    max_concurrent = int(getattr(settings, "max_concurrent_calls", 1))
+    fallback = int(getattr(settings, "vram_per_worker_mb", 3000))
+
+    models_doc: dict[str, dict[str, int]] = {}
+    for spec in specs_list:
+        call_mb = per_call_mb(
+            settings,
+            spec.key,
+            spec.vram_mb,
+            fallback,
+            spec=spec,
+        )
+        max_calls = (budget // call_mb) if call_mb > 0 else max_concurrent
+        eff_max = min(max_calls, max_concurrent)
+        models_doc[spec.key] = {
+            "per_call_mb": call_mb,
+            "max_calls": max_calls,
+            "effective_max_calls": eff_max,
+        }
+
+    return {
+        "budget_mb": budget,
+        "reserved_mb": reserved_mb(),
+        "models": models_doc,
+    }
+
+
+def effective_max_calls(
+    settings: Any,
+    model_key: str | None = None,
+    *,
+    total_mb: int | None = None,
+) -> int | None:
+    """Return ``effective_max_calls`` for ``model_key`` (defaults to
+    ``settings.default_model``) when backed by CUDA and GPU VRAM is known,
+    else ``None``.
+    """
+    key = model_key or getattr(settings, "default_model", None) or models.DEFAULT_MODEL_KEY
+    cap = gpu_capacity(settings, total_mb=total_mb)
+    if cap is None:
+        return None
+    entry = cap["models"].get(key)
+    if entry is None:
+        return None
+    return entry["effective_max_calls"]
 
 
 def reserve_active_compute(token_id: str, mb: int) -> None:

@@ -77,7 +77,27 @@ async def test_get_server_info_reports_configured_defaults() -> None:
             info = await stub.GetServerInfo(asr_pb2.ServerInfoRequest())
     assert info.default_model == "realtime_eou_120m-v1"
     assert info.max_concurrent_calls == 5
+    assert info.effective_max_concurrent_calls == 5
     assert info.active_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_get_server_info_reports_effective_max_concurrent_calls_on_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from live_stt import gpu, vram
+
+    monkeypatch.setattr(vram, "_total_mb_cache", None)
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
+
+    settings = _settings(parakeet_backend="cuda", max_concurrent_calls=20)
+    async with _Server(settings) as server:
+        async with server.channel() as channel:
+            stub = asr_pb2_grpc.StreamingASRStub(channel)
+            info = await stub.GetServerInfo(asr_pb2.ServerInfoRequest())
+    assert info.max_concurrent_calls == 20
+    assert info.effective_max_concurrent_calls == 14
+    assert info.effective_max_concurrent_calls == vram.effective_max_calls(settings)
 
 
 @pytest.mark.asyncio

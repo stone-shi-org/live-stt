@@ -21,6 +21,7 @@ import asyncio
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 from prometheus_client import generate_latest
 
@@ -3033,6 +3034,14 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
             elif self.path == "/api/health":
                 status = state.health_status()
                 http_status = 200 if status == "ok" else 503
+                capacity_doc: dict[str, Any] = {
+                    "used": state.budget.active_calls,
+                    "total": state.settings.max_concurrent_calls,
+                    "admitting": status == "ok",
+                }
+                effective_total = vram.effective_max_calls(state.settings)
+                if effective_total is not None:
+                    capacity_doc["effective_total"] = effective_total
                 self._write_json(
                     http_status,
                     {
@@ -3054,11 +3063,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         },
                         "model": state.settings.default_model,
                         "batch_model": state.settings.default_batch_model,
-                        "capacity": {
-                            "used": state.budget.active_calls,
-                            "total": state.settings.max_concurrent_calls,
-                            "admitting": status == "ok",
-                        },
+                        "capacity": capacity_doc,
                     },
                 )
             elif self.path == "/api/version":
@@ -3066,6 +3071,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
             elif self.path == "/api/stats":
                 diar = state.diarization_sessions
                 xscribe = state.transcribe_sessions
+                gpu_snap = gpu.snapshot()
                 self._write_json(
                     200,
                     {
@@ -3079,7 +3085,18 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         # live_stt/gpu.py's snapshot() docstring.
                         # reserve_mb: the headroom VRAM admission keeps free on top of
                         # each model's own figure (live_stt/vram.py) -- card-relative.
-                        "gpu": {**gpu.snapshot(), "reserve_mb": vram.reserve_mb(state.settings)},
+                        "gpu": {
+                            **gpu_snap,
+                            "reserve_mb": vram.reserve_mb(
+                                state.settings, total_mb=gpu_snap["total_vram_mb"]
+                            ),
+                        },
+                        # LS-18: effective per-model GPU call capacity based on
+                        # calibrated cold-worker VRAM figures and budget_mb.
+                        # None on CPU backends or when nvidia-smi is unavailable.
+                        "gpu_capacity": vram.gpu_capacity(
+                            state.settings, total_mb=gpu_snap["total_vram_mb"]
+                        ),
                         "diarization": {
                             "active": diar.active,
                             "completed_total": diar.completed_total,

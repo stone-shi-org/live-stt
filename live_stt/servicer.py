@@ -49,11 +49,13 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
         self, request: asr_pb2.ServerInfoRequest, context: grpc.aio.ServicerContext
     ) -> asr_pb2.ServerInfoResponse:
         version = __about__.info()
+        default_model = self._settings.default_model or models.DEFAULT_MODEL_KEY
+        eff_max = vram.effective_max_calls(self._settings, default_model)
         return asr_pb2.ServerInfoResponse(
             version=version["hash"],
             built_at=version["timestamp"],
             parakeet_ref=version["parakeet_ref"],
-            default_model=self._settings.default_model or models.DEFAULT_MODEL_KEY,
+            default_model=default_model,
             # ServerInfoResponse.backend is a single proto field (a schema
             # change to make it per-engine wasn't warranted for LS-5) --
             # reports parakeet_backend specifically, since GetServerInfo is
@@ -63,6 +65,9 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
             # check below).
             backend=self._settings.parakeet_backend,
             max_concurrent_calls=self._settings.max_concurrent_calls,
+            effective_max_concurrent_calls=(
+                eff_max if eff_max is not None else self._settings.max_concurrent_calls
+            ),
             active_calls=self._budget.active_calls,
             warm_spares=0,  # no PRE-warmed pool -- shadows are spawned on demand at rotation time
         )

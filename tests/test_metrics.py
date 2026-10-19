@@ -291,6 +291,93 @@ async def test_stats_json_endpoint_includes_gpu_and_diarization() -> None:
             "standby_count": 0,
         }
         assert doc["warmed_workers"] == []
+        assert doc["gpu_capacity"] is None
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_health_and_stats_gpu_capacity_on_gpu_vs_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    import json
+    from live_stt import gpu, vram
+
+    monkeypatch.setattr(vram, "_total_mb_cache", None)
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
+    monkeypatch.setattr(gpu, "free_vram_mb", lambda: 4000)
+    monkeypatch.setattr(gpu, "used_vram_mb", lambda: 96)
+    monkeypatch.setattr(gpu, "utilization_pct", lambda: 0)
+
+    # 1. CPU backends: gpu_capacity is None, health capacity omits effective_total.
+    cpu_settings = Settings(
+        _env_file=None,
+        parakeet_backend="cpu",
+        whisper_backend="cpu",
+        parakeet_tdt_backend="cpu",
+        max_concurrent_calls=20,
+    )
+    cpu_state = ServerState(
+        settings=cpu_settings,
+        budget=WorkerBudget(cpu_settings.max_concurrent_calls, cpu_settings.reserve_slots),
+    )
+    server = serve_admin_http("127.0.0.1", 0, cpu_state)
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=5) as resp:
+            health_doc = json.loads(resp.read().decode())
+        assert health_doc["capacity"] == {"used": 0, "total": 20, "admitting": True}
+        assert "effective_total" not in health_doc["capacity"]
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=5) as resp:
+            stats_doc = json.loads(resp.read().decode())
+        assert stats_doc["gpu_capacity"] is None
+    finally:
+        server.shutdown()
+
+    # 2. GPU backends: /api/health has capacity.effective_total and /api/stats has gpu_capacity.
+    gpu_settings = Settings(
+        _env_file=None,
+        parakeet_backend="cuda",
+        parakeet_tdt_backend="cuda",
+        whisper_backend="cpu",
+        max_concurrent_calls=20,
+    )
+    gpu_state = ServerState(
+        settings=gpu_settings,
+        budget=WorkerBudget(gpu_settings.max_concurrent_calls, gpu_settings.reserve_slots),
+    )
+    server = serve_admin_http("127.0.0.1", 0, gpu_state)
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=5) as resp:
+            health_doc = json.loads(resp.read().decode())
+        assert health_doc["capacity"] == {
+            "used": 0,
+            "total": 20,
+            "effective_total": 14,
+            "admitting": True,
+        }
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=5) as resp:
+            stats_doc = json.loads(resp.read().decode())
+        gpu_cap = stats_doc["gpu_capacity"]
+        assert gpu_cap is not None
+        assert gpu_cap["budget_mb"] == 3687
+        assert gpu_cap["reserved_mb"] == 0
+        assert gpu_cap["models"]["realtime_eou_120m-v1"] == {
+            "per_call_mb": 260,
+            "max_calls": 14,
+            "effective_max_calls": 14,
+        }
+        assert gpu_cap["models"]["parakeet-tdt-0.6b-v3"] == {
+            "per_call_mb": 1730,
+            "max_calls": 2,
+            "effective_max_calls": 2,
+        }
+        assert "whisper-base.en-q8_0" not in gpu_cap["models"]
+        assert (
+            health_doc["capacity"]["effective_total"]
+            == gpu_cap["models"][gpu_settings.default_model]["effective_max_calls"]
+        )
     finally:
         server.shutdown()
 

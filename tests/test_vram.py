@@ -288,6 +288,143 @@ def test_warn_if_concurrency_exceeds_gpu_logs_warning(monkeypatch, caplog) -> No
     with caplog.at_level(logging.WARNING):
         _warn_if_concurrency_exceeds_gpu(_s(parakeet_backend="cuda", max_concurrent_calls=20))
     assert any("max_concurrent_calls=20 exceeds estimated GPU capacity" in r.message for r in caplog.records)
+    assert any(
+        "max_concurrent_calls=20 but only 14 realtime_eou_120m-v1 calls fit in 3687MB VRAM" in r.message
+        for r in caplog.records
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _warn_if_concurrency_exceeds_gpu(_s(parakeet_backend="cuda", max_concurrent_calls=14))
+        _warn_if_concurrency_exceeds_gpu(_s(parakeet_backend="cpu", max_concurrent_calls=20))
+    assert not caplog.records
+
+
+def test_gpu_capacity_reports_expected_figures_and_agrees_with_admit_burst(monkeypatch) -> None:
+    # LS-18: On a 4096 MB card (reserve 409 MB -> budget 3687 MB):
+    # - realtime_eou_120m-v1: per_call_mb = 260, max_calls = 14, effective_max_calls = 14 (with max_concurrent_calls=20)
+    # - parakeet-tdt-0.6b-v3: per_call_mb = 1100 + 630 = 1730, max_calls = 2, effective_max_calls = 2
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
+    monkeypatch.setattr(gpu, "free_vram_mb", lambda: 4096)
+    monkeypatch.setattr(vram, "reclaim_idle_workers", lambda *a, **kw: 0)
+
+    s = _s(
+        parakeet_backend="cuda",
+        parakeet_tdt_backend="cuda",
+        whisper_backend="cpu",
+        max_concurrent_calls=20,
+    )
+    cap = vram.gpu_capacity(s)
+    assert cap is not None
+    assert cap["budget_mb"] == 3687
+    assert cap["reserved_mb"] == 0
+    # Only GPU-backed models are included (whisper_backend="cpu" is omitted).
+    assert "realtime_eou_120m-v1" in cap["models"]
+    assert "parakeet-tdt-0.6b-v3" in cap["models"]
+    assert "whisper-base.en-q8_0" not in cap["models"]
+
+    eou_cap = cap["models"]["realtime_eou_120m-v1"]
+    assert eou_cap == {
+        "per_call_mb": 260,
+        "max_calls": 14,
+        "effective_max_calls": 14,
+    }
+    tdt_cap = cap["models"]["parakeet-tdt-0.6b-v3"]
+    assert tdt_cap == {
+        "per_call_mb": 1730,
+        "max_calls": 2,
+        "effective_max_calls": 2,
+    }
+    assert vram.effective_max_calls(s) == 14
+
+    # When max_concurrent_calls < max_calls, effective_max_calls is clamped to max_concurrent_calls.
+    s_capped = _s(parakeet_backend="cuda", max_concurrent_calls=8)
+    cap_capped = vram.gpu_capacity(s_capped)
+    assert cap_capped is not None
+    assert cap_capped["models"]["realtime_eou_120m-v1"]["max_calls"] == 14
+    assert cap_capped["models"]["realtime_eou_120m-v1"]["effective_max_calls"] == 8
+    assert vram.effective_max_calls(s_capped) == 8
+
+    # Verify agreement with vram.admit() in a concurrent burst of N + 1 (15 calls):
+    spec = models.MODELS["realtime_eou_120m-v1"]
+    n_burst = eou_cap["max_calls"] + 1  # 15
+    barrier = threading.Barrier(n_burst)
+    results: list[vram.Admission] = []
+    results_lock = threading.Lock()
+
+    def _caller() -> None:
+        barrier.wait(timeout=5)
+        adm = vram.admit(s, model_key=spec.key, model_mb=spec.vram_mb, fallback_mb=s.vram_per_worker_mb)
+        with results_lock:
+            results.append(adm)
+
+    threads = [threading.Thread(target=_caller) for _ in range(n_burst)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    admitted = [r for r in results if r.ok]
+    rejected = [r for r in results if not r.ok]
+    assert len(admitted) == eou_cap["max_calls"] == 14
+    assert len(rejected) == 1
+
+    active_cap = vram.gpu_capacity(s)
+    assert active_cap is not None
+    assert active_cap["reserved_mb"] == 14 * eou_cap["per_call_mb"]
+
+    for r in admitted:
+        r.release()
+    assert vram.gpu_capacity(s)["reserved_mb"] == 0
+
+
+def test_gpu_capacity_with_custom_model_specs_and_cpu_none(monkeypatch) -> None:
+    # On CPU backends or when no GPU is visible, gpu_capacity and effective_max_calls return None.
+    assert vram.gpu_capacity(_s(parakeet_backend="cuda")) is None  # total_vram_mb is None
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
+    assert vram.gpu_capacity(_s(parakeet_backend="cpu", whisper_backend="cpu", parakeet_tdt_backend="cpu")) is None
+    assert vram.effective_max_calls(_s(parakeet_backend="cpu")) is None
+
+    # Custom ModelSpec list with fake figures (250 MB streaming, 900 MB batch with compute)
+    fake_specs = [
+        models.ModelSpec(
+            key="fake-stream",
+            vram_mb=250,
+            gguf_filename="fake-stream.gguf",
+            model_chunk_ms=160,
+            has_eou=True,
+            has_punctuation=False,
+            multilingual=False,
+            assumed_leak_mb_per_audio_sec=0.0,
+            engine="parakeet",
+        ),
+        models.ModelSpec(
+            key="fake-batch",
+            vram_mb=600,
+            gguf_filename="fake-batch.gguf",
+            model_chunk_ms=1000,
+            has_eou=False,
+            has_punctuation=True,
+            multilingual=True,
+            assumed_leak_mb_per_audio_sec=0.0,
+            engine="parakeet_tdt",
+            streaming_capable=False,
+            batch_window_sec=60.0,
+            vram_compute_mb_per_sec=5.0,  # +300 MB compute -> 900 MB total
+        ),
+    ]
+    cap = vram.gpu_capacity(
+        _s(parakeet_backend="cuda", parakeet_tdt_backend="cuda", max_concurrent_calls=20),
+        model_specs=fake_specs,
+    )
+    assert cap == {
+        "budget_mb": 3687,
+        "reserved_mb": 0,
+        "models": {
+            "fake-stream": {"per_call_mb": 250, "max_calls": 14, "effective_max_calls": 14},
+            "fake-batch": {"per_call_mb": 900, "max_calls": 4, "effective_max_calls": 4},
+        },
+    }
 
 
 
