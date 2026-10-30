@@ -715,6 +715,36 @@ in `configure()` and there is no loop anywhere near it.
   end to end. **What's NOT proven:** the dashboard's actual rendering in a real browser (same
   long-standing caveat the original diarization dashboard cards carry); not yet redeployed
   anywhere.
+- **Recently finished requests, usage only: `GET /api/requests/recent?since=<seq>`
+  (`live_stt/recent_requests.py`). Unit-tested; not deployed.** Built for the separate gpu-monitor
+  project, which polls every ~10s and stores one Postgres row per request to show which speech work
+  kept the GPU busy. It is another **deliberate, narrow exception to "not a session registry"**, like
+  the trackers above. A bounded `deque(maxlen=500)` of *finished* requests, in memory only and lost
+  on restart. The poller dedups by `id` and detects restarts by `boot_id`.
+  - **Response:** `{boot_id, next_seq, retention, requests: [...]}`. `requests` holds the entries
+    with `seq > since`, oldest first.
+  - **Each entry:** `id`, `seq`, `kind` (`stream|transcribe|tts|diarize`), `outcome`, `model`,
+    `voice`, `device`, `started_at`, `finished_at`, `duration_s`, `audio_seconds`, `input_chars`,
+    `words`, `transcript_chars`, `processing_s`.
+  - **Privacy (non-negotiable):** entries hold **no content and no caller identity**. That means no
+    transcript or TTS input text, no audio, and no client-supplied ids or metadata. `id` is server
+    random hex, never derived from the gRPC `call_id`. Every string is from a closed set: `outcome`
+    uses the Prometheus enums; `model` is a registry key, and an unknown, client-typed diarization
+    model records `null`; `voice` is a registered voice of that model, else `"other"`; `device` is
+    `cuda` or `cpu`. Everything else is a count or a duration. `ALLOWED_FIELDS` is the whole schema
+    and `record()` never stores anything outside it. `record()` also swallows and logs its own
+    errors, so it can never break or slow a request.
+  - **What gets recorded:**
+    - `stream`: once per gRPC call, every outcome. Words and chars are the same increments as
+      `words_total` / `transcript_chars_total`. `processing_s` is the sum of worker feed and
+      finalize round-trip time (`CallSession.processing_sec`).
+    - `transcribe` and `diarize`: requests that reached the engine, plus admission rejections.
+      Validation 400s are not recorded.
+    - `tts`: both response paths. `audio_seconds` is generated PCM samples / sample rate.
+      `processing_s` counts only synthesis time, not time spent writing to the client.
+  - **Outcome caveat:** rejections use these values: `draining` and `no_capacity` (the
+    `admission_rejections_total` reasons) for `stream`, and `draining` for the three HTTP kinds. So
+    `outcome` is the per-kind Prometheus enum plus those values.
 - **whisper.cpp, a second batch-only transcription engine (`live_stt_worker_whisper`,
   `worker/session_whisper.{hpp,cpp}`, `worker/main_whisper.cpp`) — built, linked, and verified for
   real on BOTH CPU and CUDA (the real RTX 3090), against real models and real speech; not yet

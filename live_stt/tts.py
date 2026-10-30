@@ -18,7 +18,7 @@ import threading
 import time
 import wave
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from live_stt import tts_models
 from live_stt.config import Settings
@@ -819,8 +819,12 @@ def synthesize(
     response_format: str = "mp3",
     speed: float = 1.0,
     settings: Settings | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> tuple[bytes, str]:
-    """Synthesize full text into formatted audio bytes and Content-Type."""
+    """Synthesize full text into formatted audio bytes and Content-Type.
+
+    ``stats``, when given, receives ``audio_seconds`` (generated PCM
+    duration, samples / sample rate) for usage accounting."""
     if not text or not text.strip():
         raise TTSBadRequestError("input text must not be empty")
 
@@ -887,6 +891,8 @@ def synthesize(
                 )
             )
 
+    if stats is not None:
+        stats["audio_seconds"] = (len(pcm_accumulator) // 2) / model_spec.sample_rate
     return pcm_to_format(bytes(pcm_accumulator), model_spec.sample_rate, response_format)
 
 
@@ -898,8 +904,11 @@ def synthesize_stream(
     response_format: str = "mp3",
     speed: float = 1.0,
     settings: Settings | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> Iterator[bytes]:
-    """Sentence-chunked incremental streaming synthesis yielding audio bytes per chunk."""
+    """Sentence-chunked incremental streaming synthesis yielding audio bytes per chunk.
+
+    ``stats``, when given, accumulates ``audio_seconds`` as chunks are produced."""
     if not text or not text.strip():
         raise TTSBadRequestError("input text must not be empty")
 
@@ -950,5 +959,9 @@ def synthesize_stream(
                 idle_timeout_sec=idle_timeout_sec,
             )
         if chunk_pcm:
+            if stats is not None:
+                stats["audio_seconds"] = stats.get("audio_seconds", 0.0) + (
+                    (len(chunk_pcm) // 2) / model_spec.sample_rate
+                )
             chunk_audio, _ = pcm_to_format(chunk_pcm, model_spec.sample_rate, response_format)
             yield chunk_audio

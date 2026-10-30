@@ -22,6 +22,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from prometheus_client import generate_latest
 
@@ -1696,6 +1697,12 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                             </tr>
                             <tr>
                                 <td><span class="method-tag method-get">GET</span></td>
+                                <td><code>/api/requests/recent</code></td>
+                                <td class="card-subtext">Recently finished requests, usage numbers only (no content, no caller ids); <code>?since=&lt;seq&gt;</code></td>
+                                <td style="text-align: right;"><a href="/api/requests/recent" target="_blank" class="btn-endpoint-open">Open ↗</a></td>
+                            </tr>
+                            <tr>
+                                <td><span class="method-tag method-get">GET</span></td>
                                 <td><code>/api/config</code></td>
                                 <td class="card-subtext">Active configuration, worker concurrency limits, timeouts, and engine settings</td>
                                 <td style="text-align: right;"><a href="/api/config" target="_blank" class="btn-endpoint-open">Open ↗</a></td>
@@ -2848,6 +2855,21 @@ def _backends_doc(state: ServerState) -> dict:
     }
 
 
+RECENT_REQUESTS_PATH = "/api/requests/recent"
+
+
+def _recent_requests_doc(state: ServerState, raw_path: str) -> tuple[int, dict]:
+    """GET /api/requests/recent?since=<seq> -- see live_stt/recent_requests.py
+    for the contract and the privacy rules. ``since`` defaults to 0."""
+    query = parse_qs(urlsplit(raw_path).query)
+    raw_since = (query.get("since") or ["0"])[0].strip() or "0"
+    try:
+        since = int(raw_since)
+    except ValueError:
+        return 400, {"error": f"'since' must be an integer, got {raw_since!r}"}
+    return 200, state.recent_requests.snapshot(since=since)
+
+
 def _handle_backend_install(state: ServerState, body: bytes) -> tuple[int, dict]:
     if state.settings_store is None:
         return 503, {"error": "no settings store configured on this process"}
@@ -3019,7 +3041,10 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
             self._write(status, json.dumps(doc).encode(), "application/json")
 
         def do_GET(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler's naming
-            if self.path in ("/", "/stats", "/dashboard"):
+            if urlsplit(self.path).path == RECENT_REQUESTS_PATH:
+                status, doc = _recent_requests_doc(state, self.path)
+                self._write_json(status, doc)
+            elif self.path in ("/", "/stats", "/dashboard"):
                 self._write(200, HTML_STATS_PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif self.path == "/settings":
                 self._write(200, HTML_SETTINGS_PAGE.encode("utf-8"), "text/html; charset=utf-8")
@@ -3232,6 +3257,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     body=body,
                     settings=state.settings,
                     tracker=state.diarization_sessions,
+                    recent=state.recent_requests,
                 )
                 self._write_json(status, doc)
             elif self.path == transcribe_http.TRANSCRIBE_PATH:
@@ -3253,6 +3279,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         draining=state.draining,
                         tracker=state.transcribe_sessions,
                         worker_pool=state.worker_pool,
+                        recent=state.recent_requests,
                     )
                 )
                 self._write(status, response_body, content_type)
@@ -3266,6 +3293,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     settings=state.settings,
                     tracker=state.tts_sessions,
                     draining=state.draining,
+                    recent=state.recent_requests,
                 )
                 if hasattr(response_data, "__iter__") and not isinstance(response_data, (bytes, bytearray)):
                     # BaseHTTPRequestHandler defaults to protocol_version = "HTTP/1.0".

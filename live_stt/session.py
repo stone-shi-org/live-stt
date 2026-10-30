@@ -77,6 +77,10 @@ class CallSession:
         self._vram_reservation_id = f"session-{id(self)}"
         self._reserved_compute_mb = 0
         self._last_finalize_doc: dict[str, object] = {}
+        # Usage accounting for GET /api/requests/recent (live_stt/recent_requests.py):
+        # worker round-trip time (feed + finalize) and audio successfully fed.
+        self._processing_sec = 0.0
+        self._ok_fed_samples = 0
 
         # Rotation-in-progress state. self._incoming is the shadow worker;
         # non-None exactly while a rotation is underway.
@@ -89,6 +93,23 @@ class CallSession:
     @property
     def audio_offset_sec(self) -> float:
         return self._fed_samples / 16000.0
+
+    @property
+    def processing_sec(self) -> float:
+        """Sum of worker feed/finalize round-trip time so far."""
+        return self._processing_sec
+
+    @property
+    def fed_audio_sec(self) -> float:
+        """Audio successfully fed to a worker (what audio_seconds_total counts)."""
+        return self._ok_fed_samples / 16000.0
+
+    @property
+    def device(self) -> str | None:
+        """"cuda"/"cpu" of the engine actually spawned, None before start()."""
+        if self._worker is None:
+            return None
+        return "cuda" if self._use_gpu else "cpu"
 
     async def start(self) -> asr_pb2.TranscriptionEvent:
         self._worker = await self._spawn_worker()
@@ -359,9 +380,12 @@ class CallSession:
                 events.extend(await self._recover_from_crash(exc))
                 return events
         self._worker.reused_standby = False
-        metrics.feed_duration_seconds.observe(time.monotonic() - feed_start)
+        feed_elapsed = time.monotonic() - feed_start
+        metrics.feed_duration_seconds.observe(feed_elapsed)
+        self._processing_sec += feed_elapsed
 
         self._fed_samples += n_samples
+        self._ok_fed_samples += n_samples
         metrics.audio_seconds_total.inc(n_samples / 16000.0)
         self._last_rss_kb = doc.get("rss_kb", self._last_rss_kb)
         events.extend(self._doc_to_events(doc, time_offset_sec=self._active_generation_start_sec))
@@ -651,7 +675,9 @@ class CallSession:
                         metrics.asr_errors_total.labels(code="feed_failed").inc()
                         raise
                 self._worker.reused_standby = False
-                metrics.feed_duration_seconds.observe(time.monotonic() - feed_start)
+                feed_elapsed = time.monotonic() - feed_start
+                metrics.feed_duration_seconds.observe(feed_elapsed)
+                self._processing_sec += feed_elapsed
                 self._last_rss_kb = feed_doc.get("rss_kb", self._last_rss_kb)
                 feed_text = feed_doc.get("text", "")
                 if self._model_spec.strip_language_tag and feed_text:
@@ -668,6 +694,7 @@ class CallSession:
                         )
                     )
 
+            finalize_start = time.monotonic()
             try:
                 doc = await self._worker.finalize()
             except WorkerError as exc:
@@ -677,9 +704,11 @@ class CallSession:
                     and not isinstance(exc, WorkerOOMError)
                 ):
                     await self._replace_failed_standby(exc)
+                    finalize_start = time.monotonic()
                     doc = await self._worker.finalize()
                 else:
                     raise
+            self._processing_sec += time.monotonic() - finalize_start
             self._worker.reused_standby = False
             self._last_finalize_doc = doc
             self._last_rss_kb = doc.get("rss_kb", self._last_rss_kb)
@@ -711,6 +740,7 @@ class CallSession:
             prev_win_end_sec = win_end_sec
 
         self._fed_samples = total_samples
+        self._ok_fed_samples = total_samples
         if total_samples > 0:
             metrics.audio_seconds_total.inc(total_samples / 16000.0)
 
@@ -752,6 +782,7 @@ class CallSession:
             # call that keeps going.
             await self._abandon_rotation()
 
+        finalize_start = time.monotonic()
         try:
             doc = await self._worker.finalize()
         except WorkerError as exc:
@@ -761,9 +792,11 @@ class CallSession:
                 and not isinstance(exc, WorkerOOMError)
             ):
                 await self._replace_failed_standby(exc)
+                finalize_start = time.monotonic()
                 doc = await self._worker.finalize()
             else:
                 raise
+        self._processing_sec += time.monotonic() - finalize_start
         self._worker.reused_standby = False
         self._last_finalize_doc = doc
         text = doc.get("text", "")

@@ -54,8 +54,11 @@ request -> response path against a real pyannote model over a real socket.
 
 from __future__ import annotations
 
+import io
 import json
 import tempfile
+import time
+import wave
 from typing import Any
 
 from live_stt import diarization_models, gpu, metrics, vram
@@ -65,6 +68,7 @@ from live_stt.diarize_sessions import DiarizationSessionTracker
 from live_stt.logging_config import get_logger
 from live_stt.multipart import MultipartError, parse_multipart_form
 from live_stt.pb.livestt.v1 import asr_pb2
+from live_stt.recent_requests import RecentRequests, get_recent_requests
 
 logger = get_logger("diarize_http")
 
@@ -89,8 +93,24 @@ def _parse_words(raw: bytes | None) -> list[asr_pb2.Word]:
         raise MultipartError(f"'words' field entries must each have text/start_sec/end_sec: {exc}") from exc
 
 
+def _wav_duration_sec(wav_bytes: bytes) -> float | None:
+    """Input length from the WAV header, or None if it isn't a parseable
+    PCM WAV (pyannote accepts more formats than the stdlib wave module)."""
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            rate = wf.getframerate()
+            return wf.getnframes() / rate if rate else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def handle_diarize_request(
-    *, content_type: str, body: bytes, settings: Settings, tracker: DiarizationSessionTracker
+    *,
+    content_type: str,
+    body: bytes,
+    settings: Settings,
+    tracker: DiarizationSessionTracker,
+    recent: RecentRequests | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Pure(ish) request handler -- no socket/HTTP-server coupling, so this
     is directly unit-testable (mirrors live_stt/events.py's pure-mapping
@@ -186,6 +206,14 @@ def handle_diarize_request(
             "incompatibility' note)"
         )
 
+    recent = recent or get_recent_requests()
+    started_at = time.time()
+    try:
+        recent_model: str | None = diarization_models.resolve(effective_settings.diarization_model).key
+    except Exception:  # noqa: BLE001 -- unknown model; the loader reports it below
+        recent_model = None  # never record a raw client-supplied model string
+    device = effective_settings.diarization_device
+
     admission: vram.Admission | None = None
     if effective_settings.diarization_device == "cuda":
         # Per-model requirement + reclaim of idle warm workers (live_stt/vram.py).
@@ -207,14 +235,22 @@ def handle_diarize_request(
         if not admission.ok:
             tracker.record_rejected_vram()
             metrics.diarization_requests_total.labels(outcome="rejected_vram").inc()
+            recent.record(
+                kind="diarize", outcome="rejected_vram", started_at=started_at,
+                model=recent_model, device=device,
+            )
             return 503, {"error": {"message": admission.message("diarization")}}
 
+    recent_outcome: str | None = None
+    engine_start = 0.0
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
             tmp.write(fields["file"])
             tmp.flush()
             request_id = tracker.start(device=effective_settings.diarization_device)
             metrics.diarization_sessions_active.inc()
+            recent_outcome = "failed"
+            engine_start = time.monotonic()
             try:
                 result = diarize_file(tmp.name, settings=effective_settings, words=words)
             except DiarizationError as exc:
@@ -237,8 +273,19 @@ def handle_diarize_request(
                 tracker.finish(request_id, ok=True)
                 metrics.diarization_sessions_active.dec()
                 metrics.diarization_requests_total.labels(outcome="ok").inc()
+                recent_outcome = "ok"
 
         return 200, result
     finally:
         if admission is not None:
             admission.release()
+        if recent_outcome is not None:
+            recent.record(
+                kind="diarize",
+                outcome=recent_outcome,
+                started_at=started_at,
+                model=recent_model,
+                device=device,
+                audio_seconds=_wav_duration_sec(fields["file"]),
+                processing_s=time.monotonic() - engine_start,
+            )

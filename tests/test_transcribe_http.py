@@ -253,7 +253,7 @@ class TestHandleTranscribeRequestValidation:
         )
         self_patch_module = transcribe_http
 
-        async def fake_run(pcm, *, settings, spec, language, budget):
+        async def fake_run(pcm, *, settings, spec, language, budget, **_):
             return "hello", [], 1.0, 1
 
         monkeypatch.setattr(self_patch_module, "_run_transcription", fake_run)
@@ -270,7 +270,7 @@ class TestHandleTranscribeRequestResponses:
     def _patch(self, monkeypatch: pytest.MonkeyPatch, *, text="hello world", words=None, total_audio_sec=2.0, generations=1):
         words = words if words is not None else [asr_pb2.Word(text="hello", start_sec=0.0, end_sec=0.5, confidence=0.875)]
 
-        async def fake_run(pcm, *, settings, spec, language, budget):
+        async def fake_run(pcm, *, settings, spec, language, budget, **_):
             return text, words, total_audio_sec, generations
 
         monkeypatch.setattr(transcribe_http, "_run_transcription", fake_run)
@@ -293,7 +293,7 @@ class TestHandleTranscribeRequestResponses:
         # parakeet-tdt-0.6b-v3 or whisper-*) rather than Settings.default_model.
         seen_specs = []
 
-        async def fake_run(pcm, *, settings, spec, language, budget):
+        async def fake_run(pcm, *, settings, spec, language, budget, **_):
             seen_specs.append(spec.key)
             return "batch transcript", [], 1.0, 1
 
@@ -647,7 +647,7 @@ class TestRealCallSessionIntegration:
         tracker = _tracker()
 
         # 1. Success releases reservation
-        async def _ok_run(pcm, *, settings, spec, language, budget):
+        async def _ok_run(pcm, *, settings, spec, language, budget, **_):
             assert vram.reserved_mb() == 260
             return "ok", [], 0.16, 1
 
@@ -659,7 +659,7 @@ class TestRealCallSessionIntegration:
         assert vram.reserved_mb() == 0
 
         # 2. Error releases reservation
-        async def _err_run(pcm, *, settings, spec, language, budget):
+        async def _err_run(pcm, *, settings, spec, language, budget, **_):
             assert vram.reserved_mb() == 260
             raise transcribe_http.TranscribeError("engine crashed")
 
@@ -674,7 +674,7 @@ class TestRealCallSessionIntegration:
         in_run = asyncio.Event()
         hang = asyncio.Event()
 
-        async def _CancelRun(pcm, *, settings, spec, language, budget):
+        async def _CancelRun(pcm, *, settings, spec, language, budget, **_):
             assert vram.reserved_mb() == 260
             in_run.set()
             await hang.wait()

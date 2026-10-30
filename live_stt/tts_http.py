@@ -7,12 +7,14 @@ existing ``ThreadingHTTPServer``.
 from __future__ import annotations
 
 import json
+import time
 from typing import Iterator
 from urllib.parse import parse_qs
 
 from live_stt import gpu, metrics, tts, tts_models, vram
 from live_stt.config import Settings
 from live_stt.logging_config import get_logger
+from live_stt.recent_requests import RecentRequests, bounded_voice, get_recent_requests
 from live_stt.tts import TTSBadRequestError, TTSError, TTSUnavailableError
 from live_stt.tts_sessions import TTSSessionTracker
 
@@ -53,12 +55,20 @@ def handle_speech_request(
     settings: Settings,
     tracker: TTSSessionTracker,
     draining: bool = False,
+    recent: RecentRequests | None = None,
 ) -> tuple[int, bytes | Iterator[bytes], str, dict[str, str]]:
     """Handle POST /v1/audio/speech.
 
     Returns (status_code, response_body_or_generator, content_type, headers_dict).
+
+    ``recent`` gets one usage-only entry (live_stt/recent_requests.py) per
+    request rejected at admission or that reached synthesis -- input LENGTH
+    only, never the text itself.
     """
+    recent = recent or get_recent_requests()
+    started_at = time.time()
     if draining:
+        recent.record(kind="tts", outcome="draining", started_at=started_at)
         return 503, json.dumps({"error": "server is draining"}).encode(), "application/json", {}
 
     try:
@@ -101,6 +111,19 @@ def handle_speech_request(
     # duplicating (and re-breaking) it.
     voice = tts.resolve_voice(payload.get("voice"), settings, model_spec)
 
+    def _record(outcome: str, *, ran: bool, stats: dict[str, Any] | None = None, processing_s: float | None = None) -> None:
+        recent.record(
+            kind="tts",
+            outcome=outcome,
+            started_at=started_at,
+            model=model_spec.key,
+            voice=bounded_voice(voice, model_spec.supported_voices),
+            device=settings.tts_device,
+            audio_seconds=(stats or {}).get("audio_seconds") if outcome == "ok" else None,
+            input_chars=len(text_str) if ran else None,
+            processing_s=processing_s,
+        )
+
     # VRAM Gate for CUDA: only enforce VRAM budget for models requiring GPU VRAM.
     # Per-model requirement + reclaim of idle warm workers (live_stt/vram.py).
     # Skipped when the warm worker already holds THIS model on the GPU: the
@@ -123,6 +146,7 @@ def handle_speech_request(
         if admission is not None and not admission.ok:
             tracker.record_rejected_vram()
             metrics.tts_requests_total.labels(outcome="rejected_vram").inc()
+            _record("rejected_vram", ran=False)
             logger.warning(
                 "TTS rejected: insufficient free VRAM (%s MiB free < %d MiB required)",
                 admission.free_mb,
@@ -147,24 +171,45 @@ def handle_speech_request(
 
     if stream:
         def stream_generator() -> Iterator[bytes]:
+            stats: dict[str, Any] = {}
+            synth_s = 0.0
             try:
-                for chunk in tts.synthesize_stream(
-                    text_str,
-                    model=model_spec.key,
-                    voice=voice,
-                    response_format=response_format,
-                    speed=speed,
-                    settings=settings,
-                ):
+                chunks = iter(
+                    tts.synthesize_stream(
+                        text_str,
+                        model=model_spec.key,
+                        voice=voice,
+                        response_format=response_format,
+                        speed=speed,
+                        settings=settings,
+                        stats=stats,
+                    )
+                )
+                # processing_s counts only time spent producing chunks, not
+                # time blocked writing them to a slow client.
+                while True:
+                    t0 = time.monotonic()
+                    try:
+                        chunk = next(chunks)
+                    except StopIteration:
+                        synth_s += time.monotonic() - t0
+                        break
+                    synth_s += time.monotonic() - t0
                     yield chunk
                 tracker.finish(request_id, ok=True)
                 metrics.tts_sessions_active.dec()
                 metrics.tts_requests_total.labels(outcome="ok").inc()
                 metrics.tts_chars_total.inc(len(text_str))
+                _record("ok", ran=True, stats=stats, processing_s=synth_s)
+            except GeneratorExit:
+                # Client went away mid-stream: still one finished request.
+                _record("failed", ran=True, processing_s=synth_s)
+                raise
             except Exception as exc:
                 tracker.finish(request_id, ok=False)
                 metrics.tts_sessions_active.dec()
                 metrics.tts_requests_total.labels(outcome="failed").inc()
+                _record("failed", ran=True, processing_s=synth_s)
                 logger.error("TTS stream synthesis failed: %s", exc)
                 raise
             finally:
@@ -174,6 +219,9 @@ def handle_speech_request(
         ct = "audio/mpeg" if response_format.lower() == "mp3" else f"audio/{response_format.lower()}"
         return 200, stream_generator(), ct, {}
 
+    stats: dict[str, Any] = {}
+    synth_start = time.monotonic()
+    recent_outcome = "failed"
     try:
         audio_bytes, ct = tts.synthesize(
             text_str,
@@ -182,11 +230,13 @@ def handle_speech_request(
             response_format=response_format,
             speed=speed,
             settings=settings,
+            stats=stats,
         )
         tracker.finish(request_id, ok=True)
         metrics.tts_sessions_active.dec()
         metrics.tts_requests_total.labels(outcome="ok").inc()
         metrics.tts_chars_total.inc(len(text_str))
+        recent_outcome = "ok"
         return 200, audio_bytes, ct, {}
     except TTSBadRequestError as exc:
         tracker.finish(request_id, ok=False)
@@ -207,3 +257,4 @@ def handle_speech_request(
     finally:
         if admission is not None:
             admission.release()
+        _record(recent_outcome, ran=True, stats=stats, processing_s=time.monotonic() - synth_start)

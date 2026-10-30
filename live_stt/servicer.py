@@ -18,6 +18,7 @@ from collections.abc import AsyncIterator
 import grpc
 
 from live_stt import __about__, gpu, metrics, models, redaction, vram
+from live_stt.recent_requests import RecentRequests, get_recent_requests
 from live_stt.logging_config import get_logger
 from live_stt.pb.livestt.v1 import asr_pb2, asr_pb2_grpc
 from live_stt.session import CallSession
@@ -27,23 +28,30 @@ from live_stt.worker import WorkerError
 logger = get_logger("servicer")
 
 
-def _count_words(event: asr_pb2.TranscriptionEvent, text_parts: list[str]) -> None:
+def _count_words(event: asr_pb2.TranscriptionEvent, text_parts: list[str]) -> tuple[int, int]:
+    """Bumps words_total/transcript_chars_total and returns the same
+    (words, chars) increment, so the per-call totals recorded in
+    live_stt/recent_requests.py match the Prometheus counters exactly."""
     kind = event.WhichOneof("event")
     if kind == "delta":
-        metrics.words_total.inc(len(event.delta.words))
-        metrics.transcript_chars_total.inc(len(event.delta.text))
+        n_words, n_chars = len(event.delta.words), len(event.delta.text)
         text_parts.append(event.delta.text)
     elif kind == "final":
-        metrics.words_total.inc(len(event.final.words))
-        metrics.transcript_chars_total.inc(len(event.final.text))
+        n_words, n_chars = len(event.final.words), len(event.final.text)
         text_parts.append(event.final.text)
+    else:
+        return 0, 0
+    metrics.words_total.inc(n_words)
+    metrics.transcript_chars_total.inc(n_chars)
+    return n_words, n_chars
 
 
 class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
-    def __init__(self, state: ServerState) -> None:
+    def __init__(self, state: ServerState, recent: RecentRequests | None = None) -> None:
         self._state = state
         self._settings = state.settings
         self._budget = state.budget
+        self._recent = recent or getattr(state, "recent_requests", None) or get_recent_requests()
 
     async def GetServerInfo(  # noqa: N802 -- generated base class naming
         self, request: asr_pb2.ServerInfoRequest, context: grpc.aio.ServicerContext
@@ -72,13 +80,45 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
             warm_spares=0,  # no PRE-warmed pool -- shadows are spawned on demand at rotation time
         )
 
+    def _record_recent(
+        self,
+        outcome: str,
+        started_at: float,
+        spec: models.ModelSpec | None,
+        session: CallSession | None,
+        n_words: int,
+        n_chars: int,
+    ) -> None:
+        """Usage-only entry for GET /api/requests/recent. Never raises.
+        Numbers stay None when no worker ever ran (a pre-start failure)."""
+        try:
+            ran = session is not None and session.device is not None
+            device = session.device if ran else (
+                self._settings.parakeet_backend if spec is not None else None
+            )
+            self._recent.record(
+                kind="stream",
+                outcome=outcome,
+                started_at=started_at,
+                model=spec.key if spec is not None else None,
+                device=device,
+                audio_seconds=session.fed_audio_sec if ran else None,
+                words=n_words if ran else None,
+                transcript_chars=n_chars if ran else None,
+                processing_s=session.processing_sec if ran else None,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("recent-requests bookkeeping failed")
+
     async def Transcribe(  # noqa: N802
         self,
         request_iterator: AsyncIterator[asr_pb2.TranscriptionRequest],
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[asr_pb2.TranscriptionEvent]:
+        started_at = time.time()
         if self._state.draining:
             metrics.admission_rejections_total.labels(reason="draining").inc()
+            self._recent.record(kind="stream", outcome="draining", started_at=started_at)
             await context.abort(grpc.StatusCode.UNAVAILABLE, "draining")
             return
 
@@ -88,6 +128,7 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
         # Transcribe call can interleave here.
         if not self._budget.try_admit_call():
             metrics.admission_rejections_total.labels(reason="no_capacity").inc()
+            self._recent.record(kind="stream", outcome="no_capacity", started_at=started_at)
             await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "at capacity, try again shortly")
             return
 
@@ -98,6 +139,9 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
         session: CallSession | None = None
         admission: vram.Admission | None = None
         final_text_parts: list[str] = []
+        spec: models.ModelSpec | None = None
+        n_words = 0
+        n_chars = 0
 
         try:
             try:
@@ -229,7 +273,9 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
                     return
                 try:
                     for event in await session.feed_audio(request.audio):
-                        _count_words(event, final_text_parts)
+                        dw, dc = _count_words(event, final_text_parts)
+                        n_words += dw
+                        n_chars += dc
                         yield event
                 except WorkerError as exc:
                     logger.error("stream=%s worker feed failed: %s", call_ref_hash, exc)
@@ -246,7 +292,9 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
             # correct here: nothing about half-close skips this code.
             try:
                 for event in await session.finalize():
-                    _count_words(event, final_text_parts)
+                    dw, dc = _count_words(event, final_text_parts)
+                    n_words += dw
+                    n_chars += dc
                     yield event
                 outcome = "ok"
             except WorkerError as exc:
@@ -276,6 +324,7 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
             metrics.streams_total.labels(outcome=outcome).inc()
             duration_sec = time.monotonic() - call_start
             metrics.stream_duration_seconds.observe(duration_sec)
+            self._record_recent(outcome, started_at, spec, session, n_words, n_chars)
 
             full_text = "".join(final_text_parts)
             fields = redaction.transcript_log_fields(full_text, call_ref_hash, self._settings)

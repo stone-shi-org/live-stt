@@ -58,6 +58,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import time
 import uuid
 import wave
 from typing import Any
@@ -68,6 +69,7 @@ from live_stt.config import Settings
 from live_stt.logging_config import get_logger
 from live_stt.multipart import MultipartError, parse_multipart_form
 from live_stt.pb.livestt.v1 import asr_pb2
+from live_stt.recent_requests import RecentRequests, get_recent_requests
 from live_stt.session import CallSession
 from live_stt.transcribe_sessions import TranscribeSessionTracker
 from live_stt.worker import WorkerError, WorkerOOMError
@@ -139,7 +141,10 @@ async def _run_transcription(
     language: str | None,
     budget: WorkerBudget,
     worker_pool: STTWorkerPool | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> tuple[str, list[asr_pb2.Word], float, int]:
+    """``usage``, when given, receives ``processing_s`` (worker round-trip
+    time) and ``device`` -- filled even when transcription fails."""
     config = asr_pb2.StreamConfig(
         call_id=f"http-transcribe-{uuid.uuid4().hex[:12]}",
         encoding=asr_pb2.AUDIO_ENCODING_LINEAR16,
@@ -173,6 +178,9 @@ async def _run_transcription(
     except WorkerError as exc:
         raise TranscribeError(f"engine error during transcription: {exc}") from exc
     finally:
+        if usage is not None:
+            usage["processing_s"] = session.processing_sec
+            usage["device"] = session.device
         await session.close()
 
     return "".join(text_parts), words, total_audio_sec, worker_generations
@@ -191,12 +199,20 @@ async def handle_transcribe_request(
     draining: bool,
     tracker: TranscribeSessionTracker,
     worker_pool: STTWorkerPool | None = None,
+    recent: RecentRequests | None = None,
 ) -> tuple[int, bytes, str]:
     """Pure(ish) request handler -- no socket coupling beyond what's already
     unavoidable (spawning a real worker process). Returns
     ``(http_status, response_body, content_type)``; never raises.
+
+    ``recent`` receives one usage-only entry (live_stt/recent_requests.py)
+    per request that was rejected at admission or reached the engine;
+    plain validation 400s/413s are not recorded.
     """
+    recent = recent or get_recent_requests()
+    started_at = time.time()
     if draining:
+        recent.record(kind="transcribe", outcome="draining", started_at=started_at)
         return 503, _err("server is draining, not accepting new work"), "application/json"
 
     try:
@@ -284,12 +300,20 @@ async def handle_transcribe_request(
         if not admission.ok:
             tracker.record_rejected_vram()
             metrics.transcribe_requests_total.labels(outcome="rejected_vram").inc()
+            recent.record(
+                kind="transcribe", outcome="rejected_vram", started_at=started_at,
+                model=spec.key, device=engine_backend,
+            )
             return 503, _err(admission.message(spec.key)), "application/json"
 
     try:
         if not budget.try_admit_call():
             tracker.record_rejected_capacity()
             metrics.transcribe_requests_total.labels(outcome="rejected_capacity").inc()
+            recent.record(
+                kind="transcribe", outcome="rejected_capacity", started_at=started_at,
+                model=spec.key, device=engine_backend,
+            )
             return 503, _err("at capacity, try again shortly"), "application/json"
 
         # Dashboard/metrics visibility only (see live_stt/transcribe_sessions.py) --
@@ -297,8 +321,11 @@ async def handle_transcribe_request(
         # holds regardless of this tracker's bookkeeping.
         request_id = tracker.start(model=spec.key)
         metrics.transcribe_sessions_active.inc()
+        usage: dict[str, Any] = {}
+        recent_outcome = "failed"
+        text, words = "", []
         try:
-            run_kwargs: dict[str, Any] = {}
+            run_kwargs: dict[str, Any] = {"usage": usage}
             if worker_pool is not None:
                 run_kwargs["worker_pool"] = worker_pool
             text, words, total_audio_sec, worker_generations = await _run_transcription(
@@ -331,8 +358,21 @@ async def handle_transcribe_request(
             tracker.finish(request_id, ok=True)
             metrics.transcribe_sessions_active.dec()
             metrics.transcribe_requests_total.labels(outcome="ok").inc()
+            recent_outcome = "ok"
         finally:
             budget.release_call()
+            ok = recent_outcome == "ok"
+            recent.record(
+                kind="transcribe",
+                outcome=recent_outcome,
+                started_at=started_at,
+                model=spec.key,
+                device=usage.get("device") or engine_backend,
+                audio_seconds=audio_sec,
+                words=len(words) if ok else None,
+                transcript_chars=len(text) if ok else None,
+                processing_s=usage.get("processing_s"),
+            )
     finally:
         if admission is not None:
             admission.release()

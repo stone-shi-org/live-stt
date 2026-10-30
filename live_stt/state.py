@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from live_stt.admission import WorkerBudget
 from live_stt.config import Settings
 from live_stt.diarize_sessions import DiarizationSessionTracker
+from live_stt.recent_requests import RecentRequests, get_recent_requests
 from live_stt.settings_store import SettingsStore
 from live_stt.transcribe_sessions import TranscribeSessionTracker
 from live_stt.tts import TTSWorkerManager, get_tts_worker_manager
@@ -51,6 +52,11 @@ class ServerState:
 
     # TTS synthesis (POST /v1/audio/speech) session tracker.
     tts_sessions: TTSSessionTracker = field(default_factory=TTSSessionTracker)
+
+    # Usage-only log of recently FINISHED requests for GET /api/requests/recent
+    # (live_stt/recent_requests.py) -- bounded ring, no content, no caller ids.
+    # Defaults to the process-wide instance so boot_id is per process.
+    recent_requests: RecentRequests = field(default_factory=get_recent_requests)
 
     # Standby worker pool for warmed-up STT engine caching (LS-10).
     worker_pool: STTWorkerPool = field(default_factory=get_worker_pool)
