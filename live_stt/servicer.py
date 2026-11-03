@@ -17,7 +17,7 @@ from collections.abc import AsyncIterator
 
 import grpc
 
-from live_stt import __about__, gpu, metrics, models, redaction, vram
+from live_stt import __about__, gpu, metrics, models, nemotron, redaction, vram
 from live_stt.recent_requests import RecentRequests, get_recent_requests
 from live_stt.logging_config import get_logger
 from live_stt.pb.livestt.v1 import asr_pb2, asr_pb2_grpc
@@ -232,6 +232,27 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
                     fallback_mb=self._settings.vram_per_worker_mb,
                     already_warm=already_warm,
                 )
+                if not admission.ok:
+                    # LS-19 option (b): live calls take priority over
+                    # Nemotron post-call jobs. If one holds the card, stop it
+                    # (the job is re-queued and reruns later) and re-check.
+                    # Nothing else ever preempts a running Nemotron job.
+                    def _readmit() -> vram.Admission:
+                        return vram.admit(
+                            self._settings,
+                            model_key=spec.key,
+                            model_mb=spec.vram_mb,
+                            fallback_mb=self._settings.vram_per_worker_mb,
+                            already_warm=already_warm,
+                        )
+
+                    retried = await asyncio.to_thread(nemotron.preempt_and_admit, self._settings, _readmit)
+                    if retried is not None:
+                        logger.info(
+                            "stream=%s preempted a Nemotron job for VRAM: %s",
+                            call_ref_hash, "admitted" if retried.ok else "still short",
+                        )
+                        admission = retried
                 if admission.free_mb is not None:
                     metrics.gpu_free_vram_mb.set(admission.free_mb)
                 if not admission.ok:

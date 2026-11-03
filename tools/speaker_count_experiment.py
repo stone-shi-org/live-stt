@@ -39,11 +39,11 @@ from live_stt.config import Settings  # noqa: E402
 from live_stt.diarization import annotation_to_house_json, load_pipeline  # noqa: E402
 
 WAV_PATH = (
-    "/data/vmfs/main01a_shared/Download/NOTSOFAR-1/eval_set/"
+    "/data/vmfs/main01a_shared/test-data/NOTSOFAR-1/eval_set/"
     "240825.1_eval_full_with_GT/MTG/MTG_32063/sc_meetup_0/ch0.wav"
 )
 GT_PATH = (
-    "/data/vmfs/main01a_shared/Download/NOTSOFAR-1/eval_set/"
+    "/data/vmfs/main01a_shared/test-data/NOTSOFAR-1/eval_set/"
     "240825.1_eval_full_with_GT/MTG/MTG_32063/gt_transcription.json"
 )
 TRUE_SPEAKERS = ["Beth", "Linda", "Rachel"]

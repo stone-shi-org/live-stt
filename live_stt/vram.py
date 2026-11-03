@@ -541,8 +541,15 @@ def reclaim_idle_workers(*, exclude_model_key: str | None = None) -> int:
     # imported by the request paths that those modules' callers also import.
     from live_stt import tts, worker_pool
 
+    from live_stt import nemotron
+
     stopped = worker_pool.evict_idle_workers(0.0, exclude_model_key=exclude_model_key)
     if tts.get_tts_worker_manager().stop_if_idle():
+        stopped += 1
+    # LS-19: an idle Nemotron sidecar holds ~22 GB; any other GPU admission
+    # may evict it. A busy one is never touched here -- only a live gRPC call
+    # can take the card from a running job (nemotron.preempt_for_live_call).
+    if nemotron.get_service().stop_if_idle():
         stopped += 1
     return stopped
 
@@ -686,3 +693,76 @@ def admit(
         time.sleep(RECLAIM_POLL_SEC)
 
 
+
+
+def has_other_gpu_work(exclude_model_key: str | None = None) -> bool:
+    """True while any admission reservation or active compute reservation
+    exists for a model other than ``exclude_model_key`` -- i.e. some live
+    call or batch job is holding (or about to allocate) VRAM. Nemotron's
+    queue (LS-19) waits on this instead of reclaiming under a live call."""
+    with _lock:
+        if _active_compute_reservations:
+            return True
+        return any(r.model_key != exclude_model_key for r in _reservations.values())
+
+
+def admit_exclusive(
+    settings: Any,
+    *,
+    model_key: str,
+    need_mb: int,
+    margin_mb: int,
+    reclaim: bool = True,
+) -> Admission:
+    """Admission for a model that needs essentially the whole card
+    (Nemotron-3.5-Transcribe, LS-19: ~22-24 GB on a 24 GB card).
+
+    The normal rule (``need + reserve_mb``) can never pass for it: the
+    reserve alone is ~2.4 GB on 24 GB. Here the requirement is
+    ``need_mb + margin_mb`` -- no card-relative reserve -- checked against
+    the same reservation-aware free figure ``admit()`` uses, after reclaiming
+    idle warm workers. ``Settings.vram_overrides[model_key]`` replaces
+    ``need_mb`` when set. On success a reservation is recorded exactly like
+    ``admit()``'s, and the caller must ``release()`` it.
+    """
+    override = (settings.vram_overrides or {}).get(model_key)
+    need = int(override) if override is not None else int(need_mb)
+    required = need + max(0, int(margin_mb))
+    pre_reclaim_free: int | None = None
+    with _lock:
+        live_free = gpu.free_vram_mb()
+        if live_free is None:
+            return Admission(True, None, required)
+        free = _effective_free_locked(live_free)
+        if free >= required:
+            res_id = _record_reservation_locked(
+                model_key=model_key, weights_mb=need, compute_mb=0, warm_claim=False
+            )
+            return Admission(True, free, required, reservation_id=res_id, reserved_mb=need)
+        if not reclaim:
+            return Admission(False, free, required)
+        pre_reclaim_free = live_free
+
+    stopped = reclaim_idle_workers()
+    if stopped == 0:
+        return Admission(False, free, required)
+    logger.info(
+        "VRAM short for exclusive model %s (%dMB free < %dMB): stopped %d idle warm worker(s), re-checking",
+        model_key, free, required, stopped,
+    )
+    deadline = time.monotonic() + RECLAIM_WAIT_SEC
+    while True:
+        with _lock:
+            live_free = gpu.free_vram_mb()
+            if live_free is None:
+                return Admission(True, None, required, stopped)
+            free = _effective_free_locked(live_free, pre_reclaim_free=pre_reclaim_free)
+            pre_reclaim_free = live_free
+            if free >= required:
+                res_id = _record_reservation_locked(
+                    model_key=model_key, weights_mb=need, compute_mb=0, warm_claim=False
+                )
+                return Admission(True, free, required, stopped, reservation_id=res_id, reserved_mb=need)
+            if time.monotonic() >= deadline:
+                return Admission(False, free, required, stopped)
+        time.sleep(RECLAIM_POLL_SEC)

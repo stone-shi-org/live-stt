@@ -46,6 +46,10 @@ declare -A MODEL_FILES=(
     ["whisper-medium-q8_0"]="ggerganov/whisper.cpp ggml-medium-q8_0.bin 42a1ffcbe4167d224232443396968db4d02d4e8e87e213d3ee2e03095dea6502"
     ["whisper-large-v3-q5_0"]="ggerganov/whisper.cpp ggml-large-v3-q5_0.bin d75795ecff3f83b5faa89d1900604ad8c780abd5739fae406de19f23ecd98ad1"
     ["whisper-large-v3-turbo-q8_0"]="ggerganov/whisper.cpp ggml-large-v3-turbo-q8_0.bin 317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1"
+    # Nemotron-3.5-Transcribe-30B-A4B (LS-19): decoder + encoder, both needed.
+    # ~19.7 GB + ~1.7 GB. sha256 = the HF LFS oids, verified on homesrv3.
+    ["nemotron-3.5-transcribe-30b-a4b"]="AtomicChat/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-AD-IQ4_NL.gguf 0c47d4ab6c783e7606ec03714b354fab0b2052027a7ea1991e7e2d3009c345ad"
+    ["nemotron-3.5-transcribe-30b-a4b-encoder"]="AtomicChat/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-Encoder-F16.gguf 4221029c8a565c4a80c507ffa760c716e595acf663f9f4273ce69910050e7ba2"
 )
 
 # No-args default set -- see the file header comment on why this doesn't

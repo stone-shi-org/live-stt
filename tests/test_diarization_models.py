@@ -96,3 +96,15 @@ def test_default_diarization_model_is_unaffected_by_the_new_entry():
     # diarization request does.
     assert DEFAULT_DIARIZATION_MODEL_KEY == "pyannote/speaker-diarization-community-1"
     assert resolve(None).engine == "pyannote"
+
+
+def test_nemotron_transcribe_entry() -> None:
+    from live_stt.diarization_models import DIARIZATION_MODELS, DEFAULT_DIARIZATION_MODEL_KEY
+
+    spec = DIARIZATION_MODELS["nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B"]
+    assert spec.engine == "nemotron_transcribe"
+    assert spec.gated is False
+    assert spec.supports_num_speakers_hint is False
+    assert spec.max_speakers_supported == 8
+    assert spec.vram_mb == 22200
+    assert DEFAULT_DIARIZATION_MODEL_KEY == "pyannote/speaker-diarization-community-1"  # opt-in only

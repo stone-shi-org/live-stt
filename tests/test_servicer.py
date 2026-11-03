@@ -386,3 +386,73 @@ async def test_vram_gate_admits_a_small_model_the_old_flat_figure_rejected(monke
             except grpc.aio.AioRpcError as exc:
                 # Past the gate; anything after it (no real CUDA backend here) is fine.
                 assert exc.code() != grpc.StatusCode.RESOURCE_EXHAUSTED, exc.details()
+
+
+@pytest.mark.asyncio
+async def test_live_call_preempts_a_running_nemotron_job(tmp_path, monkeypatch) -> None:
+    """LS-19 option (b): a live call refused VRAM because a Nemotron job holds
+    the card is admitted (within 3 s) after the job is preempted; the job is
+    re-queued and still completes once the call is gone."""
+    import threading
+    import time
+
+    from live_stt import gpu, nemotron, vram
+    from test_nemotron import FAKE, Card, Env, make_wav  # shared fake setup
+
+    wrapper = tmp_path / "nemo-speech"
+    wrapper.write_text(f'#!/bin/sh\nexec "{__import__("sys").executable}" "{FAKE}" "$@"\n')
+    wrapper.chmod(0o755)
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / nemotron.TIERS[2].decoder_filename).write_bytes(b"x")
+    (tmp_path / "models" / nemotron.ENCODER_FILENAME).write_bytes(b"x")
+    svc = nemotron.NemotronService()
+    card = Card(svc)
+    monkeypatch.setattr(nemotron, "_SERVICE", svc)
+    monkeypatch.setattr(vram, "_total_mb_cache", None)
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: 24576)
+    monkeypatch.setattr(gpu, "compute_cap", lambda: 8.6)
+    monkeypatch.setattr(gpu, "free_vram_mb", card.free)
+    monkeypatch.setenv("FAKE_NEMO_CHAT_DELAY", "4.0")
+    env = Env(tmp_path, svc, card)
+    monkeypatch.setenv("FAKE_NEMO_LOG", str(env.log))
+
+    settings = _settings(
+        parakeet_backend="cuda",
+        nemotron_bin=str(wrapper),
+        nemotron_models_dir=str(tmp_path / "models"),
+        db_path=str(tmp_path / "x.db"),
+        backends_dir=str(tmp_path / "b"),
+        nemotron_idle_timeout_sec=0,
+    )
+    result: dict = {}
+
+    def job() -> None:
+        try:
+            result["doc"] = svc.transcribe(settings, nemotron.parse_wav(make_wav(30)))
+        except Exception as exc:  # noqa: BLE001
+            result["exc"] = exc
+
+    t = threading.Thread(target=job)
+    t.start()
+    try:
+        assert await asyncio.to_thread(env.wait_for, lambda: svc.state == "busy" and env.events("chat"), 10)
+        async with _Server(settings) as server:
+            async with server.channel() as channel:
+                stub = asr_pb2_grpc.StreamingASRStub(channel)
+                t0 = time.monotonic()
+                first = None
+                try:
+                    async for event in stub.Transcribe(_config_then_audio(n_chunks=0)):
+                        first = first or event
+                        break
+                except grpc.aio.AioRpcError as exc:
+                    # Past the VRAM gate is all this test is about (no real CUDA here).
+                    assert exc.code() != grpc.StatusCode.RESOURCE_EXHAUSTED, exc.details()
+                assert time.monotonic() - t0 < 3.0
+        assert svc.preemptions_total == 1
+        assert svc.requeues_total == 1
+    finally:
+        await asyncio.to_thread(t.join, 30)
+        svc.stop()
+    assert "exc" not in result, result.get("exc")
+    assert result["doc"]["segments"]

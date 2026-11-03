@@ -78,3 +78,12 @@ def test_parakeet_tdt_aliases_to_parakeet_not_a_separate_registry_entry() -> Non
 def test_canonical_engine_is_a_noop_for_non_aliased_engines() -> None:
     assert canonical_engine("parakeet") == "parakeet"
     assert canonical_engine("whisper") == "whisper"
+
+
+def test_nemo_speech_cuda_backend_entry() -> None:
+    spec = resolve("nemo_speech", "cuda")
+    assert spec.source == "github_release"
+    assert spec.repo == "NVIDIA/NeMo-Speech.cpp" and spec.tag == "v0.3.0"
+    assert spec.asset_filename == "nemo-speech-0.3.0-linux-x86_64-cuda.tar.gz"
+    assert spec.sha256 == "eca00a1f67d3ca200ddba11dd71c4f3d67e044cc0939d17d073978e40b995917"
+    assert available_flavors("nemo_speech") == ["cuda"]

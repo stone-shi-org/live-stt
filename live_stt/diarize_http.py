@@ -61,7 +61,7 @@ import time
 import wave
 from typing import Any
 
-from live_stt import diarization_models, gpu, metrics, vram
+from live_stt import diarization_models, gpu, metrics, nemotron, vram
 from live_stt.config import Settings
 from live_stt.diarization import DiarizationError, diarize_file
 from live_stt.diarize_sessions import DiarizationSessionTracker
@@ -212,6 +212,18 @@ def handle_diarize_request(
         recent_model: str | None = diarization_models.resolve(effective_settings.diarization_model).key
     except Exception:  # noqa: BLE001 -- unknown model; the loader reports it below
         recent_model = None  # never record a raw client-supplied model string
+
+    if recent_model is not None:
+        engine = diarization_models.resolve(recent_model).engine
+        if engine == nemotron.ENGINE:
+            return _handle_nemotron(
+                fields["file"],
+                settings=effective_settings,
+                model_key=recent_model,
+                tracker=tracker,
+                recent=recent,
+                started_at=started_at,
+            )
     device = effective_settings.diarization_device
 
     admission: vram.Admission | None = None
@@ -289,3 +301,60 @@ def handle_diarize_request(
                 audio_seconds=_wav_duration_sec(fields["file"]),
                 processing_s=time.monotonic() - engine_start,
             )
+
+
+def _handle_nemotron(
+    wav: bytes,
+    *,
+    settings: Settings,
+    model_key: str,
+    tracker: DiarizationSessionTracker,
+    recent: RecentRequests,
+    started_at: float,
+) -> tuple[int, dict[str, Any]]:
+    """Nemotron-3.5-Transcribe (LS-19): one model that diarizes and
+    transcribes, so segment text comes from the model (see nemotron_seams) and ``words``/
+    ``num_speakers``/``device`` are ignored. Runs through the Nemotron job
+    queue (live_stt/nemotron.py) -- never straight to the sidecar -- so the
+    request may wait (queued, or re-queued after a live call preempted it)
+    up to ``nemotron_job_timeout_sec``. Retryable failures come back as 503
+    with ``error.retry_after_sec``, which admin_http.py sends as a
+    ``Retry-After`` header."""
+    try:
+        audio = nemotron.parse_wav(wav)
+    except nemotron.NemotronError as exc:
+        return exc.status, {"error": {"message": str(exc)}}
+
+    request_id = tracker.start(device="cuda")
+    metrics.diarization_sessions_active.inc()
+    engine_start = time.monotonic()
+    outcome = "failed"
+    try:
+        result = nemotron.get_service().transcribe(settings, audio, model_key=model_key)
+    except nemotron.NemotronError as exc:
+        if isinstance(exc, nemotron.NemotronTimeout):
+            outcome = "timeout"
+        error: dict[str, Any] = {"message": str(exc)}
+        if exc.retry_after_sec is not None:
+            error["retry_after_sec"] = int(exc.retry_after_sec)
+        logger.warning("nemotron diarization failed (%d): %s", exc.status, exc)
+        return exc.status, {"error": error}
+    except Exception as exc:  # noqa: BLE001 -- last-resort boundary; never crash the admin thread
+        logger.exception("unexpected nemotron failure")
+        return 500, {"error": {"message": f"internal error: {exc}"}}
+    else:
+        outcome = "ok"
+        return 200, result
+    finally:
+        tracker.finish(request_id, ok=outcome == "ok")
+        metrics.diarization_sessions_active.dec()
+        metrics.diarization_requests_total.labels(outcome=outcome).inc()
+        recent.record(
+            kind="diarize",
+            outcome=outcome,
+            started_at=started_at,
+            model=model_key,
+            device="cuda",
+            audio_seconds=audio.duration_sec,
+            processing_s=time.monotonic() - engine_start,
+        )

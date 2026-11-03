@@ -42,7 +42,7 @@ MODEL_PATH = os.environ.get(
     "LSTT_MODEL_PATH", str(_REPO_ROOT / "models" / "realtime_eou_120m-v1-q8_0.gguf")
 )
 MEETING_DIR = Path(
-    "/data/vmfs/main01a_shared/Download/NOTSOFAR-1/eval_set/240629.1_eval_small_with_GT/MTG/MTG_32089"
+    "/data/vmfs/main01a_shared/test-data/NOTSOFAR-1/eval_set/240629.1_eval_small_with_GT/MTG/MTG_32089"
 )
 
 # Recorded baseline (see module docstring). Wide slack: this test's job is to

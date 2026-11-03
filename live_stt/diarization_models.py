@@ -112,6 +112,24 @@ DIARIZATION_MODELS: dict[str, DiarizationModelSpec] = {
         engine="nemo_sortformer",
         max_speakers_supported=4,
     ),
+    # Nemotron-3.5-Transcribe-30B-A4B (LS-19) -- one model that diarizes AND
+    # transcribes: segment text comes from the model, callers do not send `words`.
+    # Not pyannote/torch at all: served by a NeMo-Speech.cpp sidecar
+    # (live_stt/nemotron.py, backend nemo_speech:cuda) from the AtomicChat
+    # GGUF conversion (not gated). CUDA only, needs essentially the whole
+    # 24 GB card -- vram_mb is the short-profile figure; the long profile
+    # (24,000 MiB) and the exclusive-admission rule live in nemotron.py.
+    # Labels at most 8 speakers.
+    "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B": DiarizationModelSpec(
+        key="nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B",
+        hf_repo_id="AtomicChat/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF",
+        gated=False,
+        supports_num_speakers_hint=False,
+        measured_peak_vram_mb=23970,  # card peak, 45-min long-profile run on the RTX 3090
+        vram_mb=22200,
+        engine="nemotron_transcribe",
+        max_speakers_supported=8,
+    ),
 }
 
 DEFAULT_DIARIZATION_MODEL_KEY = "pyannote/speaker-diarization-community-1"

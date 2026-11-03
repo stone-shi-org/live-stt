@@ -33,6 +33,7 @@ from live_stt import (
     diarize_http,
     gpu,
     models,
+    nemotron,
     transcribe_http,
     tts_http,
     tts_installer,
@@ -3023,22 +3024,46 @@ def _build_warmed_workers_snapshot(state: ServerState) -> list[dict[str, Any]]:
                 "device": "GPU" if str(tw.get("device", "")).lower() in ("cuda", "gpu") else "CPU",
                 "busy": tw.get("busy", False),
             })
+    nemo = nemotron.get_service().snapshot()
+    if nemo.get("pid") is not None:
+        warmed.append({
+            "service": "Nemotron Sidecar",
+            "model": f"{nemo['model']} ({nemo.get('profile')})",
+            "pid": nemo["pid"],
+            "idle_sec": nemo.get("idle_sec") or 0.0,
+            "device": "GPU",
+            "busy": nemo.get("state") in ("busy", "loading"),
+        })
     return warmed
+
+
+def _retry_after_headers(status: int, doc: dict) -> dict[str, str] | None:
+    """503s that carry error.retry_after_sec (the Nemotron job queue, LS-19)
+    also get a real Retry-After header."""
+    if status != 503:
+        return None
+    err = doc.get("error") if isinstance(doc, dict) else None
+    retry = err.get("retry_after_sec") if isinstance(err, dict) else None
+    return {"Retry-After": str(int(retry))} if retry is not None else None
 
 
 def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
-        def _write(self, status: int, body: bytes, content_type: str) -> None:
+        def _write(
+            self, status: int, body: bytes, content_type: str, headers: dict[str, str] | None = None
+        ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
-        def _write_json(self, status: int, doc: dict) -> None:
+        def _write_json(self, status: int, doc: dict, headers: dict[str, str] | None = None) -> None:
             import json
 
-            self._write(status, json.dumps(doc).encode(), "application/json")
+            self._write(status, json.dumps(doc).encode(), "application/json", headers)
 
         def do_GET(self) -> None:  # noqa: N802 -- BaseHTTPRequestHandler's naming
             if urlsplit(self.path).path == RECENT_REQUESTS_PATH:
@@ -3169,6 +3194,11 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                                 else None
                             ),
                         },
+                        # LS-19: Nemotron-3.5-Transcribe sidecar + job queue
+                        # (live_stt/nemotron.py): state/profile, queue depth,
+                        # preemptions and re-queues. Requests themselves are
+                        # counted under "diarization" above.
+                        "nemotron": nemotron.get_service().snapshot(),
                         "stt_worker_pool": {
                             "standby_workers": state.worker_pool.snapshot(),
                             "standby_count": state.worker_pool.count(),
@@ -3219,6 +3249,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         "object": "model",
                         "type": "diarization",
                         "default": spec.key == state.settings.diarization_model,
+                        "engine": spec.engine,
                         "gated": spec.gated,
                         "supports_num_speakers_hint": spec.supports_num_speakers_hint,
                         "measured_peak_vram_mb": spec.measured_peak_vram_mb,
@@ -3259,7 +3290,7 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                     tracker=state.diarization_sessions,
                     recent=state.recent_requests,
                 )
-                self._write_json(status, doc)
+                self._write_json(status, doc, _retry_after_headers(status, doc))
             elif self.path == transcribe_http.TRANSCRIBE_PATH:
                 length = int(self.headers.get("Content-Length", 0) or 0)
                 body = self.rfile.read(length) if length else b""

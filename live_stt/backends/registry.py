@@ -226,6 +226,24 @@ BACKENDS: dict[tuple[str, str], BackendSpec] = {
         lib_filename="libwhisper.so",
         wired=True,
     ),
+    # NeMo-Speech.cpp's `nemo-speech serve` (LS-19): the sidecar that serves
+    # Nemotron-3.5-Transcribe-30B-A4B for speaker-attributed post-call
+    # transcripts (live_stt/nemotron.py). Not linked by any worker -- run as a
+    # child process from <install dir>/bin/nemo-speech, whose RPATH is
+    # $ORIGIN/../lib. Bundles its own cudart/cuBLAS 12 (CUDA 12.8.1, includes
+    # 86-real); needs only the driver's libcuda.so.1. Verified to run inside
+    # the live-stt image under --memory 20g on homesrv3.
+    ("nemo_speech", "cuda"): BackendSpec(
+        engine="nemo_speech",
+        flavor="cuda",
+        source="github_release",
+        repo="NVIDIA/NeMo-Speech.cpp",
+        tag="v0.3.0",
+        asset_filename="nemo-speech-0.3.0-linux-x86_64-cuda.tar.gz",
+        sha256="eca00a1f67d3ca200ddba11dd71c4f3d67e044cc0939d17d073978e40b995917",
+        lib_filename="bin/nemo-speech",
+        wired=True,
+    ),
 }
 
 

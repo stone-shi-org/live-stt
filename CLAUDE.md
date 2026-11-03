@@ -452,7 +452,7 @@ in `configure()` and there is no loop anywhere near it.
   below), and that the CLI (`tools/diarize_call.py`) exits cleanly with a readable message on both.
 
   **Real end-to-end run, done for real (not simulated), against NOTSOFAR-1's `MTG_32089`** — the
-  same meeting Gate C already used (`/data/vmfs/main01a_shared/Download/NOTSOFAR-1/eval_set/
+  same meeting Gate C already used (`/data/vmfs/main01a_shared/test-data/NOTSOFAR-1/eval_set/
   240629.1_eval_small_with_GT/MTG/MTG_32089`), specifically `sc_meetup_0/ch0.wav` (16kHz mono,
   358s, 5 real participants: Sarah/Donald/Ron/Beth/Rachel) plus its `gt_transcription.json`, which
   conveniently has real per-speaker ground truth AND real word-level timestamps (1151 words) —
@@ -1053,6 +1053,9 @@ in `configure()` and there is no loop anywhere near it.
   mid-length audio are unmeasured; `ModelSpec.vram_mb` for TDT (2300) is a fixed figure while its
   real need grows with upload length, so a long enough upload can still OOM past admission.
 
+- **Nemotron-3.5-Transcribe-30B-A4B speaker-attributed post-call transcripts (LS-19) -- built,
+  verified for real on homesrv3's RTX 3090 (benchmark gate met: cpWER 0.295, DER 0.054), not yet
+  deployed to live-stt-2.** See "Fourth engine: Nemotron-3.5-Transcribe" below.
 - **Not yet built:** the AudioRing/backpressure design and its drift watchdog (`queue_max_sec`,
   `ring_history_sec`, `warn_behind_sec`, `abort_behind_sec` exist as `Settings` fields, referenced
   in a docstring, but nothing reads them yet — `feed_audio()` just buffers to one model chunk and
@@ -1346,6 +1349,144 @@ executed at `finalize()` via `parakeet_capi_transcribe_pcm_batch_json_lang` (`de
 - Accessible via batch HTTP endpoint `POST /v1/audio/transcriptions`.
 - Mid-call worker rotation is unconditionally disabled in `CallSession._should_start_rotation`.
 - GGUF model: `mudler/parakeet-cpp-gguf` -> `tdt-0.6b-v3-q8_0.gguf` (940.7 MB, sha256 `4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757`).
+
+## Fourth engine: Nemotron-3.5-Transcribe-30B-A4B (speaker-attributed post-call transcripts, LS-19)
+
+`nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` diarizes AND transcribes in one model. It is
+served **only** on `POST /v1/audio/diarization` (`model=nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B`),
+never on gRPC `Transcribe` or plain `/v1/audio/transcriptions`. Why, from LS-19's 20-meeting
+NOTSOFAR-1 benchmark (homesrv3, RTX 3090): cpWER **0.295 vs 0.456** and DER **0.054 vs 0.133**
+against pyannote + parakeet-tdt, but no plain-WER gain over parakeet-tdt (0.324 vs 0.308) at ~20x
+the VRAM. Plain and live ASR stay on parakeet. Default diarization model is still pyannote; switching
+my-meeting-notes is a config change (`model=` / `diarization_model`).
+
+**Pieces.**
+- `live_stt/nemotron.py` -- `NemotronService` (process-wide singleton, `get_service()`): the
+  `nemo-speech serve` sidecar on 127.0.0.1 (states unloaded/loading/ready/busy), the job queue,
+  preemption, the size-tier table and the duration plan. Modelled on `TTSWorkerManager`.
+- `live_stt/nemotron_seams.py` -- pure: parse words/turns from a response, overlap-vote seams,
+  build the house JSON.
+- Runtime: NeMo-Speech.cpp **v0.3.0** `nemo-speech-0.3.0-linux-x86_64-cuda.tar.gz` (sha256
+  `eca00a1f…5917`), registered as backend `nemo_speech:cuda` (`live_stt/backends/registry.py`).
+  Install with `POST /api/backends/install {"engine":"nemo_speech","flavor":"cuda"}` then
+  `/api/backends/activate`; the binary is `<install dir>/bin/nemo-speech` (RPATH `$ORIGIN/../lib`,
+  bundles its own cudart/cuBLAS 12, needs only the driver's libcuda). `LSTT_NEMOTRON_BIN` overrides.
+- Model: AtomicChat GGUF conversion (not gated) -- decoder `…-AD-IQ4_NL.gguf` (sha256 `0c47d4ab…45ad`)
+  plus `…-Encoder-F16.gguf` (sha256 `4221029c…7ba2`) in `models_dir` (or `LSTT_NEMOTRON_MODELS_DIR`);
+  `scripts/fetch_model.sh nemotron-3.5-transcribe-30b-a4b nemotron-3.5-transcribe-30b-a4b-encoder`.
+- Registry: `DiarizationModelSpec(engine="nemotron_transcribe", gated=False,
+  supports_num_speakers_hint=False, max_speakers_supported=8)`. `diarize_http.py` dispatches on the
+  engine before any pyannote code runs; `words`/`num_speakers`/`device` are ignored for it.
+
+**Prompting -- never the server's default.** Every request is `/v1/chat/completions` with the model
+card's speaker instruction (`nemotron.SPEAKER_INSTRUCTION`) and `timestamp_granularities: ["word"]`
+(`build_chat_payload` is the only request builder; a unit test pins it). On the spike, the server's
+built-in prompt (`/v1/audio/transcriptions`) **silently invented 4 of 10 full-meeting transcripts
+with HTTP 200**. A response with text but unaligned word timestamps (what 55 min produced) is a 502,
+never returned as a transcript without speakers.
+
+**Segments come from the model's own diarization turns, not from words.** `transcription.diarization_timestamps`
+gives segment timing, unchanged; each word's text goes to the same-speaker turn covering it, else the
+nearest same-speaker turn however far (only a speaker with no turn at all gets word-run segments).
+Measured on the 20 benchmark responses (spike scorer, 10 ms frames, 0.25 s collar): turns as-is **DER
+0.054**; word-run segments 0.186 (CTC word spans are tight, so speech between words counts as missed);
+turns stretched to reach their words 0.499 (the first integrated version -- caught only by the real
+run below); far words as their own segments 0.119. ~23% of turns carry no same-speaker word
+(backchannels, overlapped speech whose words went to the other speaker) and keep **empty text** --
+dropping them doubles DER (0.107). my-meeting-notes only rejects a response whose segments ALL lack
+text. A `words` extension field carries the word-level attribution. Note this departs from the
+ticket's "segments from consecutive same-speaker words", which would have failed its own DER gate.
+
+**Profiles by duration** (24 GB tier, the only verified one; the others in `TIERS` refuse with 503):
+
+| profile | asr.salm settings | audio | concurrency | admission figure |
+|---|---|---|---|---|
+| short | 4 slots, `n_ctx_per_sequence` 8192, `max_context` 32768, `n_batch` 1024, `encoder_max_batch` 4, `mtp_draft` 0 | <= `nemotron_short_max_sec` (27 min; token cap ~29.4 min) | up to 4 jobs on one process | 22,200 MiB |
+| long | 1 slot, 73728 context, `n_batch` 512, `encoder_max_batch` 1, `encoder_ahead_seconds` 600 | <= `nemotron_long_max_sec` (45 min) | 1, fresh process every request | 24,000 MiB |
+| windowed | long, per window | <= `max_call_sec` (150 min) | 1 | 24,000 MiB |
+
+45 min is a **hard** limit: 50 min crashed the process (`CUDA error: out of memory`), 55 min lost word
+timestamps, 60 min crashed -- non-monotonic, so it is refused, never attempted. Settings validation
+keeps `nemotron_window_sec <= nemotron_long_max_sec`. The word-timestamp buffer only grows, so a long
+request always gets a fresh process and the process is recycled after
+`nemotron_recycle_after_requests`. A profile switch drains running jobs and restarts (~10 s).
+
+**Over 45 min: overlap-vote seams.** 40-min windows, 5-min overlap, each through the long profile on a
+fresh process. Text and turns are cut at the overlap midpoint. Speakers: for each adjacent pair, words
+both windows transcribed in the overlap are paired (same normalized text, centres within 0.6 s);
+each pair votes (new local label -> global label); labels map one-to-one strongest vote first; an
+unvoted label becomes a new speaker. A seam with fewer than `nemotron_seam_min_votes` (100) matched
+words gets a `warnings` entry (scaled-down seam test: >=100 lost 0.011 cpWER, <100 lost 0.136). The
+response's `seams` field lists each seam's time and vote count. Known blind spot: a speaker silent
+through an overlap cannot be matched and becomes a new label.
+
+**GPU sharing and admission.** The model needs essentially the whole card, which the normal rule
+(`need + vram_reserve_pct` reserve, ~2.4 GB on 24 GB) would always refuse. `vram.admit_exclusive`:
+free VRAM (reservation-aware, after reclaiming idle warm workers) must cover the profile figure plus
+`nemotron_vram_margin_mb` (64; an idle 3090 shows ~24,115 MiB free). The sidecar holds that
+reservation until it stops. A queued job only attempts a load while **no other GPU reservation
+exists** (`vram.has_other_gpu_work`) -- it never reclaims under a live call. Any other GPU admission
+can evict an IDLE sidecar (`stop_if_idle`, wired into `vram.reclaim_idle_workers`).
+
+**Live calls preempt running jobs (option b).** In `servicer.Transcribe`, a CUDA admission that fails
+while a Nemotron job is running or loading calls `nemotron.preempt_and_admit`: the sidecar is
+SIGTERMed (exit ~0.7 s), the call waits for the VRAM to come back (`nemotron_preempt_wait_sec`) and is
+re-admitted; every running job goes back to the HEAD of the queue with its original audio and reruns
+from scratch (all windows). Queued jobs are held off until the call's own reservation exists, then
+wait for it to end. Nothing else preempts: pyannote/tdt/whisper/TTS get the normal capacity rejection.
+The HTTP request stays open throughout, bounded by `nemotron_job_timeout_sec` (30 min) -> 503 with
+`Retry-After` (`error.retry_after_sec`, sent as a header by `admin_http`). Starvation under sustained
+live-call load is possible by design.
+
+**Failures.** A compute-buffer OOM kills the sidecar: the in-flight request gets a retryable 503 and
+`crashes_total`/`live_stt_nemotron_sidecar_events_total{event="crash"}` count it; the next request
+loads a fresh process. Missing binary/models, no GPU, compute capability < 8.0 or an untested tier:
+503 without `Retry-After`.
+
+**Visibility.** `/api/stats["nemotron"]` (state, profile, pid, tier, queue depth, running jobs,
+loads/preemptions/requeues/crashes/timeouts); requests also count under `/api/stats["diarization"]`
+(`DiarizationSessionTracker`) and in `recent_requests` (kind `diarize`, the registry key, outcome
+`ok|failed|timeout`, no content). Prometheus: `live_stt_nemotron_{queue_depth,jobs_running,
+sidecar_state,preemptions_total,requeues_total,sidecar_events_total,job_timeouts_total,
+low_vote_seams_total}`. The sidecar also shows in the dashboard's warmed-workers table.
+
+**Tests.** `tests/test_nemotron.py` drives `tests/fakes/fake_nemo_speech.py` -- a real subprocess
+speaking real HTTP, no binary/model/GPU -- with a fake card whose free VRAM drops while a fake sidecar
+is alive, so admission, eviction, crash recovery, preemption + re-queue and the job timeout all run
+through the real `vram.py`. Its synthetic audio encodes each second's absolute index in the samples,
+so windowed jobs can check seam stitching exactly. `tests/test_servicer.py` has a real-gRPC
+preemption test. `tests/test_nemotron_integration.py` (`integration`/`gpu`/`model`) needs
+`LSTT_NEMOTRON_TEST_BIN`/`_MODELS_DIR`/`_WAV`.
+
+**Verified for real on homesrv3 (RTX 3090, 2026-11-02)** -- this code, inside the production
+`live-stt:latest` image (`--gpus all --memory 20g`), the real NeMo-Speech.cpp v0.3.0 binary and the
+real IQ4_NL GGUFs, every request through the real `diarize_http.handle_diarize_request` (scripts and
+outputs: `~/ls19-verify` on homesrv3; live-stt-2 itself was not touched or redeployed):
+
+| check | result |
+|---|---|
+| 20-meeting benchmark (AC1 gate: cpWER <= 0.31, DER <= 0.06) | **cpWER 0.295** (0.2949 scored from segment text), **DER 0.054** -- identical to the spike benchmark; 20/20 HTTP 200, ~14 s per 6-min meeting warm |
+| cold request (load + warmup + 6-min meeting) | 22.2 s; load + 60 s clip 11.4 s |
+| idle unload (timeout 3 s) | unloaded at 3.0 s, card back to the 9 MiB baseline 0.6 s later |
+| another GPU admission (pyannote-sized) while idle | evicted the sidecar, admitted, 24,115 MiB free |
+| sidecar SIGKILLed mid-request | 503 + `retry_after_sec: 30`, `crashes_total` 1; next request 200 on a fresh process |
+| live-call admission while a job runs | refused (1,915 MiB free) -> preempt -> **admitted in 0.88 s**; job re-queued, reran, output **identical** to its unpreempted run |
+| job queued while a live call holds VRAM, 5 s timeout | 503 + `retry_after_sec: 120` after 5.1 s, never loaded |
+| recycle after 20 requests | fired on the 20th benchmark request |
+| 45 min, long profile, one pass | 200 in 139.9 s |
+| 65 min, windowed (2400 s + 1800 s windows, fresh process each) | 200 in 217.5 s; one seam at 2250 s with **366 matched words** (no warning) |
+
+The first preemption run took 5.37 s: a sidecar mid-request does not exit promptly on SIGTERM (an
+idle one exits in ~0.7 s), so the 5 s grace ran out before SIGKILL. Preemption now uses a 0.5 s grace
+(`PREEMPT_TERM_GRACE_SEC`), and the fake server defers SIGTERM while busy so the unit test keeps that
+honest. The 45/65-min files are concatenations of different NOTSOFAR-1 meetings (28 and 44 true
+speakers, far over the model's 8 labels), so their cpWER/DER say nothing about long-meeting quality;
+they prove the length handling and seam mechanics only.
+
+**Not validated:** telephony (8 kHz) audio -- required before any phone-call use; real two-person
+calls; seam matching on real long meetings with ground truth (the 65-min check above is a
+concatenation of short meetings); 45 min while anything else holds VRAM (will not fit); tiers other
+than 24 GB / IQ4_NL; v0.3.0 lacks `asr.salm.n_cpu_moe`/`batched`.
 
 ## parakeet.cpp: verified API facts and build gotchas found while building this
 

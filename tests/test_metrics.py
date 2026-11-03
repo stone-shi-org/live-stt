@@ -611,3 +611,48 @@ async def test_stats_json_and_dashboard_reflects_warmed_workers() -> None:
         state.tts_worker_manager.stop()
         server.shutdown()
 
+
+
+def test_nemotron_metrics_are_registered() -> None:
+    dump = _dump()
+    for name in (
+        "live_stt_nemotron_queue_depth",
+        "live_stt_nemotron_jobs_running",
+        "live_stt_nemotron_preemptions_total",
+        "live_stt_nemotron_requeues_total",
+        "live_stt_nemotron_job_timeouts_total",
+    ):
+        assert name in dump, name
+
+
+@pytest.mark.asyncio
+async def test_stats_json_includes_nemotron_sidecar_and_queue() -> None:
+    import json
+
+    settings = Settings(_env_file=None)
+    state = ServerState(settings=settings, budget=WorkerBudget(settings.max_concurrent_calls, settings.reserve_slots))
+    server = serve_admin_http("127.0.0.1", 0, state)
+    try:
+        port = server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stats", timeout=5) as resp:
+            doc = json.loads(resp.read().decode())
+        nemo = doc["nemotron"]
+        assert nemo["state"] == "unloaded"
+        assert nemo["profile"] is None
+        assert nemo["queue_depth"] == 0
+        assert nemo["preemptions_total"] == 0
+        assert nemo["requeues_total"] == 0
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=5) as resp:
+            models_doc = json.loads(resp.read().decode())
+        entry = next(m for m in models_doc["data"] if m["id"] == "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B")
+        assert entry["type"] == "diarization" and entry["engine"] == "nemotron_transcribe"
+    finally:
+        server.shutdown()
+
+
+def test_retry_after_header_only_for_503_with_retry_hint() -> None:
+    from live_stt.admin_http import _retry_after_headers
+
+    assert _retry_after_headers(503, {"error": {"message": "x", "retry_after_sec": 120}}) == {"Retry-After": "120"}
+    assert _retry_after_headers(503, {"error": {"message": "x"}}) is None
+    assert _retry_after_headers(200, {"error": {"retry_after_sec": 5}}) is None

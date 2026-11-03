@@ -71,6 +71,18 @@ HOT_RELOAD_FIELDS: frozenset[str] = frozenset(
         "parakeet_tdt_att_context",
         "batch_window_sec",
         "batch_overlap_sec",
+        # LS-19: read per job by live_stt/nemotron.py; the process-level
+        # knobs (binary, models dir, port, ready timeout) are not hot.
+        "nemotron_idle_timeout_sec",
+        "nemotron_recycle_after_requests",
+        "nemotron_job_timeout_sec",
+        "nemotron_short_max_sec",
+        "nemotron_long_max_sec",
+        "nemotron_window_sec",
+        "nemotron_window_overlap_sec",
+        "nemotron_seam_min_votes",
+        "nemotron_vram_margin_mb",
+        "nemotron_preempt_wait_sec",
         "max_call_sec",
         "tts_voice",
         "tts_idle_timeout_sec",

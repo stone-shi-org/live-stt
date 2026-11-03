@@ -37,6 +37,11 @@ def _offline_safety(monkeypatch: pytest.MonkeyPatch) -> None:
     # that happens to have a real one built at the default path must not
     # let a "unit" test accidentally exercise it.
     monkeypatch.delenv("LSTT_WORKER_BIN_WHISPER", raising=False)
+    # LS-19: a real nemo-speech binary / 20 GB of Nemotron GGUFs on a dev box
+    # must never be picked up by a unit test (tests/test_nemotron.py drives
+    # tests/fakes/fake_nemo_speech.py explicitly).
+    monkeypatch.delenv("LSTT_NEMOTRON_BIN", raising=False)
+    monkeypatch.delenv("LSTT_NEMOTRON_MODELS_DIR", raising=False)
     # A real HF token lives in this dev host's shell env (~/.secrets/huggingface.env,
     # sourced from .zshenv -- see CLAUDE.md) so ad-hoc diarization runs don't need
     # it typed in. Settings(_env_file=None) only skips the .env FILE, not real

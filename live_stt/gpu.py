@@ -88,3 +88,26 @@ def snapshot() -> dict[str, int | None]:
         "used_vram_mb": used_vram_mb(),
         "utilization_pct": utilization_pct(),
     }
+
+
+def compute_cap() -> float | None:
+    """CUDA compute capability of GPU 0 (e.g. 8.6 for an RTX 3090), or None
+    when nvidia-smi is unavailable. Drives Nemotron's size tier (LS-19)."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        return float(out.stdout.strip().splitlines()[0])
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        ValueError,
+        IndexError,
+    ) as exc:
+        logger.warning("could not query GPU compute_cap: %s", exc)
+        return None

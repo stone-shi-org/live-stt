@@ -74,7 +74,7 @@ diarization_sessions_active = Gauge(
 diarization_requests_total = Counter(
     "live_stt_diarization_requests_total",
     "Completed diarization HTTP requests",
-    ["outcome"],  # ok|failed|rejected_vram
+    ["outcome"],  # ok|failed|rejected_vram|timeout (timeout: Nemotron job queue, LS-19)
 )
 transcribe_sessions_active = Gauge(
     "live_stt_transcribe_sessions_active",
@@ -98,6 +98,33 @@ tts_chars_total = Counter(
     "live_stt_tts_chars_total",
     "Total characters synthesized via TTS",
 )
+# --- Nemotron-3.5-Transcribe sidecar + job queue (LS-19, live_stt/nemotron.py) ---
+nemotron_queue_depth = Gauge("live_stt_nemotron_queue_depth", "Nemotron jobs waiting to start")
+nemotron_jobs_running = Gauge("live_stt_nemotron_jobs_running", "Nemotron jobs currently running")
+nemotron_sidecar_state = Gauge(
+    "live_stt_nemotron_sidecar_state",
+    "Nemotron sidecar state (1 for the current state, 0 otherwise)",
+    ["state"],  # unloaded|loading|ready|busy
+)
+nemotron_preemptions_total = Counter(
+    "live_stt_nemotron_preemptions_total", "Nemotron jobs preempted by a live gRPC call"
+)
+nemotron_requeues_total = Counter(
+    "live_stt_nemotron_requeues_total", "Nemotron jobs put back at the head of the queue after preemption"
+)
+nemotron_sidecar_events_total = Counter(
+    "live_stt_nemotron_sidecar_events_total",
+    "Nemotron sidecar lifecycle events",
+    ["event"],  # load|load_failed|unload_idle|evicted|recycled|crash|preempted|profile_switch
+)
+nemotron_job_timeouts_total = Counter(
+    "live_stt_nemotron_job_timeouts_total", "Nemotron jobs that hit nemotron_job_timeout_sec (503 + Retry-After)"
+)
+nemotron_low_vote_seams_total = Counter(
+    "live_stt_nemotron_low_vote_seams_total",
+    "Window seams whose overlap vote fell below nemotron_seam_min_votes (reported in warnings)",
+)
+
 stt_standby_workers_active = Gauge(
     "live_stt_stt_standby_workers_active",
     "Pre-warmed STT standby workers currently idle in memory",
