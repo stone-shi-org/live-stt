@@ -2300,6 +2300,10 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     diarizationModels.length
                         ? diarizationModels.map(m => modelRow(m, [
                               m.default && 'default',
+                              // Capabilities: what a caller actually gets back.
+                              m.transcribes ? 'transcript + speakers' : 'speakers only',
+                              m.max_speakers_supported && `max ${m.max_speakers_supported} speakers`,
+                              m.requires_cuda && 'CUDA only',
                               m.gated && 'gated',
                               m.supports_num_speakers_hint && 'num_speakers hint',
                           ])).join('')
@@ -3252,6 +3256,11 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                         "engine": spec.engine,
                         "gated": spec.gated,
                         "supports_num_speakers_hint": spec.supports_num_speakers_hint,
+                        # Capabilities the admin UI renders as badges (LS-19):
+                        # transcribes = segment text comes from the model itself.
+                        "transcribes": spec.transcribes,
+                        "requires_cuda": spec.requires_cuda,
+                        "max_speakers_supported": spec.max_speakers_supported,
                         "measured_peak_vram_mb": spec.measured_peak_vram_mb,
                         "vram_mb": vram.need_mb(state.settings, spec.key, spec.vram_mb, state.settings.diarization_vram_mb),
                     }

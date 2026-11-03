@@ -646,6 +646,14 @@ async def test_stats_json_includes_nemotron_sidecar_and_queue() -> None:
             models_doc = json.loads(resp.read().decode())
         entry = next(m for m in models_doc["data"] if m["id"] == "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B")
         assert entry["type"] == "diarization" and entry["engine"] == "nemotron_transcribe"
+        assert entry["transcribes"] is True and entry["requires_cuda"] is True
+        assert entry["max_speakers_supported"] == 8
+        pyannote = next(m for m in models_doc["data"] if m["id"] == "pyannote/speaker-diarization-community-1")
+        assert pyannote["transcribes"] is False and pyannote["requires_cuda"] is False
+        # The dashboard renders these as badges.
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as resp:
+            html = resp.read().decode()
+        assert "'transcript + speakers'" in html and "'speakers only'" in html
     finally:
         server.shutdown()
 

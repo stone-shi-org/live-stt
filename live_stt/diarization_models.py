@@ -80,6 +80,15 @@ class DiarizationModelSpec:
     # identical), but the best signal available without engine-level
     # ground truth.
     max_speakers_supported: int | None = None
+    # The engine produces the words itself, so segment ``text`` comes back
+    # filled and the caller does not need to send ``words`` (Nemotron-3.5-
+    # Transcribe, LS-19: a speaker-attributed TRANSCRIPT). False for
+    # pyannote/Sortformer, which only say who spoke when -- text there is
+    # merged in from a separate ASR pass the caller supplies. Surfaced in
+    # /v1/models and as a capability badge in the admin UI.
+    transcribes: bool = False
+    # Only runs on a CUDA GPU (no CPU fallback), e.g. Nemotron's sidecar.
+    requires_cuda: bool = False
 
 
 DIARIZATION_MODELS: dict[str, DiarizationModelSpec] = {
@@ -129,6 +138,8 @@ DIARIZATION_MODELS: dict[str, DiarizationModelSpec] = {
         vram_mb=22200,
         engine="nemotron_transcribe",
         max_speakers_supported=8,
+        transcribes=True,
+        requires_cuda=True,
     ),
 }
 

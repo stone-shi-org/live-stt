@@ -61,6 +61,8 @@ def test_spec_dataclass_shape_has_no_surprise_fields():
         "vram_mb",
         "engine",
         "max_speakers_supported",
+        "transcribes",
+        "requires_cuda",
     }
 
 
@@ -108,3 +110,12 @@ def test_nemotron_transcribe_entry() -> None:
     assert spec.max_speakers_supported == 8
     assert spec.vram_mb == 22200
     assert DEFAULT_DIARIZATION_MODEL_KEY == "pyannote/speaker-diarization-community-1"  # opt-in only
+
+
+def test_transcribes_capability_only_on_nemotron():
+    from live_stt.diarization_models import DIARIZATION_MODELS
+
+    transcribing = {k for k, v in DIARIZATION_MODELS.items() if v.transcribes}
+    assert transcribing == {"nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B"}
+    assert DIARIZATION_MODELS["nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B"].requires_cuda
+    assert not DIARIZATION_MODELS["pyannote/speaker-diarization-community-1"].requires_cuda
