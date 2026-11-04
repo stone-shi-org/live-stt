@@ -315,6 +315,43 @@ def relabel_in_order(words: list[Word], turns: list[Turn] | None = None) -> tupl
     )
 
 
+def repair_collapsed_word_speakers(words: list[Word], turns: list[Turn]) -> tuple[list[Word], bool]:
+    """Relabel words from the model's turns when its inline speaker tags collapsed.
+
+    Occasionally the model's diarization turns name several speakers while its inline
+    ``<spk:N>`` tags put every word on one of them (NOTSOFAR MTG_32256: 4 speakers in the
+    turns, all 877 words on ``spk:0``). ``_assign_words`` then piles the whole transcript
+    into that speaker's turns: DER stays fine, but per-speaker text is wrong (cpWER 1.14
+    on a meeting with WER 0.02). Only that unambiguous case is repaired -- one word label,
+    two or more turn labels -- so ordinary word/turn disagreement (overlap, backchannels)
+    is left alone. Each word takes the speaker of the turn it overlaps most, else of the
+    nearest turn. Returns ``(words, repaired)``.
+
+    This is a best effort, not a cure: on MTG_32256 the collapse came with broken word
+    timestamps too (no words placed between 90 s and 300 s, the rest crowded around them;
+    deterministic on re-run, and still present in a 0-200 s window), so relabelling only
+    took cpWER from 1.14 to 1.09. The caller therefore always reports it in ``warnings``.
+    """
+    if not words or not turns:
+        return words, False
+    if len({w.speaker for w in words}) != 1 or len({t.speaker for t in turns}) < 2:
+        return words, False
+
+    def pick(w: Word) -> str:
+        best: Turn | None = None
+        best_key: tuple[float, float] | None = None
+        for t in turns:
+            overlap = max(0.0, min(w.end, t.end) - max(w.start, t.start))
+            dist = 0.0 if t.start <= w.centre <= t.end else min(abs(w.centre - t.start), abs(w.centre - t.end))
+            key = (-overlap, dist)
+            if best_key is None or key < best_key:
+                best, best_key = t, key
+        assert best is not None
+        return best.speaker
+
+    return [Word(w.text, w.start, w.end, pick(w)) for w in words], True
+
+
 def _word_runs(words: list[Word]) -> list[Turn]:
     runs: list[Turn] = []
     cur: Turn | None = None

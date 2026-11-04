@@ -125,6 +125,11 @@ nemotron_low_vote_seams_total = Counter(
     "Window seams whose overlap vote fell below nemotron_seam_min_votes (reported in warnings)",
 )
 
+nemotron_word_speaker_repairs_total = Counter(
+    "live_stt_nemotron_word_speaker_repairs_total",
+    "Nemotron windows whose word speaker tags collapsed to one label and were relabelled from the turns",
+)
+
 stt_standby_workers_active = Gauge(
     "live_stt_stt_standby_workers_active",
     "Pre-warmed STT standby workers currently idle in memory",

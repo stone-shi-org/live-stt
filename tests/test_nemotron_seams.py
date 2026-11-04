@@ -137,6 +137,45 @@ def test_segments_use_turn_timing_with_word_text():
     assert doc["num_speakers"] == 3
 
 
+def test_collapsed_word_speakers_are_relabelled_from_turns():
+    # MTG_32256 shape: turns name 3 speakers, every word tagged spk:0.
+    words = [_w("hello", 1.0, "spk:0"), _w("hi", 5.1, "spk:0"), _w("yes", 9.0, "spk:0"), _w("gap", 12.0, "spk:0")]
+    turns = [seams.Turn("spk:0", 0.5, 3.0), seams.Turn("spk:1", 4.0, 7.0), seams.Turn("spk:2", 8.0, 10.0)]
+    fixed, repaired = seams.repair_collapsed_word_speakers(words, turns)
+    assert repaired
+    # Covering turn wins; a word outside every turn takes the nearest one.
+    assert [w.speaker for w in fixed] == ["spk:0", "spk:1", "spk:2", "spk:2"]
+    assert [(w.text, w.start, w.end) for w in fixed] == [(w.text, w.start, w.end) for w in words]
+    doc = seams.words_to_house_json(fixed, model="m", turns=turns)
+    assert [(s["speaker"], s["text"]) for s in doc["segments"]] == [
+        ("SPEAKER_00", "hello"), ("SPEAKER_01", "hi"), ("SPEAKER_02", "yes gap"),
+    ]
+
+
+def test_collapsed_word_speaker_repair_prefers_larger_overlap():
+    words = [Word("both", 2.6, 3.4, "spk:0")]  # 0.4 s inside spk:0's turn, 0.5 s inside spk:1's
+    turns = [seams.Turn("spk:0", 0.0, 3.0), seams.Turn("spk:1", 2.9, 6.0)]
+    fixed, repaired = seams.repair_collapsed_word_speakers(words, turns)
+    assert repaired and fixed[0].speaker == "spk:1"
+
+
+@pytest.mark.parametrize(
+    "words, turns",
+    [
+        # Words already carry several speakers: ordinary disagreement is left alone.
+        ([_w("a", 1.0, "spk:0"), _w("b", 5.0, "spk:0"), _w("c", 5.5, "spk:1")],
+         [seams.Turn("spk:0", 0.0, 2.0), seams.Turn("spk:1", 4.0, 7.0)]),
+        # A genuine single-speaker recording.
+        ([_w("a", 1.0, "spk:0"), _w("b", 5.0, "spk:0")], [seams.Turn("spk:0", 0.0, 7.0)]),
+        # No turns at all.
+        ([_w("a", 1.0, "spk:0")], []),
+    ],
+)
+def test_word_speaker_repair_only_fires_on_full_collapse(words, turns):
+    fixed, repaired = seams.repair_collapsed_word_speakers(words, turns)
+    assert not repaired and fixed is words
+
+
 def test_seam_warnings_flag_low_vote_seams_only():
     reports = [
         seams.SeamReport(0, 2100, 2400, matched_words=250),

@@ -25,6 +25,8 @@ Behaviour knobs (environment):
   FAKE_NEMO_ALIGN_FAIL     "1": text but no aligned word timestamps (the 55-min case)
   FAKE_NEMO_EXIT_BEFORE_READY "1": exit 3 during load
   FAKE_NEMO_NO_TURNS       "1": no diarization_timestamps (segments fall back to word runs)
+  FAKE_NEMO_COLLAPSE_WORD_SPEAKERS "1": every word tagged spk:0 while turns stay correct
+                           (seen on NOTSOFAR MTG_32256)
   FAKE_NEMO_SPEAKERS / FAKE_NEMO_TURN_SEC / FAKE_NEMO_WORD_EVERY
 """
 
@@ -119,6 +121,9 @@ def transcribe(wav_bytes: bytes) -> dict:
             turns[-1]["end"] = float(i + 1)
         else:
             turns.append({"speaker": slot, "start": float(i), "end": float(i + 1)})
+    if os.environ.get("FAKE_NEMO_COLLAPSE_WORD_SPEAKERS") == "1":
+        for w in words:
+            w["speaker"], w["speaker_slot"] = "spk:0", 0
     text = " ".join(f"<{w['speaker']}> {w['word']}" for w in words)
     if os.environ.get("FAKE_NEMO_ALIGN_FAIL") == "1":
         return {

@@ -207,6 +207,21 @@ def test_without_turns_segments_fall_back_to_word_runs(env, monkeypatch):
     assert all(s["text"] for s in doc["segments"])
 
 
+def test_collapsed_word_speakers_are_relabelled_and_warned(env, monkeypatch):
+    monkeypatch.setenv("FAKE_NEMO_COLLAPSE_WORD_SPEAKERS", "1")
+    before = metrics.nemotron_word_speaker_repairs_total._value.get()
+    doc = _run(env, 130)
+    # Words follow the turns again: three speakers, each turn carrying its own words.
+    assert doc["num_speakers"] == 3
+    assert len({w["speaker"] for w in doc["words"]}) == 3
+    assert all(s["text"] for s in doc["segments"])
+    for seg in doc["segments"]:
+        for tok in seg["text"].split():
+            assert seg["start"] <= int(tok[1:]) < seg["end"]
+    assert len(doc["warnings"]) == 1 and "relabelled" in doc["warnings"][0]
+    assert metrics.nemotron_word_speaker_repairs_total._value.get() == before + 1
+
+
 def test_low_vote_seam_is_reported_in_warnings(env, monkeypatch):
     monkeypatch.setenv("FAKE_NEMO_WORD_EVERY", "10")  # 30 words in the 5-min overlap
     before = metrics.nemotron_low_vote_seams_total._value.get()

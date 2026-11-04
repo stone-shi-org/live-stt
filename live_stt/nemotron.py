@@ -559,6 +559,21 @@ class NemotronService:
                 self._update_metrics_locked()
                 self._cond.notify_all()
 
+        # Per window, before stitching: seam votes pair words by speaker label.
+        repaired_windows: list[tuple[float, float]] = []
+        for i, (w_start, w_end, w_words, w_turns) in enumerate(results):
+            fixed, repaired = seams.repair_collapsed_word_speakers(w_words, w_turns)
+            if repaired:
+                results[i] = (w_start, w_end, fixed, w_turns)
+                repaired_windows.append((w_start, w_end))
+        if repaired_windows:
+            metrics.nemotron_word_speaker_repairs_total.inc(len(repaired_windows))
+            logger.warning(
+                "nemotron job %d: word speaker tags collapsed to one label in %d window(s); "
+                "relabelled words from the model's diarization turns",
+                job.id, len(repaired_windows),
+            )
+
         if len(results) == 1:
             words, turns, seam_reports = results[0][2], results[0][3], []
         else:
@@ -575,6 +590,12 @@ class NemotronService:
             doc.setdefault("warnings", []).append(
                 f"detected speaker count ({doc['num_speakers']}) is at this model's labelling maximum "
                 f"({MAX_SPEAKERS}); if the real audio has more speakers, some were merged"
+            )
+        for w_start, w_end in repaired_windows:
+            doc.setdefault("warnings", []).append(
+                f"word speaker tags {w_start:.0f}-{w_end:.0f}s all named one speaker while the model's "
+                "diarization found several; words were relabelled from the diarization turns, but "
+                "per-speaker text in this span is unreliable (word timestamps may be misaligned too)"
             )
         if seam_reports:
             doc["seams"] = [
