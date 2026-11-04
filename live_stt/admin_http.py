@@ -829,6 +829,73 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             border: 1px solid rgba(245, 158, 11, 0.25);
         }
 
+        .badge-unavail {
+            background: rgba(239, 68, 68, 0.16);
+            color: #fca5a5;
+            border: 1px solid rgba(239, 68, 68, 0.35);
+            font-weight: 600;
+        }
+
+        /* Modal Dialog (LS-20 backend activation error dialog) */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(9, 13, 22, 0.78);
+            backdrop-filter: blur(4px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+            padding: 1.5rem;
+        }
+
+        .modal-overlay.open {
+            display: flex;
+        }
+
+        .modal-card {
+            background: var(--panel-bg);
+            border: 1px solid rgba(239, 68, 68, 0.45);
+            border-radius: 12px;
+            max-width: 560px;
+            width: 100%;
+            padding: 1.5rem;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
+        }
+
+        .modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0.85rem;
+            color: #fca5a5;
+            font-weight: 700;
+            font-size: 1.05rem;
+        }
+
+        .modal-body {
+            color: var(--text-main);
+            font-size: 0.9rem;
+            line-height: 1.5;
+            margin-bottom: 1rem;
+        }
+
+        .modal-suggestion {
+            background: rgba(56, 189, 248, 0.1);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            color: #bae6fd;
+            padding: 0.65rem 0.85rem;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            margin-bottom: 1.1rem;
+        }
+
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.65rem;
+        }
+
         /* Endpoints Table */
         .endpoints-table thead th {
             background: rgba(15, 23, 42, 0.4);
@@ -1530,6 +1597,30 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     </tbody>
                 </table>
             </div>
+
+            <!-- Nemotron-3.5-Transcribe Sidecar & Job Queue (LS-19 / LS-20) -->
+            <div class="section-card request-table-card" id="nemotronStatusCard" style="margin-top: 1.25rem;">
+                <div class="section-title">
+                    <span>🧠 Nemotron-3.5-Transcribe Sidecar (<code>nemo_speech</code>)</span>
+                    <span class="outcome-active-badge" id="valNemotronStateBadge">unloaded</span>
+                </div>
+                <table class="kv-table">
+                    <tbody>
+                        <tr>
+                            <td class="kv-key" style="width: 22%;">Active Device & Threads</td>
+                            <td class="kv-val" id="valNemotronDevice">-</td>
+                            <td class="kv-key" style="width: 22%;">Profile / Tier</td>
+                            <td class="kv-val" id="valNemotronProfile">-</td>
+                        </tr>
+                        <tr>
+                            <td class="kv-key" id="lblNemotronMemory">Memory / VRAM</td>
+                            <td class="kv-val" id="valNemotronMemory">-</td>
+                            <td class="kv-key">Queue / Running / Preemptions</td>
+                            <td class="kv-val" id="valNemotronQueue">0 queued · 0 running · 0 preemptions</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
 
         <!-- TAB 2: MODELS & ENDPOINTS -->
@@ -1884,6 +1975,22 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Modal Error Dialog for Unsupported Backend Activation (LS-20) -->
+    <div id="backendErrorModal" class="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="backendErrorTitle" onclick="if(event.target===this)closeBackendErrorDialog()">
+        <div class="modal-card">
+            <div class="modal-header">
+                <span id="backendErrorTitle">⚠️ Cannot Activate Backend</span>
+                <button onclick="closeBackendErrorDialog()" style="background:none;border:none;color:var(--text-muted);cursor:pointer;font-size:1.1rem;">✕</button>
+            </div>
+            <div class="modal-body" id="backendErrorMsg"></div>
+            <div class="modal-suggestion" id="backendErrorSuggestion" style="display:none;"></div>
+            <div class="modal-actions">
+                <button id="backendErrorSuggestBtn" class="btn-primary" style="display:none;"></button>
+                <button id="backendErrorCloseBtn" onclick="closeBackendErrorDialog()">Close</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const COPY_ICON_SVG = `<svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
         const CHECK_ICON_SVG = `<svg viewBox="0 0 24 24" style="stroke:var(--accent-green);"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
@@ -2213,6 +2320,45 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                         }).join('');
                     }
                 }
+
+                // Nemotron Sidecar & Job Queue (LS-19 / LS-20)
+                const nemo = stats.nemotron || {};
+                const nemoStateBadge = document.getElementById('valNemotronStateBadge');
+                if (nemoStateBadge) {
+                    nemoStateBadge.innerText = (nemo.state || 'unloaded') + (nemo.pid ? ` (#${nemo.pid})` : '');
+                }
+                const nemoDevEl = document.getElementById('valNemotronDevice');
+                if (nemoDevEl) {
+                    const dev = nemo.device ? String(nemo.device).toUpperCase() : 'NONE';
+                    const thr = nemo.device === 'cpu' && nemo.threads ? ` (${nemo.threads} threads)` : '';
+                    nemoDevEl.innerText = `${dev}${thr}`;
+                }
+                const nemoProfEl = document.getElementById('valNemotronProfile');
+                if (nemoProfEl) {
+                    nemoProfEl.innerText = `${nemo.profile || '-'} / ${nemo.tier || '-'}`;
+                }
+                const lblNemoMem = document.getElementById('lblNemotronMemory');
+                const valNemoMem = document.getElementById('valNemotronMemory');
+                if (valNemoMem) {
+                    if (nemo.device === 'cpu') {
+                        if (lblNemoMem) lblNemoMem.innerText = 'CPU Available RAM';
+                        const availGb = nemo.available_ram_mb != null ? (nemo.available_ram_mb / 1024).toFixed(1) + ' GB' : 'N/A';
+                        const totGb = nemo.total_ram_mb != null ? (nemo.total_ram_mb / 1024).toFixed(1) + ' GB' : '-';
+                        const reqGb = nemo.required_ram_mb != null ? (nemo.required_ram_mb / 1024).toFixed(1) + ' GB' : '-';
+                        valNemoMem.innerText = `${availGb} free of ${totGb} (need ${reqGb})`;
+                    } else {
+                        if (lblNemoMem) lblNemoMem.innerText = 'GPU VRAM';
+                        if (gpuInfo.free_vram_mb != null && gpuInfo.total_vram_mb != null) {
+                            valNemoMem.innerText = `${(gpuInfo.free_vram_mb / 1024).toFixed(1)} GB free of ${(gpuInfo.total_vram_mb / 1024).toFixed(1)} GB`;
+                        } else {
+                            valNemoMem.innerText = 'N/A (no GPU)';
+                        }
+                    }
+                }
+                const valNemoQ = document.getElementById('valNemotronQueue');
+                if (valNemoQ) {
+                    valNemoQ.innerText = `${nemo.queue_depth ?? 0} queued · ${nemo.running_jobs ?? 0} running · ${nemo.preemptions_total ?? 0} preemptions · ${nemo.requeues_total ?? 0} requeues`;
+                }
             }
 
             // Config runtime overview
@@ -2378,7 +2524,12 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 keys: [
                     "diarization_model", "diarization_device", "diarization_hf_token",
                     "diarization_num_speakers", "diarization_min_speakers", "diarization_max_speakers",
-                    "diarize_in_subprocess", "diarization_deps_dir"
+                    "diarize_in_subprocess", "diarization_deps_dir",
+                    "nemotron_idle_timeout_sec", "nemotron_ready_timeout_sec", "nemotron_recycle_after_requests",
+                    "nemotron_job_timeout_sec", "nemotron_short_max_sec", "nemotron_long_max_sec",
+                    "nemotron_window_sec", "nemotron_window_overlap_sec", "nemotron_seam_min_votes",
+                    "nemotron_vram_margin_mb", "nemotron_preempt_wait_sec",
+                    "nemotron_cpu_threads", "nemotron_cpu_max_sec", "nemotron_cpu_ram_mb", "nemotron_cpu_timeout_per_audio_sec"
                 ]
             },
             {
@@ -2578,6 +2729,84 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             b.innerText = text;
         }
 
+        function escapeHtml(s) {
+            return String(s || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        let lastBackendsDoc = { registered: [], installed: [] };
+
+        function closeBackendErrorDialog() {
+            const modal = document.getElementById('backendErrorModal');
+            if (modal) modal.classList.remove('open');
+        }
+
+        function showBackendErrorDialog(engine, flavor, doc) {
+            const modal = document.getElementById('backendErrorModal');
+            const title = document.getElementById('backendErrorTitle');
+            const msg = document.getElementById('backendErrorMsg');
+            const sug = document.getElementById('backendErrorSuggestion');
+            const sugBtn = document.getElementById('backendErrorSuggestBtn');
+            if (!modal || !msg) return;
+
+            if (title) title.innerText = `⚠️ Cannot Activate ${engine}:${flavor}`;
+            msg.innerText = doc.error || `Failed to activate ${engine}:${flavor}.`;
+
+            let sugEngine = doc.suggested_engine || null;
+            let sugFlavor = doc.suggested_flavor || null;
+            if ((!sugEngine || !sugFlavor) && typeof doc.suggestion === 'string') {
+                const m = doc.suggestion.match(/([a-z0-9_]+):([a-z0-9_]+)/i);
+                if (m) {
+                    sugEngine = m[1];
+                    sugFlavor = m[2];
+                }
+            }
+
+            if (sug && doc.suggestion) {
+                sug.style.display = '';
+                sug.innerText = `💡 Suggestion: ${doc.suggestion}`;
+            } else if (sug) {
+                sug.style.display = 'none';
+            }
+
+            if (sugBtn && sugEngine && sugFlavor) {
+                sugBtn.style.display = '';
+                sugBtn.innerText = `Activate ${sugEngine}:${sugFlavor}`;
+                sugBtn.onclick = () => activateSuggestedBackend(sugEngine, sugFlavor);
+            } else if (sugBtn) {
+                sugBtn.style.display = 'none';
+                sugBtn.onclick = null;
+            }
+            modal.classList.add('open');
+        }
+
+        async function activateSuggestedBackend(engine, flavor) {
+            closeBackendErrorDialog();
+            const installed = (lastBackendsDoc.installed || []).find(
+                (b) => b.engine === engine && b.flavor === flavor
+            );
+            let version = installed ? installed.version : null;
+            if (!version) {
+                showBackendsBanner('ok', `Installing ${engine}:${flavor} before activating...`);
+                const insResp = await fetch('/api/backends/install', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({engine, flavor}),
+                });
+                const insDoc = await insResp.json();
+                if (!insResp.ok) {
+                    showBackendsBanner('err', insDoc.error || `Failed to install ${engine}:${flavor}`);
+                    await loadBackends();
+                    return;
+                }
+                version = insDoc.version;
+            }
+            await activateBackend(engine, flavor, version);
+        }
+
         async function installBackend(engine, flavor) {
             showBackendsBanner('ok', `Installing ${engine}:${flavor}... (may take a moment)`);
             const resp = await fetch('/api/backends/install', {
@@ -2602,16 +2831,20 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             });
             const doc = await resp.json();
             if (resp.ok) {
-                showBackendsBanner('ok', `Activated ${engine}:${flavor}:${version}. New worker spawns will use it.`);
+                const warn = doc.warning ? ` (Warning: ${doc.warning})` : '';
+                showBackendsBanner('ok', `Activated ${engine}:${flavor}:${version}. New worker spawns will use it.${warn}`);
             } else {
                 showBackendsBanner('err', doc.error || 'activate failed');
+                showBackendErrorDialog(engine, flavor, doc);
             }
             await loadBackends();
+            await updateDashboard();
         }
 
         async function loadBackends() {
             const resp = await fetch('/api/backends');
             const doc = await resp.json();
+            lastBackendsDoc = doc || { registered: [], installed: [] };
             const tbody = document.getElementById('backendsBody');
             if (doc.store_available === false) {
                 tbody.innerHTML = '<tr><td colspan="6" class="card-subtext">No settings store configured on this process.</td></tr>';
@@ -2624,12 +2857,21 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                 const versionsText = installedVersions.length
                     ? installedVersions.map((b) => `${b.version}${b.active ? ' (active)' : ''}`).join(', ')
                     : '(none installed)';
+                const unavailBadge = spec.activatable === false
+                    ? ` <span class="model-badge badge-unavail" title="${escapeHtml(spec.unsupported_reason || '')}">unsupported</span>` +
+                      `<div class="card-subtext" style="font-size:0.74rem;color:#fca5a5;margin-top:0.2rem;">${escapeHtml(spec.unsupported_reason || '')}</div>`
+                    : (spec.warning
+                        ? `<div class="card-subtext" style="font-size:0.74rem;color:#fcd34d;margin-top:0.2rem;">⚠️ ${escapeHtml(spec.warning)}</div>`
+                        : '');
                 const installBtn = `<button onclick="installBackend('${spec.engine}','${spec.flavor}')">Install ${spec.tag}</button>`;
-                const activateBtns = installedVersions
+                let activateBtns = installedVersions
                     .filter((b) => !b.active)
                     .map((b) => `<button onclick="activateBackend('${spec.engine}','${spec.flavor}','${b.version}')">Activate ${b.version}</button>`)
                     .join(' ');
-                return `<tr><td><code>${spec.engine}</code></td><td>${spec.flavor}</td><td>${spec.tag}</td>` +
+                if (!activateBtns && spec.activatable === false) {
+                    activateBtns = `<button onclick="activateBackend('${spec.engine}','${spec.flavor}','${spec.tag}')" title="${escapeHtml(spec.unsupported_reason || '')}">Activate ${spec.tag}</button>`;
+                }
+                return `<tr><td><code>${spec.engine}</code></td><td>${spec.flavor}${unavailBadge}</td><td>${spec.tag}</td>` +
                     `<td>${spec.wired ? 'yes' : 'no (registered only)'}</td>` +
                     `<td>${versionsText}</td><td>${installBtn} ${activateBtns}</td></tr>`;
             });
@@ -2834,18 +3076,28 @@ def _backends_doc(state: ServerState) -> dict:
     # test image, then hit a real PermissionError on a bare CI agent where
     # /app doesn't exist) before being caught for real on Bamboo.
     installed = installer.list_installed(state.settings_store.connection)
-    return {
-        "store_available": True,
-        "registered": [
+    registered_list = []
+    for spec in backend_registry.BACKENDS.values():
+        check = installer.check_activation_support(spec.engine, spec.flavor, state.settings)
+        registered_list.append(
             {
                 "engine": spec.engine,
                 "flavor": spec.flavor,
                 "repo": spec.repo,
                 "tag": spec.tag,
                 "wired": spec.wired,
+                "activatable": check.activatable,
+                "unsupported_reason": check.unsupported_reason,
+                "reason": check.reason,
+                "suggestion": check.suggestion,
+                "suggested_engine": check.suggested_engine,
+                "suggested_flavor": check.suggested_flavor,
+                "warning": check.warning,
             }
-            for spec in backend_registry.BACKENDS.values()
-        ],
+        )
+    return {
+        "store_available": True,
+        "registered": registered_list,
         "installed": [
             {
                 "engine": b.engine,
@@ -2913,14 +3165,36 @@ def _handle_backend_activate(state: ServerState, body: bytes) -> tuple[int, dict
     except (json.JSONDecodeError, UnicodeDecodeError):
         return 400, {"error": "invalid JSON body"}
     engine, flavor, version = payload.get("engine"), payload.get("flavor"), payload.get("version")
-    if not engine or not flavor or not version:
+    if not engine or not flavor:
         return 400, {"error": "expected a JSON object: {'engine': ..., 'flavor': ..., 'version': ...}"}
+    if not version:
+        try:
+            version = backend_registry.resolve(engine, flavor).pinned_version
+        except KeyError as exc:
+            return 400, {"error": str(exc)}
+
+    try:
+        check = installer.check_activation_support(engine, flavor, state.settings)
+    except KeyError as exc:
+        return 400, {"error": str(exc)}
+    if not check.activatable:
+        return 422, {
+            "error": check.unsupported_reason or f"{engine}:{flavor} is not supported on this host",
+            "reason": check.reason,
+            "details": check.details,
+            "suggestion": check.suggestion,
+            "suggested_engine": check.suggested_engine,
+            "suggested_flavor": check.suggested_flavor,
+        }
 
     try:
         installer.activate(state.settings_store.connection, engine, flavor, version)
     except installer.BackendInstallError as exc:
         return 400, {"error": str(exc)}
-    return 200, {"activated": {"engine": engine, "flavor": flavor, "version": version}}
+    resp: dict[str, Any] = {"activated": {"engine": engine, "flavor": flavor, "version": version}}
+    if check.warning:
+        resp["warning"] = check.warning
+    return 200, resp
 
 
 def _diarization_engines_doc(state: ServerState) -> dict:
@@ -3028,14 +3302,15 @@ def _build_warmed_workers_snapshot(state: ServerState) -> list[dict[str, Any]]:
                 "device": "GPU" if str(tw.get("device", "")).lower() in ("cuda", "gpu") else "CPU",
                 "busy": tw.get("busy", False),
             })
-    nemo = nemotron.get_service().snapshot()
+    nemo = nemotron.get_service().snapshot(state.settings)
     if nemo.get("pid") is not None:
+        nemo_dev = "CPU" if str(nemo.get("device", "")).lower() == "cpu" else "GPU"
         warmed.append({
             "service": "Nemotron Sidecar",
             "model": f"{nemo['model']} ({nemo.get('profile')})",
             "pid": nemo["pid"],
             "idle_sec": nemo.get("idle_sec") or 0.0,
-            "device": "GPU",
+            "device": nemo_dev,
             "busy": nemo.get("state") in ("busy", "loading"),
         })
     return warmed
@@ -3198,11 +3473,11 @@ def _make_handler(state: ServerState) -> type[BaseHTTPRequestHandler]:
                                 else None
                             ),
                         },
-                        # LS-19: Nemotron-3.5-Transcribe sidecar + job queue
-                        # (live_stt/nemotron.py): state/profile, queue depth,
-                        # preemptions and re-queues. Requests themselves are
-                        # counted under "diarization" above.
-                        "nemotron": nemotron.get_service().snapshot(),
+                        # LS-19 / LS-20: Nemotron-3.5-Transcribe sidecar + job
+                        # queue (live_stt/nemotron.py): state/profile/device/threads,
+                        # queue depth, preemptions and re-queues. Requests
+                        # themselves are counted under "diarization" above.
+                        "nemotron": nemotron.get_service().snapshot(state.settings),
                         "stt_worker_pool": {
                             "standby_workers": state.worker_pool.snapshot(),
                             "standby_count": state.worker_pool.count(),

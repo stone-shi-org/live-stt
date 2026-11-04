@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import stat
 import sys
 import threading
@@ -20,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from live_stt import diarize_http, gpu, metrics, nemotron, vram
+from live_stt.backends import installer
 from live_stt.config import Settings
 from live_stt.diarize_sessions import DiarizationSessionTracker
 from live_stt.recent_requests import RecentRequests
@@ -437,3 +439,229 @@ def test_missing_binary_or_models_is_503_without_retry_after(env):
     )
     assert status == 503 and "retry_after_sec" not in doc["error"]
     assert "binary" in doc["error"]["message"]
+
+
+# --------------------------------------------------------------------------- #
+# LS-20: nemo_speech:cpu backend, flavor switching, CPU admission & preemption
+
+
+def _install_db_backends(env: Env, active_flavor: str | None = "cpu") -> tuple[Path, Path]:
+    cpu_dir = env.tmp / "backends" / "nemo_speech" / "cpu" / "v0.3.0" / "bin"
+    cuda_dir = env.tmp / "backends" / "nemo_speech" / "cuda" / "v0.3.0" / "bin"
+    cpu_dir.mkdir(parents=True, exist_ok=True)
+    cuda_dir.mkdir(parents=True, exist_ok=True)
+    for d in (cpu_dir, cuda_dir):
+        b = d / "nemo-speech"
+        b.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}" "$@"\n')
+        b.chmod(b.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    with sqlite3.connect(env.tmp / "lstt.db") as conn:
+        installer.ensure_schema(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO installed_backends VALUES (?,?,?,?,?,?,?)",
+            (
+                "nemo_speech",
+                "cpu",
+                "v0.3.0",
+                "sha-cpu",
+                str(cpu_dir.parent),
+                "now",
+                1 if active_flavor == "cpu" else 0,
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO installed_backends VALUES (?,?,?,?,?,?,?)",
+            (
+                "nemo_speech",
+                "cuda",
+                "v0.3.0",
+                "sha-cuda",
+                str(cuda_dir.parent),
+                "now",
+                1 if active_flavor == "cuda" else 0,
+            ),
+        )
+        conn.commit()
+    return cpu_dir / "nemo-speech", cuda_dir / "nemo-speech"
+
+
+def test_cpu_flavor_builds_cpu_command_and_works_on_pascal_host(env, monkeypatch):
+    _install_db_backends(env, active_flavor="cpu")
+    # Simulate homesrv: Quadro P1000 (cc 6.1, 4 GB VRAM) + 48 GB free RAM + AVX2.
+    monkeypatch.setattr(gpu, "total_vram_mb", lambda: 4096)
+    monkeypatch.setattr(gpu, "compute_cap", lambda: 6.1)
+    monkeypatch.setattr(nemotron, "available_ram_mb", lambda: 48000)
+    monkeypatch.setattr(nemotron, "effective_cpu_threads", lambda s: 16)
+
+    s = env.settings(nemotron_bin=None, nemotron_idle_timeout_sec=300)
+    tracker, recent = DiarizationSessionTracker(), RecentRequests()
+    body, ctype = _multipart(make_wav(30))
+    status, doc = diarize_http.handle_diarize_request(
+        content_type=ctype, body=body, settings=s, tracker=tracker, recent=recent
+    )
+    assert status == 200, doc
+    starts = env.events("start")
+    assert len(starts) == 1
+    args = starts[0]["args"]
+    cfg = starts[0]["config"]
+    assert args["device"] == "cpu"
+    assert args["read-timeout"] == "3600"
+    assert args["write-timeout"] == "3600"
+    assert "max_sequences: 1" in cfg
+    assert "max_context: 32768" in cfg
+    assert "threads: 16" in cfg
+    snap = env.svc.snapshot(s)
+    assert snap["device"] == "cpu"
+    assert snap["profile"] == "cpu"
+    assert snap["threads"] == 16
+    assert vram.reserved_mb() == 0  # CPU flavor never reserves GPU VRAM
+    entry = recent.snapshot(0)["requests"][-1]
+    assert entry["device"] == "cpu"
+
+
+def test_cuda_flavor_in_db_builds_cuda_command(env):
+    _install_db_backends(env, active_flavor="cuda")
+    s = env.settings(nemotron_bin=None, nemotron_idle_timeout_sec=300)
+    _run(env, 30, nemotron_bin=None, nemotron_idle_timeout_sec=300)
+    starts = env.events("start")
+    assert len(starts) == 1
+    args = starts[0]["args"]
+    cfg = starts[0]["config"]
+    assert args["device"] == "cuda"
+    assert "max_sequences: 4" in cfg
+    assert "threads:" not in cfg
+    assert env.svc.snapshot(s)["device"] == "cuda"
+
+
+def test_switching_active_flavor_stops_idle_sidecar_and_switches_next_load(env, monkeypatch):
+    _install_db_backends(env, active_flavor="cuda")
+    monkeypatch.setattr(nemotron, "available_ram_mb", lambda: 48000)
+    s = env.settings(nemotron_bin=None, nemotron_idle_timeout_sec=300)
+
+    _run(env, 20, nemotron_bin=None, nemotron_idle_timeout_sec=300)
+    assert env.svc.state == "ready"
+    assert env.svc.snapshot(s)["device"] == "cuda"
+
+    # Switch active flavor to cpu -> idle sidecar stops immediately.
+    with sqlite3.connect(env.tmp / "lstt.db") as conn:
+        installer.activate(conn, "nemo_speech", "cpu", "v0.3.0")
+    assert env.svc.state == "unloaded"
+
+    # Next job launches on CPU.
+    _run(env, 20, nemotron_bin=None, nemotron_idle_timeout_sec=300)
+    starts = env.events("start")
+    assert [st["args"]["device"] for st in starts] == ["cuda", "cpu"]
+    assert env.svc.snapshot(s)["device"] == "cpu"
+
+
+def test_switching_active_flavor_while_busy_finishes_running_job_then_switches(env, monkeypatch):
+    _install_db_backends(env, active_flavor="cuda")
+    monkeypatch.setattr(nemotron, "available_ram_mb", lambda: 48000)
+    monkeypatch.setenv("FAKE_NEMO_CHAT_DELAY", "0.6")
+    s = env.settings(nemotron_bin=None, nemotron_idle_timeout_sec=300)
+    out: dict = {}
+
+    def first_job():
+        out["doc"] = env.svc.transcribe(s, nemotron.parse_wav(make_wav(20)))
+
+    t = threading.Thread(target=first_job)
+    t.start()
+    assert env.wait_for(lambda: env.svc.state == "busy" and len(env.events("chat")) == 1, 5)
+
+    # Activate CPU while the CUDA job is still running.
+    with sqlite3.connect(env.tmp / "lstt.db") as conn:
+        installer.activate(conn, "nemo_speech", "cpu", "v0.3.0")
+
+    t.join(10)
+    assert not t.is_alive()
+    assert out["doc"]["segments"]
+    # Sidecar was retired after the busy job finished.
+    assert env.wait_for(lambda: env.svc.state == "unloaded", 5)
+
+    monkeypatch.delenv("FAKE_NEMO_CHAT_DELAY")
+    _run(env, 20, nemotron_bin=None, nemotron_idle_timeout_sec=300)
+    assert [st["args"]["device"] for st in env.events("start")] == ["cuda", "cpu"]
+
+
+def test_cpu_admission_waits_when_ram_low_and_scales_timeout_and_windows_over_limit(env, monkeypatch):
+    _install_db_backends(env, active_flavor="cpu")
+    monkeypatch.setattr(nemotron, "effective_cpu_threads", lambda s: 12)
+
+    # 1. Timeout scaling on CPU: base + nemotron_cpu_timeout_per_audio_sec * duration_sec.
+    s = env.settings(
+        nemotron_bin=None,
+        nemotron_job_timeout_sec=60,
+        nemotron_cpu_timeout_per_audio_sec=3.0,
+    )
+    assert env.svc.job_timeout_budget_sec(s, 400.0, flavor="cpu") == 60.0 + 1200.0
+    assert env.svc.job_timeout_budget_sec(s, 400.0, flavor="cuda") == 60.0
+
+    # 2. Low available RAM defers load and times out with retry_after_sec.
+    monkeypatch.setattr(nemotron, "available_ram_mb", lambda: 12000)
+    with pytest.raises(nemotron.NemotronTimeout) as exc_info:
+        _run(
+            env,
+            10,
+            nemotron_bin=None,
+            nemotron_job_timeout_sec=0.8,
+            nemotron_cpu_timeout_per_audio_sec=0.0,
+            nemotron_cpu_ram_mb=24000,
+        )
+    assert exc_info.value.retry_after_sec == nemotron.RETRY_AFTER_TIMEOUT_SEC
+    assert "insufficient available RAM" in (env.svc.last_error or "")
+    assert env.events("start") == []
+
+    # 3. Over-limit recording on CPU (> nemotron_cpu_max_sec) windows and stitches with overlap vote.
+    monkeypatch.setattr(nemotron, "available_ram_mb", lambda: 48000)
+    doc = _run(
+        env,
+        35 * 60,
+        nemotron_bin=None,
+        nemotron_cpu_max_sec=1620.0,
+        nemotron_window_sec=1620.0,
+        nemotron_window_overlap_sec=300.0,
+    )
+    chats = env.events("chat")
+    assert [round(c["audio_seconds"]) for c in chats] == [1620, 780]
+    assert doc["seams"] == [{"at_sec": 1470.0, "matched_words": 300, "new_speakers": 0}]
+    _assert_consistent_speakers(doc)
+
+
+def test_live_call_preempts_and_holds_cpu_nemotron_job(env, monkeypatch):
+    _install_db_backends(env, active_flavor="cpu")
+    monkeypatch.setattr(nemotron, "available_ram_mb", lambda: 48000)
+    monkeypatch.setenv("FAKE_NEMO_CHAT_DELAY", "4.0")
+    s = env.settings(nemotron_bin=None, nemotron_idle_timeout_sec=0)
+    result: dict = {}
+
+    def job():
+        try:
+            result["doc"] = env.svc.transcribe(s, nemotron.parse_wav(make_wav(30)))
+        except Exception as exc:  # noqa: BLE001
+            result["exc"] = exc
+
+    t = threading.Thread(target=job)
+    t.start()
+    assert env.wait_for(lambda: env.svc.state == "busy" and len(env.events("chat")) == 1, 10)
+    assert env.svc.is_active_on("cpu")
+
+    before = metrics.nemotron_preemptions_total._value.get()
+    env.svc.enter_live_call()
+    try:
+        assert nemotron.preempt_cpu_for_live_call(s) is True
+        assert metrics.nemotron_preemptions_total._value.get() == before + 1
+        # While the live call is active, the CPU job stays queued and does not reload.
+        time.sleep(0.8)
+        assert t.is_alive()
+        snap = env.svc.snapshot(s)
+        assert snap["requeues_total"] == 1 and snap["queue_depth"] == 1 and snap["state"] == "unloaded"
+        assert snap["live_calls_active"] == 1
+        monkeypatch.setenv("FAKE_NEMO_CHAT_DELAY", "0.0")
+    finally:
+        env.svc.leave_live_call()
+
+    t.join(15)
+    assert not t.is_alive()
+    assert "exc" not in result, result.get("exc")
+    assert result["doc"]["segments"]
+    assert env.svc.preemptions_total == 1

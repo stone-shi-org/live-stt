@@ -117,5 +117,6 @@ def test_transcribes_capability_only_on_nemotron():
 
     transcribing = {k for k, v in DIARIZATION_MODELS.items() if v.transcribes}
     assert transcribing == {"nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B"}
-    assert DIARIZATION_MODELS["nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B"].requires_cuda
+    # LS-20: Nemotron now supports both CPU (nemo_speech:cpu) and CUDA (nemo_speech:cuda).
+    assert not DIARIZATION_MODELS["nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B"].requires_cuda
     assert not DIARIZATION_MODELS["pyannote/speaker-diarization-community-1"].requires_cuda

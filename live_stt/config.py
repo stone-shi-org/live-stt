@@ -331,10 +331,11 @@ class Settings(BaseSettings):
     # context) is reclaimed by the operating system.
     diarize_in_subprocess: bool = True
 
-    # --- Nemotron-3.5-Transcribe-30B-A4B (LS-19, live_stt/nemotron.py) ---
+    # --- Nemotron-3.5-Transcribe-30B-A4B (LS-19 / LS-20, live_stt/nemotron.py) ---
     # Speaker-attributed post-call transcripts on POST /v1/audio/diarization
     # (model="nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B"), served by a
-    # NeMo-Speech.cpp `nemo-speech serve` sidecar on 127.0.0.1. CUDA only.
+    # NeMo-Speech.cpp `nemo-speech serve` sidecar on 127.0.0.1. Runs on CPU or
+    # CUDA according to the active "nemo_speech" backend flavor.
     # nemotron_bin: explicit path to the nemo-speech binary. None = the active
     # "nemo_speech" backend install (POST /api/backends/install + activate,
     # live_stt/backends/registry.py), at <install dir>/bin/nemo-speech.
@@ -343,35 +344,51 @@ class Settings(BaseSettings):
     nemotron_models_dir: str | None = None
     # Sidecar HTTP port on 127.0.0.1. 0 = pick a free port at each start.
     nemotron_port: int = 0
-    # Unload (SIGTERM) after this long with no job. Measured: exit in 0.7 s,
-    # card VRAM back to baseline. 0 = unload as soon as the queue is empty.
+    # Unload (SIGTERM) after this long with no job. Measured: exit in 0.7 s on
+    # CUDA (card VRAM back to baseline), 1.7 s on CPU. 0 = unload as soon as
+    # the queue is empty.
     nemotron_idle_timeout_sec: float = 300.0
-    # How long a load may take to report GET /ready. Measured 16.6 s cold.
+    # How long a load may take to report GET /ready. Measured 16.6 s cold on
+    # CUDA, 14 s on CPU.
     nemotron_ready_timeout_sec: float = 180.0
     # Recycle the process after this many requests (the word-timestamp buffer
     # only grows). A long-profile request always recycles. 0 = never.
     nemotron_recycle_after_requests: int = 20
     # Total time an HTTP request may wait for its job (queued, re-queued after
-    # preemption, and running). Hitting it returns 503 with Retry-After.
+    # preemption, and running). Hitting it returns 503 with Retry-After. On
+    # CPU (LS-20), the per-job budget adds nemotron_cpu_timeout_per_audio_sec *
+    # duration_sec because CPU inference runs at ~1x realtime.
     nemotron_job_timeout_sec: float = 1800.0
-    # Profile selection by duration. short: 4 slots, max_context 32768 tokens
-    # (measured cap ~29.4 min). long: 1 slot, fresh process, 45 min measured
-    # OK, 50 min crashed -- a hard limit, refused rather than attempted.
+    # CUDA profile selection by duration. short: 4 slots, max_context 32768
+    # tokens (measured cap ~29.4 min). long: 1 slot, fresh process, 45 min
+    # measured OK, 50 min crashed -- a hard limit, refused rather than attempted.
     nemotron_short_max_sec: float = 1620.0  # 27 min
     nemotron_long_max_sec: float = 2700.0  # 45 min
-    # Over nemotron_long_max_sec: overlapping windows through the long
-    # profile, speakers matched across windows by overlap vote.
+    # Over nemotron_long_max_sec (CUDA) or nemotron_cpu_max_sec (CPU):
+    # overlapping windows, speakers matched across windows by overlap vote.
     nemotron_window_sec: float = 2400.0  # 40 min
     nemotron_window_overlap_sec: float = 300.0  # 5 min
     # A seam whose overlap vote paired fewer words than this gets a
     # "warnings" entry (LS-19 seam test: >=100 lost 0.011 cpWER, <100 lost 0.136).
     nemotron_seam_min_votes: int = 100
-    # Exclusive-model admission: free VRAM must cover the profile figure plus
-    # this margin (no card-relative reserve -- see vram.admit_exclusive).
+    # Exclusive-model admission (CUDA): free VRAM must cover the profile figure
+    # plus this margin (no card-relative reserve -- see vram.admit_exclusive).
     nemotron_vram_margin_mb: int = 64
     # After a live call preempts a running job: how long to wait for the
     # sidecar's VRAM to come back before re-checking the call's admission.
     nemotron_preempt_wait_sec: float = 5.0
+    # CPU execution profile (LS-20, active flavor "nemo_speech:cpu"):
+    # threads passed as asr.backend.threads (capped at container/host CPUs).
+    nemotron_cpu_threads: int = 16
+    # Single-pass duration cap on CPU (max_context 32768 tokens caps at ~29.4
+    # min; recordings over this use the overlapping-window path on CPU).
+    nemotron_cpu_max_sec: float = 1620.0  # 27 min
+    # Minimum available RAM (MiB) required to admit a CPU Nemotron job.
+    # Measured on homesrv: cgroup anon peak 16.9 GB + page cache headroom.
+    nemotron_cpu_ram_mb: int = 24000
+    # Additional job timeout budget on CPU per second of input audio (~1x
+    # realtime measured on Ryzen 9 5900XT; 3x leaves generous headroom).
+    nemotron_cpu_timeout_per_audio_sec: float = 3.0
 
     # Text-to-Speech (TTS) configuration (live_stt/tts.py).
     # tts_model: key from live_stt/tts_models.py (default: kokoro-82m-v1)
@@ -413,6 +430,16 @@ class Settings(BaseSettings):
             )
         if not 0 <= self.nemotron_window_overlap_sec < self.nemotron_window_sec:
             raise ValueError("nemotron_window_overlap_sec must be >= 0 and < nemotron_window_sec")
+        if self.nemotron_cpu_threads <= 0:
+            raise ValueError("nemotron_cpu_threads must be positive")
+        if self.nemotron_cpu_max_sec <= 0:
+            raise ValueError("nemotron_cpu_max_sec must be positive")
+        if self.nemotron_window_overlap_sec >= self.nemotron_cpu_max_sec:
+            raise ValueError("nemotron_window_overlap_sec must be < nemotron_cpu_max_sec")
+        if self.nemotron_cpu_ram_mb < 0:
+            raise ValueError("nemotron_cpu_ram_mb must be non-negative")
+        if self.nemotron_cpu_timeout_per_audio_sec < 0:
+            raise ValueError("nemotron_cpu_timeout_per_audio_sec must be non-negative")
         if self.stt_idle_timeout_sec < 0:
             raise ValueError("stt_idle_timeout_sec must be non-negative")
         if self.batch_window_sec is not None and self.batch_window_sec < 0:

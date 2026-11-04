@@ -226,13 +226,27 @@ BACKENDS: dict[tuple[str, str], BackendSpec] = {
         lib_filename="libwhisper.so",
         wired=True,
     ),
-    # NeMo-Speech.cpp's `nemo-speech serve` (LS-19): the sidecar that serves
-    # Nemotron-3.5-Transcribe-30B-A4B for speaker-attributed post-call
+    # NeMo-Speech.cpp's `nemo-speech serve` (LS-19 / LS-20): the sidecar that
+    # serves Nemotron-3.5-Transcribe-30B-A4B for speaker-attributed post-call
     # transcripts (live_stt/nemotron.py). Not linked by any worker -- run as a
     # child process from <install dir>/bin/nemo-speech, whose RPATH is
-    # $ORIGIN/../lib. Bundles its own cudart/cuBLAS 12 (CUDA 12.8.1, includes
-    # 86-real); needs only the driver's libcuda.so.1. Verified to run inside
-    # the live-stt image under --memory 20g on homesrv3.
+    # $ORIGIN/../lib.
+    # - cpu (LS-20): x86-64-v3 (AVX2) build, verified on homesrv (Ryzen 9
+    #   5900XT, 16 threads).
+    # - cuda (LS-19): bundles its own cudart/cuBLAS 12 (CUDA 12.8.1, includes
+    #   86-real); needs only the driver's libcuda.so.1. Verified to run inside
+    #   the live-stt image under --memory 20g on homesrv3.
+    ("nemo_speech", "cpu"): BackendSpec(
+        engine="nemo_speech",
+        flavor="cpu",
+        source="github_release",
+        repo="NVIDIA/NeMo-Speech.cpp",
+        tag="v0.3.0",
+        asset_filename="nemo-speech-0.3.0-linux-x86_64-cpu.tar.gz",
+        sha256="255f12b722ab15b2a38a51cf125d56e3fa97058b528f7e895b39d6a473deb06e",
+        lib_filename="bin/nemo-speech",
+        wired=True,
+    ),
     ("nemo_speech", "cuda"): BackendSpec(
         engine="nemo_speech",
         flavor="cuda",

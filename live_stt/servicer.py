@@ -138,6 +138,7 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
         outcome = "internal"
         session: CallSession | None = None
         admission: vram.Admission | None = None
+        cpu_live_held = False
         final_text_parts: list[str] = []
         spec: models.ModelSpec | None = None
         n_words = 0
@@ -261,6 +262,19 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
                     await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, admission.message())
                     return
 
+            # LS-20: on CPU, a single Nemotron job saturates the CPU (~14 of 16
+            # cores measured on homesrv). Hold CPU Nemotron jobs while any live
+            # call is active, and preempt a running CPU Nemotron job so the
+            # live call gets CPU capacity immediately.
+            nemotron.get_service().enter_live_call()
+            cpu_live_held = True
+            if nemotron.get_service().is_active_on("cpu"):
+                preempted_cpu = await asyncio.to_thread(
+                    nemotron.preempt_cpu_for_live_call, self._settings
+                )
+                if preempted_cpu:
+                    logger.info("stream=%s preempted a CPU Nemotron job for live call", call_ref_hash)
+
             session = CallSession(
                 self._settings, spec, config, self._budget, worker_pool=self._state.worker_pool
             )
@@ -340,6 +354,8 @@ class StreamingASRServicer(asr_pb2_grpc.StreamingASRServicer):
                 await session.close()
             if admission is not None:
                 admission.release()
+            if cpu_live_held:
+                nemotron.get_service().leave_live_call()
             self._budget.release_call()
             metrics.streams_active.dec()
             metrics.streams_total.labels(outcome=outcome).inc()

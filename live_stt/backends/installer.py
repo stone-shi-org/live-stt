@@ -47,12 +47,13 @@ import subprocess
 import tarfile
 import threading
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from live_stt import db
-from live_stt.backends.registry import BackendSpec, canonical_engine, resolve
+from live_stt import db, gpu, nemotron
+from live_stt.backends.registry import BackendSpec, available_flavors, canonical_engine, resolve
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS installed_backends (
@@ -89,6 +90,150 @@ class InstalledBackend:
     path: str
     installed_at: str
     active: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ActivationCheck:
+    activatable: bool
+    reason: str | None = None
+    unsupported_reason: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+    suggestion: str | None = None
+    suggested_engine: str | None = None
+    suggested_flavor: str | None = None
+    warning: str | None = None
+
+
+def check_activation_support(engine: str, flavor: str, settings: Any = None) -> ActivationCheck:
+    """Validate whether ``(engine, flavor)`` can run on this host before
+    marking it active (LS-20). Used by both ``GET /api/backends`` (for UI
+    preview badges/tooltips) and ``POST /api/backends/activate``."""
+    engine = canonical_engine(engine)
+    resolve(engine, flavor)
+
+    if flavor == "cuda":
+        total_mb = gpu.total_vram_mb()
+        cc = gpu.compute_cap()
+        if total_mb is None or cc is None:
+            has_cpu = "cpu" in available_flavors(engine)
+            suggestion = f"Activate {engine}:cpu instead" if has_cpu else None
+            msg = (
+                f"{engine}:cuda cannot run on this host: no usable NVIDIA GPU detected "
+                "(nvidia-smi reported no total VRAM / compute capability)."
+            )
+            if suggestion:
+                msg = f"{msg} {suggestion}."
+            return ActivationCheck(
+                activatable=False,
+                reason="no_gpu",
+                unsupported_reason=msg,
+                details={
+                    "engine": engine,
+                    "flavor": flavor,
+                    "gpu_name": None,
+                    "compute_cap": cc,
+                    "total_vram_mb": total_mb,
+                },
+                suggestion=suggestion,
+                suggested_engine=engine if has_cpu else None,
+                suggested_flavor="cpu" if has_cpu else None,
+            )
+
+        if engine == "nemo_speech":
+            try:
+                nemotron.select_tier(total_mb, cc)
+            except nemotron.NemotronUnavailable as exc:
+                card = gpu.device_name() or "GPU 0"
+                suggestion = "Activate nemo_speech:cpu instead"
+                msg = (
+                    f"nemo_speech:cuda cannot run on this host: {card} has compute capability "
+                    f"{cc:.1f} and {total_mb} MiB; Nemotron needs compute capability >= "
+                    f"{nemotron.MIN_COMPUTE_CAP:.1f} and >= 24 GB ({nemotron.TIER_24GB_MIN_MB} MiB). "
+                    f"{suggestion}."
+                )
+                return ActivationCheck(
+                    activatable=False,
+                    reason="gpu_unsupported",
+                    unsupported_reason=msg,
+                    details={
+                        "engine": engine,
+                        "flavor": flavor,
+                        "gpu_name": card,
+                        "compute_cap": cc,
+                        "total_vram_mb": total_mb,
+                        "min_compute_cap": nemotron.MIN_COMPUTE_CAP,
+                        "min_vram_mb": nemotron.TIER_24GB_MIN_MB,
+                        "tier_error": str(exc),
+                    },
+                    suggestion=suggestion,
+                    suggested_engine="nemo_speech",
+                    suggested_flavor="cpu",
+                )
+
+        return ActivationCheck(
+            activatable=True,
+            details={
+                "engine": engine,
+                "flavor": flavor,
+                "compute_cap": cc,
+                "total_vram_mb": total_mb,
+            },
+        )
+
+    if engine == "nemo_speech" and flavor == "cpu":
+        if not nemotron.cpu_has_avx2():
+            cuda_ok = False
+            try:
+                nemotron.select_tier(gpu.total_vram_mb(), gpu.compute_cap())
+                cuda_ok = True
+            except nemotron.NemotronUnavailable:
+                cuda_ok = False
+            suggestion = "Activate nemo_speech:cuda instead" if cuda_ok else None
+            msg = (
+                "nemo_speech:cpu cannot run on this host: CPU is missing AVX2 instructions "
+                "(x86-64-v3 required by the prebuilt NeMo-Speech.cpp CPU release)."
+            )
+            if suggestion:
+                msg = f"{msg} {suggestion}."
+            return ActivationCheck(
+                activatable=False,
+                reason="cpu_unsupported",
+                unsupported_reason=msg,
+                details={
+                    "engine": engine,
+                    "flavor": flavor,
+                    "avx2": False,
+                    "required_isa": "x86-64-v3 (avx2)",
+                },
+                suggestion=suggestion,
+                suggested_engine="nemo_speech" if cuda_ok else None,
+                suggested_flavor="cuda" if cuda_ok else None,
+            )
+
+        req_ram_mb = int(getattr(settings, "nemotron_cpu_ram_mb", 24000)) if settings is not None else 24000
+        avail_mb = nemotron.available_ram_mb()
+        warning = None
+        if avail_mb is not None and avail_mb < req_ram_mb:
+            warning = (
+                f"Available RAM ({avail_mb} MiB) is currently below nemotron_cpu_ram_mb "
+                f"({req_ram_mb} MiB); requests will wait or fail until enough memory is free."
+            )
+        return ActivationCheck(
+            activatable=True,
+            details={
+                "engine": engine,
+                "flavor": flavor,
+                "avx2": True,
+                "available_ram_mb": avail_mb,
+                "required_ram_mb": req_ram_mb,
+            },
+            warning=warning,
+        )
+
+    return ActivationCheck(
+        activatable=True,
+        details={"engine": engine, "flavor": flavor},
+    )
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -327,6 +472,8 @@ def activate(conn: sqlite3.Connection, engine: str, flavor: str, version: str) -
             (engine, flavor, version),
         )
         conn.commit()
+    if engine == "nemo_speech":
+        nemotron.get_service().on_flavor_activated(flavor)
 
 
 def get_active(conn: sqlite3.Connection, engine: str) -> InstalledBackend | None:

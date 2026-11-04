@@ -111,3 +111,27 @@ def compute_cap() -> float | None:
     ) as exc:
         logger.warning("could not query GPU compute_cap: %s", exc)
         return None
+
+
+def device_name() -> str | None:
+    """Marketing name of GPU 0 (e.g. 'Quadro P1000', 'NVIDIA GeForce RTX 3090'),
+    or None when nvidia-smi is unavailable. Used by backend activation checks
+    (LS-20) so unsupported-GPU error messages name the actual card."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        name = out.stdout.strip().splitlines()[0].strip()
+        return name or None
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        IndexError,
+    ) as exc:
+        logger.warning("could not query GPU name: %s", exc)
+        return None

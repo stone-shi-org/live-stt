@@ -325,7 +325,8 @@ def _handle_nemotron(
     except nemotron.NemotronError as exc:
         return exc.status, {"error": {"message": str(exc)}}
 
-    request_id = tracker.start(device="cuda")
+    device = nemotron.NemotronService.active_device(settings)
+    request_id = tracker.start(device=device)
     metrics.diarization_sessions_active.inc()
     engine_start = time.monotonic()
     outcome = "failed"
@@ -346,6 +347,7 @@ def _handle_nemotron(
         outcome = "ok"
         return 200, result
     finally:
+        actual_device = nemotron.get_service().snapshot(settings).get("device") or device
         tracker.finish(request_id, ok=outcome == "ok")
         metrics.diarization_sessions_active.dec()
         metrics.diarization_requests_total.labels(outcome=outcome).inc()
@@ -354,7 +356,7 @@ def _handle_nemotron(
             outcome=outcome,
             started_at=started_at,
             model=model_key,
-            device="cuda",
+            device=actual_device,
             audio_seconds=audio.duration_sec,
             processing_s=time.monotonic() - engine_start,
         )

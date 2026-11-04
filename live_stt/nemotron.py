@@ -61,6 +61,7 @@ import base64
 import io
 import itertools
 import json
+import math
 import os
 import shutil
 import socket
@@ -88,6 +89,7 @@ BACKEND_ENGINE = "nemo_speech"
 BACKEND_FLAVOR = "cuda"
 HF_REPO = "AtomicChat/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF"
 MAX_SPEAKERS = 8
+SIDE_TIMEOUT_SEC = 3600  # nemo-speech serve max --read-timeout / --write-timeout (default is 30s)
 
 # The model card's speaker instruction, verbatim as used for every spike,
 # benchmark and seam-test measurement on LS-19.
@@ -158,6 +160,23 @@ PROFILES_24GB: dict[str, Profile] = {
     ),
 }
 
+# CPU profile (LS-20), measured on homesrv (Ryzen 9 5900XT, 16 threads):
+# 0.85x-1.21x realtime, cgroup anon peak 16.9 GB, VmRSS 36.4 GB (with 21 GB
+# mmap'd GGUF page cache). 1 sequence at a time; 32768-token context (~29.4 min
+# cap, windowed over nemotron_cpu_max_sec).
+PROFILE_CPU = Profile(
+    "cpu",
+    {
+        "max_sequences": 1,
+        "n_ctx_per_sequence": 32768,
+        "max_context": 32768,
+        "mtp_draft": 0,
+        "n_batch": 512,
+        "encoder_max_batch": 1,
+    },
+    vram_mb=0,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Tier:
@@ -173,6 +192,8 @@ def _decoder(quant: str) -> str:
     return f"NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-{quant}.gguf"
 
 
+TIER_24GB_MIN_MB = 22000
+
 # Size selection by total VRAM and compute capability. Only the 24 GB tier
 # ships configured; the others are declared (so the choice is visible) but
 # untested -- v0.3.0 also lacks asr.salm.n_cpu_moe/batched, which the larger
@@ -183,7 +204,7 @@ TIERS: tuple[Tier, ...] = (
     Tier("32gb-iq4_nl_l", 30000, _decoder("IQ4_NL_L"), None, verified=False),
     Tier(
         "24gb-iq4_nl",
-        22000,
+        TIER_24GB_MIN_MB,
         _decoder("AD-IQ4_NL"),
         "0c47d4ab6c783e7606ec03714b354fab0b2052027a7ea1991e7e2d3009c345ad",
         verified=True,
@@ -191,8 +212,124 @@ TIERS: tuple[Tier, ...] = (
     ),
     Tier("16gb-q2_0_m", 15000, _decoder("Q2_0_M"), None, verified=False),
 )
+TIER_CPU = Tier(
+    "cpu-iq4_nl",
+    0,
+    _decoder("AD-IQ4_NL"),
+    "0c47d4ab6c783e7606ec03714b354fab0b2052027a7ea1991e7e2d3009c345ad",
+    verified=True,
+    profiles={"cpu": PROFILE_CPU},
+)
 MIN_COMPUTE_CAP = 8.0
 BLACKWELL_COMPUTE_CAP = 10.0
+
+
+# --------------------------------------------------------------------------- #
+# Host CPU & RAM probes (LS-20)
+
+
+def cpu_has_avx2(cpuinfo_path: str = "/proc/cpuinfo") -> bool:
+    """True when /proc/cpuinfo reports the ``avx2`` flag (x86-64-v3, required
+    by the prebuilt NeMo-Speech.cpp CPU release)."""
+    try:
+        text = Path(cpuinfo_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        key, sep, rest = line.partition(":")
+        if sep and key.strip().lower() == "flags":
+            if "avx2" in rest.lower().split():
+                return True
+    return False
+
+
+def available_ram_mb(
+    meminfo_path: str = "/proc/meminfo",
+    cgroup_max_path: str = "/sys/fs/cgroup/memory.max",
+    cgroup_current_path: str = "/sys/fs/cgroup/memory.current",
+    cgroup_stat_path: str = "/sys/fs/cgroup/memory.stat",
+) -> int | None:
+    """Available RAM in MiB for admitting a CPU Nemotron job, bounded by both
+    host ``MemAvailable`` and the container's cgroup v2 memory limit (excluding
+    reclaimable/reusable page cache ``file`` bytes). Returns None when
+    /proc/meminfo cannot be read."""
+    host_avail_mb: int | None = None
+    try:
+        for line in Path(meminfo_path).read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    host_avail_mb = int(parts[1]) // 1024
+                break
+    except (OSError, ValueError):
+        return None
+    if host_avail_mb is None:
+        return None
+
+    try:
+        raw_max = Path(cgroup_max_path).read_text(encoding="utf-8").strip()
+        if raw_max and raw_max != "max":
+            limit_bytes = int(raw_max)
+            cur_bytes = int(Path(cgroup_current_path).read_text(encoding="utf-8").strip())
+            file_bytes = 0
+            try:
+                for line in Path(cgroup_stat_path).read_text(encoding="utf-8").splitlines():
+                    if line.startswith("file "):
+                        file_bytes = int(line.split()[1])
+                        break
+            except (OSError, ValueError, IndexError):
+                file_bytes = 0
+            anon_used = max(0, cur_bytes - file_bytes)
+            cg_avail_mb = max(0, (limit_bytes - anon_used) // (1024 * 1024))
+            return min(host_avail_mb, cg_avail_mb)
+    except (OSError, ValueError):
+        pass
+    return host_avail_mb
+
+
+def total_ram_mb(
+    meminfo_path: str = "/proc/meminfo",
+    cgroup_max_path: str = "/sys/fs/cgroup/memory.max",
+) -> int | None:
+    """Total usable RAM in MiB (host MemTotal capped at cgroup memory.max)."""
+    host_total_mb: int | None = None
+    try:
+        for line in Path(meminfo_path).read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("MemTotal:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    host_total_mb = int(parts[1]) // 1024
+                break
+    except (OSError, ValueError):
+        return None
+    if host_total_mb is None:
+        return None
+    try:
+        raw_max = Path(cgroup_max_path).read_text(encoding="utf-8").strip()
+        if raw_max and raw_max != "max":
+            cg_max_mb = int(raw_max) // (1024 * 1024)
+            return min(host_total_mb, cg_max_mb)
+    except (OSError, ValueError):
+        pass
+    return host_total_mb
+
+
+def effective_cpu_threads(
+    requested: int,
+    cgroup_cpu_max_path: str = "/sys/fs/cgroup/cpu.max",
+) -> int:
+    """Cap ``requested`` threads at the container's cgroup CPU quota (if set)
+    and ``os.cpu_count()``."""
+    cap = os.cpu_count() or max(1, int(requested))
+    try:
+        raw = Path(cgroup_cpu_max_path).read_text(encoding="utf-8").strip().split()
+        if len(raw) >= 2 and raw[0] != "max":
+            quota, period = int(raw[0]), int(raw[1])
+            if quota > 0 and period > 0:
+                cap = min(cap, max(1, math.ceil(quota / period)))
+    except (OSError, ValueError):
+        pass
+    return max(1, min(int(requested), cap))
 
 
 # --------------------------------------------------------------------------- #
@@ -275,7 +412,7 @@ def select_tier(total_mb: int | None, compute_cap: float | None) -> Tier:
     return tier
 
 
-def plan_job(settings: Any, duration_sec: float) -> tuple[str, list[tuple[float, float]]]:
+def plan_job(settings: Any, duration_sec: float, *, flavor: str = "cuda") -> tuple[str, list[tuple[float, float]]]:
     """``(profile name, [(start_sec, end_sec), ...])`` for a recording."""
     if duration_sec <= 0:
         raise NemotronBadRequest("audio is empty")
@@ -283,6 +420,20 @@ def plan_job(settings: Any, duration_sec: float) -> tuple[str, list[tuple[float,
         raise NemotronBadRequest(
             f"audio is {duration_sec:.0f}s, over the {float(settings.max_call_sec):.0f}s max_call_sec limit"
         )
+    if flavor == "cpu":
+        cpu_max = float(getattr(settings, "nemotron_cpu_max_sec", 1620.0))
+        if duration_sec <= cpu_max:
+            return "cpu", [(0.0, duration_sec)]
+        win_sec = min(float(settings.nemotron_window_sec), cpu_max)
+        overlap_sec = float(settings.nemotron_window_overlap_sec)
+        if overlap_sec >= win_sec:
+            overlap_sec = max(0.0, win_sec * 0.125)
+        windows = seams.plan_windows(duration_sec, win_sec, overlap_sec)
+        longest = max(e - s for s, e in windows)
+        if longest > cpu_max + 1e-6:
+            raise NemotronBadRequest("window plan exceeds nemotron_cpu_max_sec")
+        return "cpu", windows
+
     if duration_sec <= float(settings.nemotron_short_max_sec):
         return "short", [(0.0, duration_sec)]
     if duration_sec <= float(settings.nemotron_long_max_sec):
@@ -376,8 +527,11 @@ def build_chat_payload(wav_bytes: bytes) -> dict[str, Any]:
     }
 
 
-def salm_config_yaml(profile: Profile) -> str:
-    lines = ["# written by live_stt/nemotron.py", "asr:", "  salm:"]
+def salm_config_yaml(profile: Profile, *, threads: int | None = None) -> str:
+    lines = ["# written by live_stt/nemotron.py", "asr:"]
+    if threads is not None:
+        lines += ["  backend:", f"    threads: {int(threads)}"]
+    lines.append("  salm:")
     lines += [f"    {k}: {v}" for k, v in profile.salm.items()]
     return "\n".join(lines) + "\n"
 
@@ -395,9 +549,11 @@ def _free_port() -> int:
 @dataclass(eq=False)
 class _Job:
     id: int
+    flavor: str
     profile: str
     windows: list[tuple[float, float]]
     deadline: float
+    budget_sec: float = 1800.0
     preempted: bool = False
     attempts: int = 0
 
@@ -406,9 +562,11 @@ class _Job:
 class _Proc:
     popen: subprocess.Popen
     port: int
+    flavor: str
     profile: Profile
     workdir: str
     reservation: vram.Admission | None
+    threads: int | None = None
 
 
 class NemotronService:
@@ -421,8 +579,10 @@ class NemotronService:
         self._ids = itertools.count(1)
         self._proc: _Proc | None = None
         self._loading = False
+        self._loading_flavor: str | None = None
         self._load_preempted = False
         self._suspended = 0
+        self._active_live_calls = 0
         self._retire = False
         self._served_since_load = 0
         self._idle_since: float | None = None
@@ -452,26 +612,67 @@ class NemotronService:
 
     def is_active(self) -> bool:
         """A job is running or a sidecar is loading for one -- i.e. a live
-        call short on VRAM should preempt rather than be rejected."""
+        call short on VRAM/CPU should preempt rather than be rejected."""
         with self._cond:
             return bool(self._running) or self._loading
 
-    def snapshot(self) -> dict[str, Any]:
+    def is_active_on(self, flavor: str) -> bool:
+        """True when a job or load is currently active on ``flavor`` ('cpu' or 'cuda')."""
+        with self._cond:
+            if self._loading and self._loading_flavor == flavor:
+                return True
+            if self._proc is not None and self._alive_locked() and self._proc.flavor == flavor and self._running:
+                return True
+            return any(j.flavor == flavor for j in self._running.values())
+
+    def snapshot(self, settings: Any = None) -> dict[str, Any]:
+        active_flavor: str | None = None
+        if settings is not None:
+            try:
+                from live_stt.backends import installer
+
+                active = installer.get_active_backend(settings.db_path, BACKEND_ENGINE)
+                if active is not None:
+                    active_flavor = active.flavor
+                elif getattr(settings, "nemotron_bin", None):
+                    active_flavor = "cuda"
+            except Exception:  # noqa: BLE001
+                active_flavor = None
+
         with self._cond:
             alive = self._alive_locked()
+            proc_flavor = self._proc.flavor if self._proc is not None and alive else None
+            device = proc_flavor or active_flavor
+            threads = (
+                self._proc.threads
+                if self._proc is not None and alive and self._proc.flavor == "cpu"
+                else (
+                    effective_cpu_threads(int(getattr(settings, "nemotron_cpu_threads", 16)))
+                    if device == "cpu"
+                    else None
+                )
+            )
             idle_sec = (
                 round(time.monotonic() - self._idle_since, 1)
                 if alive and not self._running and self._idle_since is not None
                 else None
             )
-            return {
+            tier_name = (
+                TIER_CPU.name
+                if device == "cpu"
+                else (self._tier_cache.name if self._tier_cache is not None else None)
+            )
+            snap: dict[str, Any] = {
                 "model": MODEL_KEY,
                 "state": self.state,
+                "device": device,
+                "threads": threads,
                 "profile": self._proc.profile.name if self._proc is not None and alive else None,
                 "pid": self._proc.popen.pid if self._proc is not None and alive else None,
-                "tier": self._tier_cache.name if self._tier_cache is not None else None,
+                "tier": tier_name,
                 "queue_depth": len(self._queue),
                 "running_jobs": len(self._running),
+                "live_calls_active": self._active_live_calls,
                 "served_since_load": self._served_since_load,
                 "idle_sec": idle_sec,
                 "loads_total": self.loads_total,
@@ -481,6 +682,11 @@ class NemotronService:
                 "timeouts_total": self.timeouts_total,
                 "last_error": self.last_error,
             }
+        if device == "cpu":
+            snap["available_ram_mb"] = available_ram_mb()
+            snap["total_ram_mb"] = total_ram_mb()
+            snap["required_ram_mb"] = int(getattr(settings, "nemotron_cpu_ram_mb", 24000)) if settings is not None else 24000
+        return snap
 
     def _update_metrics_locked(self) -> None:
         metrics.nemotron_queue_depth.set(len(self._queue))
@@ -496,23 +702,55 @@ class NemotronService:
             self._tier_cache = select_tier(gpu.total_vram_mb(), gpu.compute_cap())
         return self._tier_cache
 
+    def resolve_tier_for_flavor(self, flavor: str) -> Tier:
+        if flavor == "cpu":
+            if not cpu_has_avx2():
+                raise NemotronUnavailable(
+                    "Nemotron-3.5-Transcribe on CPU requires AVX2 instructions (x86-64-v3)"
+                )
+            return TIER_CPU
+        return self.resolve_tier()
+
     @staticmethod
-    def resolve_binary(settings: Any) -> str:
-        if settings.nemotron_bin:
+    def resolve_runtime(settings: Any) -> tuple[str, str]:
+        """Return ``(flavor, binary_path)`` from the active ``nemo_speech``
+        backend install (or ``settings.nemotron_bin`` override)."""
+        from live_stt.backends import installer
+
+        active = installer.get_active_backend(settings.db_path, BACKEND_ENGINE)
+        if active is not None:
+            flavor = active.flavor
+            path = Path(settings.nemotron_bin) if settings.nemotron_bin else Path(active.path) / "bin" / "nemo-speech"
+        elif settings.nemotron_bin:
+            flavor = "cuda"
             path = Path(settings.nemotron_bin)
         else:
+            raise NemotronUnavailable(
+                "no active nemo_speech backend: POST /api/backends/install "
+                '{"engine": "nemo_speech", "flavor": "cpu" | "cuda"}, then /api/backends/activate'
+            )
+        if not (path.is_file() and os.access(path, os.X_OK)):
+            raise NemotronUnavailable(f"nemo-speech binary not found or not executable: {path}")
+        return flavor, str(path)
+
+    @staticmethod
+    def resolve_binary(settings: Any) -> str:
+        _, binary = NemotronService.resolve_runtime(settings)
+        return binary
+
+    @staticmethod
+    def active_device(settings: Any) -> str:
+        """Return the active device ('cpu' or 'cuda') for Nemotron, defaulting
+        to 'cuda' if only nemotron_bin is set."""
+        try:
             from live_stt.backends import installer
 
             active = installer.get_active_backend(settings.db_path, BACKEND_ENGINE)
-            if active is None:
-                raise NemotronUnavailable(
-                    "no active nemo_speech backend: POST /api/backends/install "
-                    '{"engine": "nemo_speech", "flavor": "cuda"}, then /api/backends/activate'
-                )
-            path = Path(active.path) / "bin" / "nemo-speech"
-        if not (path.is_file() and os.access(path, os.X_OK)):
-            raise NemotronUnavailable(f"nemo-speech binary not found or not executable: {path}")
-        return str(path)
+            if active is not None:
+                return active.flavor
+        except Exception:  # noqa: BLE001
+            pass
+        return "cuda"
 
     @staticmethod
     def model_paths(settings: Any, tier: Tier) -> tuple[str, str]:
@@ -526,20 +764,53 @@ class NemotronService:
             )
         return str(decoder), str(encoder)
 
+    def on_flavor_activated(self, new_flavor: str) -> bool:
+        """Called when the active ``nemo_speech`` flavor changes.
+        Stops an idle sidecar immediately if it was running a different flavor;
+        marks a busy sidecar ``_retire = True`` so running jobs finish on the
+        old flavor and the next load uses ``new_flavor``."""
+        old: _Proc | None = None
+        with self._cond:
+            if self._proc is None or not self._alive_locked():
+                return False
+            if self._proc.flavor == new_flavor:
+                return False
+            if self._running or self._loading:
+                self._retire = True
+                self._cond.notify_all()
+                return False
+            logger.info("stopping idle nemotron sidecar on flavor switch (%s -> %s)", self._proc.flavor, new_flavor)
+            old = self._detach_locked("flavor_switch")
+        if old is not None:
+            self._terminate(old)
+            return True
+        return False
+
     # -- public entry point ------------------------------------------------- #
+
+    @staticmethod
+    def job_timeout_budget_sec(settings: Any, duration_sec: float, *, flavor: str) -> float:
+        base = float(settings.nemotron_job_timeout_sec)
+        if flavor == "cpu":
+            per_sec = float(getattr(settings, "nemotron_cpu_timeout_per_audio_sec", 3.0))
+            return base + max(0.0, per_sec * duration_sec)
+        return base
 
     def transcribe(self, settings: Any, audio: WavAudio, *, model_key: str = MODEL_KEY) -> dict[str, Any]:
         """Blocking. Queue the recording, run it (possibly several times if
         preempted), and return the house diarization JSON."""
-        tier = self.resolve_tier()
-        binary = self.resolve_binary(settings)
+        flavor, binary = self.resolve_runtime(settings)
+        tier = self.resolve_tier_for_flavor(flavor)
         decoder, encoder = self.model_paths(settings, tier)
-        profile_name, windows = plan_job(settings, audio.duration_sec)
+        profile_name, windows = plan_job(settings, audio.duration_sec, flavor=flavor)
+        budget_sec = self.job_timeout_budget_sec(settings, audio.duration_sec, flavor=flavor)
         job = _Job(
             id=next(self._ids),
+            flavor=flavor,
             profile=profile_name,
             windows=windows,
-            deadline=time.monotonic() + float(settings.nemotron_job_timeout_sec),
+            deadline=time.monotonic() + budget_sec,
+            budget_sec=budget_sec,
         )
         launch = (binary, decoder, encoder)
         with self._cond:
@@ -547,8 +818,8 @@ class NemotronService:
             self._update_metrics_locked()
             self._cond.notify_all()
         logger.info(
-            "nemotron job %d queued: %.0fs audio, profile=%s, %d window(s)",
-            job.id, audio.duration_sec, profile_name, len(windows),
+            "nemotron job %d queued: %.0fs audio, flavor=%s, profile=%s, %d window(s)",
+            job.id, audio.duration_sec, flavor, profile_name, len(windows),
         )
         try:
             results = self._run(job, settings, tier, launch, audio)
@@ -606,19 +877,35 @@ class NemotronService:
 
     # -- job execution ------------------------------------------------------ #
 
+    def _refresh_job_runtime(
+        self, job: _Job, settings: Any, tier: Tier, launch: tuple[str, str, str], audio: WavAudio
+    ) -> tuple[Tier, Profile, tuple[str, str, str]]:
+        """Re-resolve active flavor before acquiring a sidecar so a flavor
+        switch while jobs are queued takes effect on the next load."""
+        cur_flavor, cur_binary = self.resolve_runtime(settings)
+        if cur_flavor != job.flavor:
+            tier = self.resolve_tier_for_flavor(cur_flavor)
+            decoder, encoder = self.model_paths(settings, tier)
+            profile_name, windows = plan_job(settings, audio.duration_sec, flavor=cur_flavor)
+            with self._cond:
+                job.flavor = cur_flavor
+                job.profile = profile_name
+                job.windows = windows
+            launch = (cur_binary, decoder, encoder)
+        return tier, tier.profiles[job.profile], launch
+
     def _run(
         self, job: _Job, settings: Any, tier: Tier, launch: tuple[str, str, str], audio: WavAudio
     ) -> list[tuple[float, float, list[seams.Word], list[seams.Turn]]]:
-        profile = tier.profiles[job.profile]
         while True:
+            tier, profile, launch = self._refresh_job_runtime(job, settings, tier, launch, audio)
             self._acquire(job, settings, profile, launch)
             results: list[tuple[float, float, list[seams.Word], list[seams.Turn]]] = []
             try:
                 for i, (start, end) in enumerate(job.windows):
                     if i > 0:
-                        # Every long request gets a fresh process: the
-                        # word-timestamp buffer only grows, and all passing
-                        # 45-minute runs were on fresh processes.
+                        # Every multi-window request gets a fresh process per
+                        # window: the word-timestamp buffer only grows.
                         self._restart_for_job(job, settings, profile, launch)
                     payload = build_chat_payload(audio.window_bytes(start, end))
                     doc = self._post_chat(job, payload)
@@ -668,7 +955,7 @@ class NemotronService:
                 raise
             with self._cond:
                 self._running.pop(job.id, None)
-                if profile.name == "long":
+                if profile.name == "long" or len(job.windows) > 1:
                     self._retire = True
                 old = self._after_job_locked(settings, served=True)
             self._terminate_maybe(old)
@@ -704,6 +991,7 @@ class NemotronService:
             p is not None
             and self._alive_locked()
             and not self._retire
+            and p.flavor == job.flavor
             and p.profile.name == job.profile
             and len(self._running) < p.profile.max_sequences
         )
@@ -721,11 +1009,16 @@ class NemotronService:
                         metrics.nemotron_job_timeouts_total.inc()
                         self._update_metrics_locked()
                         raise NemotronTimeout(
-                            f"Nemotron job waited over {float(settings.nemotron_job_timeout_sec):.0f}s "
-                            "(queued behind other jobs or live calls holding the GPU)"
+                            f"Nemotron job waited over {job.budget_sec:.0f}s "
+                            "(queued behind other jobs or live calls holding the GPU/CPU)"
                         )
                     head = bool(self._queue) and self._queue[0] is job
-                    if head and not self._suspended and not self._loading:
+                    live_holding = (
+                        vram.has_other_gpu_work(exclude_model_key=MODEL_KEY)
+                        if job.flavor == "cuda"
+                        else self._active_live_calls > 0
+                    )
+                    if head and not self._suspended and not self._loading and not live_holding:
                         if self._can_join_locked(job):
                             self._queue.popleft()
                             self._running[job.id] = job
@@ -737,22 +1030,28 @@ class NemotronService:
                         if not self._running:
                             break
                     self._cond.wait(timeout=min(_WAIT_POLL_SEC, job.deadline - now))
-                if vram.has_other_gpu_work(exclude_model_key=MODEL_KEY):
-                    # A live call (or other GPU job) holds VRAM: never reclaim
-                    # under it. Wait for it to finish.
+                live_holding = (
+                    vram.has_other_gpu_work(exclude_model_key=MODEL_KEY)
+                    if job.flavor == "cuda"
+                    else self._active_live_calls > 0
+                )
+                if live_holding:
+                    # A live call holds VRAM or CPU priority: wait for it to finish.
                     self._cond.wait(timeout=min(_ADMIT_RETRY_SEC, max(0.0, job.deadline - time.monotonic())))
                     continue
                 self._loading = True
+                self._loading_flavor = job.flavor
                 self._load_preempted = False
                 old = self._detach_locked("profile_switch") if self._proc is not None else None
                 self._update_metrics_locked()
             if old is not None:
                 self._terminate(old)
             try:
-                loaded = self._load(settings, profile, launch, job.deadline)
+                loaded = self._load(settings, job.flavor, profile, launch, job.deadline)
             finally:
                 with self._cond:
                     self._loading = False
+                    self._loading_flavor = None
                     self._update_metrics_locked()
                     self._cond.notify_all()
             if not loaded:
@@ -764,53 +1063,76 @@ class NemotronService:
             if job.preempted:
                 raise _Preempted()
             self._loading = True
+            self._loading_flavor = job.flavor
             self._load_preempted = False
             old = self._detach_locked("recycled")
             self._update_metrics_locked()
         if old is not None:
             self._terminate(old)
         try:
-            ok = self._load(settings, profile, launch, job.deadline)
+            ok = self._load(settings, job.flavor, profile, launch, job.deadline)
         finally:
             with self._cond:
                 self._loading = False
+                self._loading_flavor = None
                 self._update_metrics_locked()
                 self._cond.notify_all()
         if not ok:
             raise _Preempted()
 
-    def _load(self, settings: Any, profile: Profile, launch: tuple[str, str, str], deadline: float) -> bool:
-        """Admit + spawn + wait for ready. False = VRAM not available or the
+    def _load(
+        self, settings: Any, flavor: str, profile: Profile, launch: tuple[str, str, str], deadline: float
+    ) -> bool:
+        """Admit + spawn + wait for ready. False = VRAM/RAM not available or the
         load was preempted (caller retries); raises on a hard failure."""
-        admission = vram.admit_exclusive(
-            settings,
-            model_key=MODEL_KEY,
-            need_mb=profile.vram_mb,
-            margin_mb=int(settings.nemotron_vram_margin_mb),
-        )
-        if admission.free_mb is not None:
-            metrics.gpu_free_vram_mb.set(admission.free_mb)
-        if not admission.ok:
-            logger.info("nemotron load deferred: %s", admission.message("Nemotron"))
-            with self._cond:
-                self.last_error = admission.message("Nemotron")
-            return False
+        admission: vram.Admission | None = None
+        threads: int | None = None
+        if flavor == "cuda":
+            admission = vram.admit_exclusive(
+                settings,
+                model_key=MODEL_KEY,
+                need_mb=profile.vram_mb,
+                margin_mb=int(settings.nemotron_vram_margin_mb),
+            )
+            if admission.free_mb is not None:
+                metrics.gpu_free_vram_mb.set(admission.free_mb)
+            if not admission.ok:
+                logger.info("nemotron load deferred: %s", admission.message("Nemotron"))
+                with self._cond:
+                    self.last_error = admission.message("Nemotron")
+                return False
+        else:
+            avail_mb = available_ram_mb()
+            need_ram_mb = int(getattr(settings, "nemotron_cpu_ram_mb", 24000))
+            if avail_mb is not None and avail_mb < need_ram_mb:
+                msg = (
+                    f"insufficient available RAM for Nemotron on CPU: "
+                    f"need {need_ram_mb} MiB, available {avail_mb} MiB"
+                )
+                logger.info("nemotron CPU load deferred: %s", msg)
+                with self._cond:
+                    self.last_error = msg
+                return False
+            threads = effective_cpu_threads(int(getattr(settings, "nemotron_cpu_threads", 16)))
+
         binary, decoder, encoder = launch
         workdir = tempfile.mkdtemp(prefix="lstt-nemotron-")
         try:
             cfg = Path(workdir) / "salm.yaml"
-            cfg.write_text(salm_config_yaml(profile))
+            cfg.write_text(salm_config_yaml(profile, threads=threads))
             port = int(settings.nemotron_port) or _free_port()
             cmd = [
                 binary, "serve",
                 "--asr-model", decoder,
                 "--salm-encoder", encoder,
-                "--device", "cuda",
+                "--device", flavor,
                 "--host", "127.0.0.1",
                 "--port", str(port),
                 "--config", str(cfg),
                 "--no-ui",
                 "--max-upload-mb", str(MAX_UPLOAD_MB),
+                "--read-timeout", str(SIDE_TIMEOUT_SEC),
+                "--write-timeout", str(SIDE_TIMEOUT_SEC),
             ]
             log = open(Path(workdir) / "server.log", "wb")  # noqa: SIM115 -- owned by the child
             try:
@@ -820,12 +1142,13 @@ class NemotronService:
             finally:
                 log.close()
         except Exception as exc:
-            admission.release()
+            if admission is not None:
+                admission.release()
             shutil.rmtree(workdir, ignore_errors=True)
             metrics.nemotron_sidecar_events_total.labels(event="load_failed").inc()
             raise NemotronUnavailable(f"could not start nemo-speech: {exc}") from exc
 
-        proc = _Proc(popen, port, profile, workdir, admission)
+        proc = _Proc(popen, port, flavor, profile, workdir, admission, threads=threads)
         with self._cond:
             self._proc = proc
             self._retire = False
@@ -852,8 +1175,8 @@ class NemotronService:
             self.loads_total += 1
         metrics.nemotron_sidecar_events_total.labels(event="load").inc()
         logger.info(
-            "nemotron sidecar ready: profile=%s pid=%d port=%d in %.1fs",
-            profile.name, popen.pid, port, time.monotonic() - t0,
+            "nemotron sidecar ready: flavor=%s profile=%s pid=%d port=%d in %.1fs",
+            flavor, profile.name, popen.pid, port, time.monotonic() - t0,
         )
         return True
 
@@ -995,12 +1318,14 @@ class NemotronService:
             self._terminate(old)
 
     def stop_if_idle(self) -> bool:
-        """Evict an idle sidecar so other GPU work can have the card. Never
+        """Evict an idle CUDA sidecar so other GPU work can have the card. Never
         blocks and never touches a running job (vram.reclaim_idle_workers)."""
         if not self._cond.acquire(blocking=False):
             return False
         try:
             if self._running or self._loading or not self._alive_locked():
+                return False
+            if self._proc is not None and self._proc.flavor != "cuda":
                 return False
             logger.info("evicting idle nemotron sidecar to free VRAM")
             old = self._detach_locked("evicted")
@@ -1011,13 +1336,25 @@ class NemotronService:
             return True
         return False
 
+    def enter_live_call(self) -> None:
+        """Mark a live gRPC call active so CPU Nemotron jobs yield the CPU."""
+        with self._cond:
+            self._active_live_calls += 1
+            self._cond.notify_all()
+
+    def leave_live_call(self) -> None:
+        """Release a live gRPC call's CPU priority hold."""
+        with self._cond:
+            self._active_live_calls = max(0, self._active_live_calls - 1)
+            self._cond.notify_all()
+
     def preempt_for_live_call(self, settings: Any) -> bool:
-        """A live gRPC call was refused VRAM while a job holds the card: stop
-        the sidecar, wait for its VRAM to come back, and put every running
-        job back at the head of the queue. Returns True if anything was
-        preempted. The caller MUST call ``resume_after_preempt()`` once its
-        own admission has been re-checked (success or not) -- until then no
-        queued job can grab the card back."""
+        """A live gRPC call needs the GPU or CPU while a job is running: stop
+        the sidecar, wait for its VRAM (when on CUDA) to come back, and put
+        every running job back at the head of the queue. Returns True if
+        anything was preempted. The caller MUST call ``resume_after_preempt()``
+        once its own admission has been re-checked (success or not) -- until
+        then no queued job can grab the card/CPU back."""
         with self._cond:
             if not self._running and not self._loading:
                 return False
@@ -1031,7 +1368,7 @@ class NemotronService:
             self.preemptions_total += 1
         metrics.nemotron_preemptions_total.inc()
         try:
-            free_before = gpu.free_vram_mb()
+            free_before = gpu.free_vram_mb() if need else None
             if old is not None:
                 logger.warning("preempting nemotron sidecar pid=%d for a live call", old.popen.pid)
                 self._terminate(old, grace_sec=PREEMPT_TERM_GRACE_SEC)
@@ -1088,6 +1425,18 @@ def preempt_and_admit(settings: Any, admit: Callable[[], vram.Admission]) -> vra
         return admit()
     finally:
         svc.resume_after_preempt()
+
+
+def preempt_cpu_for_live_call(settings: Any) -> bool:
+    """Preempt a running/loading CPU Nemotron job for an incoming live gRPC
+    call. Returns True if a CPU job was preempted."""
+    svc = get_service()
+    if not svc.is_active_on("cpu"):
+        return False
+    if not svc.preempt_for_live_call(settings):
+        return False
+    svc.resume_after_preempt()
+    return True
 
 
 atexit.register(_SERVICE.stop)

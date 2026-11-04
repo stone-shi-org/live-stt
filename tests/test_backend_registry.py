@@ -86,4 +86,14 @@ def test_nemo_speech_cuda_backend_entry() -> None:
     assert spec.repo == "NVIDIA/NeMo-Speech.cpp" and spec.tag == "v0.3.0"
     assert spec.asset_filename == "nemo-speech-0.3.0-linux-x86_64-cuda.tar.gz"
     assert spec.sha256 == "eca00a1f67d3ca200ddba11dd71c4f3d67e044cc0939d17d073978e40b995917"
-    assert available_flavors("nemo_speech") == ["cuda"]
+    assert available_flavors("nemo_speech") == ["cpu", "cuda"]
+
+
+def test_nemo_speech_cpu_backend_entry() -> None:
+    spec = resolve("nemo_speech", "cpu")
+    assert spec.source == "github_release"
+    assert spec.repo == "NVIDIA/NeMo-Speech.cpp" and spec.tag == "v0.3.0"
+    assert spec.asset_filename == "nemo-speech-0.3.0-linux-x86_64-cpu.tar.gz"
+    assert spec.sha256 == "255f12b722ab15b2a38a51cf125d56e3fa97058b528f7e895b39d6a473deb06e"
+    assert spec.lib_filename == "bin/nemo-speech"
+    assert spec.wired is True

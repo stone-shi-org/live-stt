@@ -1350,7 +1350,7 @@ executed at `finalize()` via `parakeet_capi_transcribe_pcm_batch_json_lang` (`de
 - Mid-call worker rotation is unconditionally disabled in `CallSession._should_start_rotation`.
 - GGUF model: `mudler/parakeet-cpp-gguf` -> `tdt-0.6b-v3-q8_0.gguf` (940.7 MB, sha256 `4d69a4a6683f4f2d952bad794c1357ca6eb628027695b4699c5a9ad4cd07d757`).
 
-## Fourth engine: Nemotron-3.5-Transcribe-30B-A4B (speaker-attributed post-call transcripts, LS-19)
+## Fourth engine: Nemotron-3.5-Transcribe-30B-A4B (speaker-attributed post-call transcripts, LS-19 & LS-20)
 
 `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` diarizes AND transcribes in one model. It is
 served **only** on `POST /v1/audio/diarization` (`model=nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B`),
@@ -1366,15 +1366,36 @@ my-meeting-notes is a config change (`model=` / `diarization_model`).
   preemption, the size-tier table and the duration plan. Modelled on `TTSWorkerManager`.
 - `live_stt/nemotron_seams.py` -- pure: parse words/turns from a response, overlap-vote seams,
   build the house JSON.
-- Runtime: NeMo-Speech.cpp **v0.3.0** `nemo-speech-0.3.0-linux-x86_64-cuda.tar.gz` (sha256
-  `eca00a1f…5917`), registered as backend `nemo_speech:cuda` (`live_stt/backends/registry.py`).
-  Install with `POST /api/backends/install {"engine":"nemo_speech","flavor":"cuda"}` then
-  `/api/backends/activate`; the binary is `<install dir>/bin/nemo-speech` (RPATH `$ORIGIN/../lib`,
-  bundles its own cudart/cuBLAS 12, needs only the driver's libcuda). `LSTT_NEMOTRON_BIN` overrides.
+- Runtime backends (`live_stt/backends/registry.py`): NeMo-Speech.cpp **v0.3.0** ships two
+  user-selectable flavors under engine `nemo_speech`:
+  - `nemo_speech:cuda` -- `nemo-speech-0.3.0-linux-x86_64-cuda.tar.gz` (sha256 `eca00a1f…5917`).
+    Requires NVIDIA GPU with compute capability >= 8.0 and >= 24 GB VRAM (`22,000 MiB`).
+  - `nemo_speech:cpu` -- `nemo-speech-0.3.0-linux-x86_64-cpu.tar.gz` (sha256 `255f12b7…06e`, 9.6 MB).
+    Targets x86-64-v3 (`avx2` required in `/proc/cpuinfo`); recommends >= `nemotron_cpu_ram_mb`
+    (default `24,000` MiB) total RAM (warns on activation if lower, enforced against `MemAvailable`
+    at request time).
+  Install with `POST /api/backends/install {"engine":"nemo_speech","flavor":"cuda"|"cpu"}` then
+  `POST /api/backends/activate`; the binary is `<install dir>/bin/nemo-speech`. `LSTT_NEMOTRON_BIN`
+  overrides the binary path while keeping the active flavor (`cpu` or `cuda`, defaulting to `cuda`
+  when only `LSTT_NEMOTRON_BIN` is set). Switching flavors while idle stops the sidecar immediately;
+  switching while busy lets running jobs finish on the old flavor and loads the new flavor on the
+  next job.
+- Server-side hardware validation & admin error dialog (`live_stt/backends/installer.py`,
+  `live_stt/admin_http.py`): `POST /api/backends/activate` runs `check_activation_support(engine,
+  flavor, settings)` *before* flipping the active row in SQLite. On unsupported hardware (e.g.
+  activating `nemo_speech:cuda` on a Quadro P1000 with compute capability 6.1 and 4096 MiB, or on a
+  host without a GPU, or activating `nemo_speech:cpu` without AVX2), it returns HTTP `422` with
+  `{"error": ..., "reason": "gpu_unsupported"|"no_gpu"|"cpu_missing_avx2", "details": {...},
+  "suggestion": "Activate nemo_speech:cpu instead", "suggested_engine": "nemo_speech",
+  "suggested_flavor": "cpu"}` and leaves the active flavor unchanged. `GET /api/backends` exposes
+  `activatable: bool`, `unsupported_reason: str | null`, `reason`, `suggestion`, and `warning` on
+  every registered entry so the Admin UI renders an "Unsupported on this host" badge with a tooltip
+  while keeping the Activate button clickable (clicking opens `#backendErrorModal` with a one-click
+  button to install/activate `nemo_speech:cpu`).
 - Model: AtomicChat GGUF conversion (not gated) -- decoder `…-AD-IQ4_NL.gguf` (sha256 `0c47d4ab…45ad`)
   plus `…-Encoder-F16.gguf` (sha256 `4221029c…7ba2`) in `models_dir` (or `LSTT_NEMOTRON_MODELS_DIR`);
   `scripts/fetch_model.sh nemotron-3.5-transcribe-30b-a4b nemotron-3.5-transcribe-30b-a4b-encoder`.
-- Registry: `DiarizationModelSpec(engine="nemotron_transcribe", gated=False,
+- Registry: `DiarizationModelSpec(engine="nemotron_transcribe", gated=False, requires_cuda=False,
   supports_num_speakers_hint=False, max_speakers_supported=8)`. `diarize_http.py` dispatches on the
   engine before any pyannote code runs; `words`/`num_speakers`/`device` are ignored for it.
 
@@ -1397,22 +1418,32 @@ dropping them doubles DER (0.107). my-meeting-notes only rejects a response whos
 text. A `words` extension field carries the word-level attribution. Note this departs from the
 ticket's "segments from consecutive same-speaker words", which would have failed its own DER gate.
 
-**Profiles by duration** (24 GB tier, the only verified one; the others in `TIERS` refuse with 503):
+**Profiles by duration and device** (24 GB CUDA tier + CPU tier; untested CUDA tiers in `TIERS` refuse with 503):
 
-| profile | asr.salm settings | audio | concurrency | admission figure |
-|---|---|---|---|---|
-| short | 4 slots, `n_ctx_per_sequence` 8192, `max_context` 32768, `n_batch` 1024, `encoder_max_batch` 4, `mtp_draft` 0 | <= `nemotron_short_max_sec` (27 min; token cap ~29.4 min) | up to 4 jobs on one process | 22,200 MiB |
-| long | 1 slot, 73728 context, `n_batch` 512, `encoder_max_batch` 1, `encoder_ahead_seconds` 600 | <= `nemotron_long_max_sec` (45 min) | 1, fresh process every request | 24,000 MiB |
-| windowed | long, per window | <= `max_call_sec` (150 min) | 1 | 24,000 MiB |
+| profile | device | asr.salm / asr.backend settings | audio | concurrency | admission figure |
+|---|---|---|---|---|---|
+| short | cuda | 4 slots, `n_ctx_per_sequence` 8192, `max_context` 32768, `n_batch` 1024, `encoder_max_batch` 4, `mtp_draft` 0 | <= `nemotron_short_max_sec` (27 min; token cap ~29.4 min) | up to 4 jobs on one process | 22,200 MiB VRAM |
+| long | cuda | 1 slot, 73728 context, `n_batch` 512, `encoder_max_batch` 1, `encoder_ahead_seconds` 600 | <= `nemotron_long_max_sec` (45 min) | 1, fresh process every request | 24,000 MiB VRAM |
+| windowed (cuda) | cuda | long, per window | <= `max_call_sec` (150 min) | 1 | 24,000 MiB VRAM |
+| cpu | cpu | 1 slot, `n_ctx_per_sequence` 32768, `max_context` 32768, `n_batch` 512, `encoder_max_batch` 1, `mtp_draft` 0, `asr.backend.threads` = `effective_cpu_threads` (default 16, capped at container/host CPU quota) | <= `nemotron_cpu_max_sec` (27 min) in one pass; > 27 min windowed at `min(nemotron_window_sec, nemotron_cpu_max_sec)` with `nemotron_window_overlap_sec` overlap | 1 | `nemotron_cpu_ram_mb` (24,000 MiB `MemAvailable`) |
 
-45 min is a **hard** limit: 50 min crashed the process (`CUDA error: out of memory`), 55 min lost word
-timestamps, 60 min crashed -- non-monotonic, so it is refused, never attempted. Settings validation
-keeps `nemotron_window_sec <= nemotron_long_max_sec`. The word-timestamp buffer only grows, so a long
-request always gets a fresh process and the process is recycled after
-`nemotron_recycle_after_requests`. A profile switch drains running jobs and restarts (~10 s).
+On CUDA, 45 min is a **hard** single-pass limit: 50 min crashed the process (`CUDA error: out of memory`),
+55 min lost word timestamps, 60 min crashed -- non-monotonic, so it is refused, never attempted.
+On CPU (`PROFILE_CPU`), `max_context` is 32768 (~29.4 min token ceiling); a 30-min (1800 s) probe on
+homesrv (`Ryzen 9 5900XT`, 16 threads) confirmed that `max_context: 32768` rejects 30 min with HTTP 400
+(`audio and output need 33452 tokens, max_model_len is 32768`), whereas raising `max_context` to 73728
+completes 30 min in 2395.3 s (`1.33x` realtime, 17.3 GiB anonymous RSS / 36.3 GiB total RSS including
+model page cache) and would push a 45-min single pass to ~3600 s right into `nemo-speech serve`'s hard
+`--read-timeout` / `--write-timeout` ceiling (`3600` s). Keeping `PROFILE_CPU` at 32768 context and
+slicing recordings above `nemotron_cpu_max_sec` (`1620` s / 27 min) into overlapping windows with
+overlap-vote seam stitching keeps per-window wall time (~30–36 min max) and memory (~17 GiB anon)
+bounded well under the 3600 s sidecar socket timeout. Job timeout on CPU scales with audio length:
+`nemotron_job_timeout_sec + nemotron_cpu_timeout_per_audio_sec * duration_sec` (default `1800 + 3.0 *
+duration_sec`).
 
-**Over 45 min: overlap-vote seams.** 40-min windows, 5-min overlap, each through the long profile on a
-fresh process. Text and turns are cut at the overlap midpoint. Speakers: for each adjacent pair, words
+**Over single-pass max (45 min on CUDA, 27 min on CPU): overlap-vote seams.** Windows (`nemotron_window_sec`
+on CUDA, `min(nemotron_window_sec, nemotron_cpu_max_sec)` on CPU) with `nemotron_window_overlap_sec`
+(5-min default) overlap. Text and turns are cut at the overlap midpoint. Speakers: for each adjacent pair, words
 both windows transcribed in the overlap are paired (same normalized text, centres within 0.6 s);
 each pair votes (new local label -> global label); labels map one-to-one strongest vote first; an
 unvoted label becomes a new speaker. A seam with fewer than `nemotron_seam_min_votes` (100) matched
@@ -1420,64 +1451,67 @@ words gets a `warnings` entry (scaled-down seam test: >=100 lost 0.011 cpWER, <1
 response's `seams` field lists each seam's time and vote count. Known blind spot: a speaker silent
 through an overlap cannot be matched and becomes a new label.
 
-**GPU sharing and admission.** The model needs essentially the whole card, which the normal rule
+**GPU / CPU sharing and admission.** On CUDA, the model needs essentially the whole card, which the normal rule
 (`need + vram_reserve_pct` reserve, ~2.4 GB on 24 GB) would always refuse. `vram.admit_exclusive`:
 free VRAM (reservation-aware, after reclaiming idle warm workers) must cover the profile figure plus
 `nemotron_vram_margin_mb` (64; an idle 3090 shows ~24,115 MiB free). The sidecar holds that
-reservation until it stops. A queued job only attempts a load while **no other GPU reservation
+reservation until it stops. A queued CUDA job only attempts a load while **no other GPU reservation
 exists** (`vram.has_other_gpu_work`) -- it never reclaims under a live call. Any other GPU admission
-can evict an IDLE sidecar (`stop_if_idle`, wired into `vram.reclaim_idle_workers`).
+can evict an IDLE sidecar (`stop_if_idle`, wired into `vram.reclaim_idle_workers`). On CPU, admission
+checks `/proc/meminfo` `MemAvailable >= nemotron_cpu_ram_mb` (default 24,000 MiB) without touching
+`vram.py`, and queued CPU jobs wait while any live gRPC call is active (`_active_live_calls > 0`).
 
-**Live calls preempt running jobs (option b).** In `servicer.Transcribe`, a CUDA admission that fails
-while a Nemotron job is running or loading calls `nemotron.preempt_and_admit`: the sidecar is
-SIGTERMed (exit ~0.7 s), the call waits for the VRAM to come back (`nemotron_preempt_wait_sec`) and is
-re-admitted; every running job goes back to the HEAD of the queue with its original audio and reruns
-from scratch (all windows). Queued jobs are held off until the call's own reservation exists, then
-wait for it to end. Nothing else preempts: pyannote/tdt/whisper/TTS get the normal capacity rejection.
-The HTTP request stays open throughout, bounded by `nemotron_job_timeout_sec` (30 min) -> 503 with
-`Retry-After` (`error.retry_after_sec`, sent as a header by `admin_http`). Starvation under sustained
-live-call load is possible by design.
+**Live calls preempt running jobs (CUDA and CPU).** In `servicer.Transcribe`:
+- On CUDA, an admission that fails while a Nemotron job is running or loading on CUDA calls
+  `nemotron.preempt_and_admit`: the sidecar is SIGTERMed (exit ~0.7 s), the call waits for the VRAM
+  to come back (`nemotron_preempt_wait_sec`) and is re-admitted; every running job goes back to the
+  HEAD of the queue with its original audio and reruns from scratch (all windows).
+- On CPU, every admitted live gRPC call increments `enter_live_call()` (decremented in `finally` via
+  `leave_live_call()`) and, if a CPU Nemotron job is running or loading (`is_active_on("cpu")`), calls
+  `preempt_cpu_for_live_call()` to SIGTERM the CPU sidecar immediately (~1.7 s exit) and re-queue the
+  interrupted job at the head of the queue so the 16-thread batch job never starves live call latency.
+  When the live call ends, the condition variable wakes the queue loop and the CPU job resumes.
+Nothing else preempts: pyannote/tdt/whisper/TTS get the normal capacity rejection. The HTTP request
+stays open throughout, bounded by the job timeout budget -> 503 with `Retry-After`
+(`error.retry_after_sec`, sent as a header by `admin_http`). Starvation under sustained live-call
+load is possible by design.
 
 **Failures.** A compute-buffer OOM kills the sidecar: the in-flight request gets a retryable 503 and
 `crashes_total`/`live_stt_nemotron_sidecar_events_total{event="crash"}` count it; the next request
-loads a fresh process. Missing binary/models, no GPU, compute capability < 8.0 or an untested tier:
+loads a fresh process. Missing binary/models, no active `nemo_speech` backend, or unsupported hardware:
 503 without `Retry-After`.
 
-**Visibility.** `/api/stats["nemotron"]` (state, profile, pid, tier, queue depth, running jobs,
-loads/preemptions/requeues/crashes/timeouts); requests also count under `/api/stats["diarization"]`
-(`DiarizationSessionTracker`) and in `recent_requests` (kind `diarize`, the registry key, outcome
-`ok|failed|timeout`, no content). Prometheus: `live_stt_nemotron_{queue_depth,jobs_running,
-sidecar_state,preemptions_total,requeues_total,sidecar_events_total,job_timeouts_total,
-low_vote_seams_total}`. The sidecar also shows in the dashboard's warmed-workers table.
+**Visibility.** `/api/stats["nemotron"]` (state, profile, device, threads, pid, tier, available/required
+RAM on CPU or reserved VRAM on CUDA, queue depth, running jobs, loads/preemptions/requeues/crashes/timeouts);
+requests also count under `/api/stats["diarization"]` (`DiarizationSessionTracker`) and in
+`recent_requests` (kind `diarize`, `model (cpu)` or `model (cuda)`, outcome `ok|failed|timeout`, no
+content). Prometheus: `live_stt_nemotron_{queue_depth,jobs_running,sidecar_state,preemptions_total,
+requeues_total,sidecar_events_total,job_timeouts_total,low_vote_seams_total}`. The sidecar also shows
+in the dashboard's warmed-workers table (`device: "cpu"|"cuda"`, `threads`) and the dedicated
+Nemotron status card (`#nemotronStatusCard`).
 
 **Tests.** `tests/test_nemotron.py` drives `tests/fakes/fake_nemo_speech.py` -- a real subprocess
-speaking real HTTP, no binary/model/GPU -- with a fake card whose free VRAM drops while a fake sidecar
-is alive, so admission, eviction, crash recovery, preemption + re-queue and the job timeout all run
-through the real `vram.py`. Its synthetic audio encodes each second's absolute index in the samples,
-so windowed jobs can check seam stitching exactly. `tests/test_servicer.py` has a real-gRPC
-preemption test. `tests/test_nemotron_integration.py` (`integration`/`gpu`/`model`) needs
-`LSTT_NEMOTRON_TEST_BIN`/`_MODELS_DIR`/`_WAV`.
+speaking real HTTP, no binary/model/GPU -- covering both `nemo_speech:cuda` and `nemo_speech:cpu`
+(`--device cpu`, `PROFILE_CPU`, `asr.backend.threads`, `--read-timeout 3600`, CPU RAM admission,
+live-call CPU preemption + hold + resume, flavor switching while idle and while busy, and CPU
+windowed seam stitching). `tests/test_admin_backends.py` covers `POST /api/backends/activate` 422
+refusal on unsupported GPU (`gpu_unsupported`, `no_gpu`) and CPU (`cpu_missing_avx2`), low-RAM
+warnings, and `GET /api/backends` `activatable`/`unsupported_reason` fields.
 
-**Verified for real on homesrv3 (RTX 3090, 2026-11-02)** -- this code, inside the production
-`live-stt:latest` image (`--gpus all --memory 20g`), the real NeMo-Speech.cpp v0.3.0 binary and the
-real IQ4_NL GGUFs, every request through the real `diarize_http.handle_diarize_request` (scripts and
-outputs: `~/ls19-verify` on homesrv3; live-stt-2 itself was not touched or redeployed):
+**Verified for real on homesrv3 (RTX 3090, 2026-11-02 & 2026-11-04) and homesrv (Quadro P1000 + Ryzen 9 5900XT, 2026-11-04):**
 
-| check | result |
+| host & check | result |
 |---|---|
-| 20-meeting benchmark (AC1 gate: cpWER <= 0.31, DER <= 0.06) | **cpWER 0.295** (0.2949 scored from segment text), **DER 0.054** -- identical to the spike benchmark; 20/20 HTTP 200, ~14 s per 6-min meeting warm |
-| cold request (load + warmup + 6-min meeting) | 22.2 s; load + 60 s clip 11.4 s |
-| idle unload (timeout 3 s) | unloaded at 3.0 s, card back to the 9 MiB baseline 0.6 s later |
-| another GPU admission (pyannote-sized) while idle | evicted the sidecar, admitted, 24,115 MiB free |
-| sidecar SIGKILLed mid-request | 503 + `retry_after_sec: 30`, `crashes_total` 1; next request 200 on a fresh process |
-| live-call admission while a job runs | refused (1,915 MiB free) -> preempt -> **admitted in 0.88 s**; job re-queued, reran, output **identical** to its unpreempted run |
-| job queued while a live call holds VRAM, 5 s timeout | 503 + `retry_after_sec: 120` after 5.1 s, never loaded |
-| recycle after 20 requests | fired on the 20th benchmark request |
-| 45 min, long profile, one pass | 200 in 139.9 s |
-| 65 min, windowed (2400 s + 1800 s windows, fresh process each) | 200 in 217.5 s; one seam at 2250 s with **366 matched words** (no warning) |
+| homesrv3 (RTX 3090) 20-meeting CUDA benchmark (LS-19 AC1 gate: cpWER <= 0.31, DER <= 0.06) | **cpWER 0.295**, **DER 0.054** -- 20/20 HTTP 200, ~14 s per 6-min meeting warm (cold 21.9–22.2 s) |
+| homesrv3 (RTX 3090) idle unload / eviction / crash recovery / live-call VRAM preemption / 45-min long / 65-min windowed (LS-19) | all passed (preemption admitted in 0.88 s; 45 min in 139.9 s; 65 min in 217.5 s with 366 seam votes) |
+| homesrv3 (RTX 3090) live CPU <-> GPU flavor switching without restart (LS-20 AC4) | `POST /api/backends/activate` `cuda` -> `MTG_32089` in 11.3 s warm (`--device cuda`, cpWER 0.327, DER 0.107) -> activate `cpu` (warm CUDA sidecar unloaded immediately) -> 60 s clip in 52.9 s (`--device cpu`) -> activate `cuda` (warm CPU sidecar unloaded immediately) -> 60 s clip in 11.1 s (`--device cuda`) |
+| homesrv (Quadro P1000, cc 6.1, 4 GB + Ryzen 9 5900XT 16t) 3-meeting CPU benchmark (LS-20 spike) | **cpWER 0.274** (vs 0.284 on RTX 3090), **DER 0.062** (vs 0.065 on RTX 3090), speaker count identical in all 3 meetings, 0.85x–1.21x realtime (296 / 427 / 377 s), cgroup anon peak 16.9 GB |
+| homesrv (Ryzen 9 5900XT 16t) end-to-end `POST /v1/audio/diarization` on `MTG_32089` + windowed seam check (LS-20 AC1 & AC5) | `POST /api/backends/install` & `activate` `nemo_speech:cpu` -> `MTG_32089` (358 s) HTTP 200 in 327.1 s (cold load + inference, `0.91x` realtime), **cpWER 0.315** (332/1054, vs 0.327 on RTX 3090), **DER 0.100** (vs 0.107 on RTX 3090), spk 6/5, 195 segments, 1061 words; 120 s windowed clip (two 75 s windows, 30 s overlap) HTTP 200 in 136.0 s with 1 seam at 60.0 s (**78 matched words**) |
+| homesrv (Quadro P1000) `POST /api/backends/activate` `nemo_speech:cuda` refusal (LS-20 AC2 & AC3) | HTTP `422` (`reason: "gpu_unsupported"`, Quadro P1000 cc 6.1 / 4096 MiB < cc 8.0 / 22000 MiB, `suggestion: "Activate nemo_speech:cpu instead"`); active flavor stayed `nemo_speech:cpu`; `GET /api/backends` reported `activatable: false` on `cuda` and `true` on `cpu` |
+| homesrv (Ryzen 9 5900XT 16t) 30-min & 45-min CPU probe (LS-20 AC5) | 30 min at 32k context -> HTTP 400 (33,452 tokens > 32,768); 30 min at 73k context -> HTTP 200 in 2395.3 s (`1.33x` realtime, 6150 words, 1260 turns, 17.3 GiB anon RSS / 36.3 GiB total RSS); >27 min (`nemotron_cpu_max_sec=1620s`) routed through windowed 32k-context overlap-vote seams |
 
-The first preemption run took 5.37 s: a sidecar mid-request does not exit promptly on SIGTERM (an
-idle one exits in ~0.7 s), so the 5 s grace ran out before SIGKILL. Preemption now uses a 0.5 s grace
+The first CUDA preemption run took 5.37 s: a sidecar mid-request does not exit promptly on SIGTERM (an
+idle one exits in ~0.7 s on GPU, ~1.7 s on CPU), so the 5 s grace ran out before SIGKILL. Preemption now uses a 0.5 s grace
 (`PREEMPT_TERM_GRACE_SEC`), and the fake server defers SIGTERM while busy so the unit test keeps that
 honest. The 45/65-min files are concatenations of different NOTSOFAR-1 meetings (28 and 44 true
 speakers, far over the model's 8 labels), so their cpWER/DER say nothing about long-meeting quality;
@@ -1485,7 +1519,7 @@ they prove the length handling and seam mechanics only.
 
 **Not validated:** telephony (8 kHz) audio -- required before any phone-call use; real two-person
 calls; seam matching on real long meetings with ground truth (the 65-min check above is a
-concatenation of short meetings); 45 min while anything else holds VRAM (will not fit); tiers other
+concatenation of short meetings); 45 min on CUDA while anything else holds VRAM (will not fit); CUDA tiers other
 than 24 GB / IQ4_NL; v0.3.0 lacks `asr.salm.n_cpu_moe`/`batched`.
 
 ## parakeet.cpp: verified API facts and build gotchas found while building this
