@@ -992,6 +992,13 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
             word-break: break-all;
         }
 
+        /* Nemotron sidecar card: 4-column key/value grid. Overrides the global
+           .kv-key width (55%, meant for 2-column tables) and break-all, which
+           otherwise crush the value columns to one character wide. */
+        .nemotron-kv-table { table-layout: fixed; }
+        .nemotron-kv-table .kv-key { width: auto; padding-right: 0.75rem; }
+        .nemotron-kv-table .kv-val { word-break: normal; overflow-wrap: anywhere; padding-right: 1.25rem; }
+
         .col-id { width: 100px; }
         .col-elapsed { width: 120px; }
         .col-info { width: auto; }
@@ -1604,12 +1611,16 @@ HTML_STATS_PAGE = """<!DOCTYPE html>
                     <span>🧠 Nemotron-3.5-Transcribe Sidecar (<code>nemo_speech</code>)</span>
                     <span class="outcome-active-badge" id="valNemotronStateBadge">unloaded</span>
                 </div>
-                <table class="kv-table">
+                <table class="kv-table nemotron-kv-table">
+                    <colgroup>
+                        <col style="width: 20%;"><col style="width: 30%;">
+                        <col style="width: 20%;"><col style="width: 30%;">
+                    </colgroup>
                     <tbody>
                         <tr>
-                            <td class="kv-key" style="width: 22%;">Active Device & Threads</td>
+                            <td class="kv-key">Active Device & Threads</td>
                             <td class="kv-val" id="valNemotronDevice">-</td>
-                            <td class="kv-key" style="width: 22%;">Profile / Tier</td>
+                            <td class="kv-key">Profile / Tier</td>
                             <td class="kv-val" id="valNemotronProfile">-</td>
                         </tr>
                         <tr>
